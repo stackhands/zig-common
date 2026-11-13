@@ -4,6 +4,7 @@ pub const fsx = @import("fsx.zig");
 pub const proc = @import("proc.zig");
 pub const logs = @import("logs.zig");
 pub const cli = @import("cli.zig");
+pub const env = @import("env.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
