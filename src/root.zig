@@ -12,4 +12,5 @@ pub const atomic = @import("atomic.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("atomic_test.zig");
 }

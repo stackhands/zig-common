@@ -5,6 +5,7 @@
 //! NFSv4 ACL and the POSIX access ACL, most native first; a filesystem may
 //! expose one ACL through several of them.
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
@@ -13,6 +14,83 @@ const Allocator = std.mem.Allocator;
 
 pub const acl_attributes = [_][:0]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
 const posix_access = "system.posix_acl_access";
+
+/// The calls atomicWrite makes on a file descriptor, as raw system-call
+/// results. Programs leave them alone; tests replace them, under
+/// builtin.is_test only, to emulate a filesystem's ACL model or a failing
+/// call. `created` runs on the temporary file right after its O_EXCL
+/// creation, where a filesystem applies an inherited ACL.
+pub const Ops = struct {
+    flistxattr: *const fn (fd: sys.fd_t, buf: []u8) usize = realList,
+    fgetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize = realGet,
+    fsetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, value: []const u8) usize = realSet,
+    fremovexattr: *const fn (fd: sys.fd_t, name: [:0]const u8) usize = realRemove,
+    fchmod: *const fn (fd: sys.fd_t, mode: u32) usize = realChmod,
+    fchown: *const fn (fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize = realChown,
+    fsync: *const fn (fd: sys.fd_t) usize = realFsync,
+    geteuid: *const fn () linux.uid_t = realGeteuid,
+    created: *const fn (fd: sys.fd_t) void = realCreated,
+};
+
+var test_ops: Ops = .{};
+const real_ops: Ops = .{};
+
+/// The calls in use. A test build may assign through it (`ops.* = ...`);
+/// in any other build it points at constant real calls.
+pub const ops = if (builtin.is_test) &test_ops else &real_ops;
+
+fn realList(fd: sys.fd_t, buf: []u8) usize {
+    return linux.flistxattr(fd, buf.ptr, buf.len);
+}
+fn realGet(fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize {
+    return linux.fgetxattr(fd, name.ptr, buf.ptr, buf.len);
+}
+fn realSet(fd: sys.fd_t, name: [:0]const u8, value: []const u8) usize {
+    return linux.fsetxattr(fd, name.ptr, value.ptr, value.len, 0);
+}
+fn realRemove(fd: sys.fd_t, name: [:0]const u8) usize {
+    return linux.fremovexattr(fd, name.ptr);
+}
+fn realChmod(fd: sys.fd_t, mode: u32) usize {
+    return linux.fchmod(fd, @intCast(mode));
+}
+fn realChown(fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize {
+    return linux.fchown(fd, uid, gid);
+}
+fn realFsync(fd: sys.fd_t) usize {
+    return linux.fsync(fd);
+}
+fn realGeteuid() linux.uid_t {
+    return linux.geteuid();
+}
+fn realCreated(_: sys.fd_t) void {}
+
+/// Call one of `ops`, retrying on EINTR.
+fn op(f: anytype, args: anytype) sys.Error!usize {
+    while (true) {
+        if (try sys.result(@call(.auto, f, args))) |rc| return rc;
+    }
+}
+
+/// Python's OSError text for an error from one of the calls, so a message
+/// reads "[Errno 13] Permission denied" as the Python tool prints it.
+pub fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotFound => "[Errno 2] No such file or directory",
+        error.AccessDenied => "[Errno 13] Permission denied",
+        error.Unsupported => "[Errno 95] Operation not supported",
+        error.NoData => "[Errno 61] No data available",
+        error.InvalidArgument => "[Errno 22] Invalid argument",
+        error.Exists => "[Errno 17] File exists",
+        error.NoSpace => "[Errno 28] No space left on device",
+        error.ReadOnly => "[Errno 30] Read-only file system",
+        error.SymLink => "[Errno 40] Too many levels of symbolic links",
+        error.IsDir => "[Errno 21] Is a directory",
+        error.NotDir => "[Errno 20] Not a directory",
+        error.Unexpected => "[Errno 5] Input/output error",
+        else => @errorName(err),
+    };
+}
 
 /// Why a replacement was refused; filled in when an error is returned.
 pub const Why = struct {
@@ -58,7 +136,7 @@ fn isNfs4Family(name: []const u8) bool {
 /// unsupported.
 fn listedAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error![acl_attributes.len]bool {
     var buf: [64 * 1024]u8 = undefined;
-    const n = try sys.call(linux.flistxattr, .{ fd, &buf, buf.len });
+    const n = try op(ops.flistxattr, .{ fd, &buf });
     var listed = [_]bool{ false, false, false };
     var it = std.mem.splitScalar(u8, buf[0..n], 0);
     while (it.next()) |name| {
@@ -74,12 +152,24 @@ fn listedAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error![acl_attributes.len]b
     return listed;
 }
 
+fn errnoText(e: linux.E) []const u8 {
+    return switch (e) {
+        .ACCES => "Permission denied",
+        .PERM => "Operation not permitted",
+        .IO => "Input/output error",
+        .INVAL => "Invalid argument",
+        .NODATA => "No data available",
+        .OPNOTSUPP => "Operation not supported",
+        else => @tagName(e),
+    };
+}
+
 fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
     const listed = try listedAcls(a, fd, why);
     var acls: Acls = .{};
     var buf: [64 * 1024]u8 = undefined;
     for (acl_attributes, 0..) |name, i| {
-        const rc = linux.fgetxattr(fd, name.ptr, &buf, buf.len);
+        const rc = ops.fgetxattr(fd, name, &buf);
         const e = linux.errno(rc);
         if (e == .SUCCESS) {
             acls.present[i] = try a.dupe(u8, buf[0..rc]);
@@ -87,13 +177,13 @@ fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
         }
         if (listed[i]) {
             if (e == .NODATA) return refuse(a, why, "{s} was listed but is no longer readable", .{name});
-            return refuse(a, why, "cannot read {s}: {s}", .{ name, @tagName(e) });
+            return refuse(a, why, "cannot read {s}: [Errno {d}] {s}", .{ name, @backingInt(e), errnoText(e) });
         }
         if (e == .NODATA or e == .OPNOTSUPP) continue;
         // An unlisted NFSv4-family name may answer EINVAL where the same
         // inspection lists a POSIX access ACL, which is read here.
         if (e == .INVAL and isNfs4Family(name) and listed[2]) continue;
-        return refuse(a, why, "cannot read {s}: {s}", .{ name, @tagName(e) });
+        return refuse(a, why, "cannot read {s}: [Errno {d}] {s}", .{ name, @backingInt(e), errnoText(e) });
     }
     if (listed[2] and acls.present[2] == null) return refuse(a, why, "{s} was listed but is no longer readable", .{posix_access});
     return acls;
@@ -129,11 +219,11 @@ fn sameMetadata(x: Metadata, y: Metadata) bool {
 /// form removed, then everything read back.
 fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, why: *Why) Error!void {
     const m = metadata orelse {
-        try sys.fchmod(fd, @intCast(mode));
+        _ = try op(ops.fchmod, .{ fd, mode });
         return;
     };
-    try sys.fchown(fd, m.info.uid, m.info.gid);
-    try sys.fchmod(fd, @intCast(mode));
+    _ = try op(ops.fchown, .{ fd, m.info.uid, m.info.gid });
+    _ = try op(ops.fchmod, .{ fd, mode });
     var primary: ?usize = null;
     for (m.acls.present, 0..) |p, i| if (p != null) {
         primary = i;
@@ -142,7 +232,7 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
     if (primary) |i| {
         if (!(try readAcls(a, fd, why)).eql(m.acls)) {
             const v = m.acls.present[i].?;
-            _ = try sys.call(linux.fsetxattr, .{ fd, acl_attributes[i].ptr, v.ptr, v.len, @as(usize, 0) });
+            _ = try op(ops.fsetxattr, .{ fd, acl_attributes[i], v });
         }
     }
     for (acl_attributes) |_| {
@@ -153,7 +243,7 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
             break;
         };
         const i = extra orelse break;
-        _ = try sys.call(linux.fremovexattr, .{ fd, acl_attributes[i].ptr });
+        _ = try op(ops.fremovexattr, .{ fd, acl_attributes[i] });
     }
     const restored = try fsx.fstat(fd);
     if (restored.uid != m.info.uid or restored.gid != m.info.gid or restored.perm() != mode)
@@ -233,14 +323,14 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     var metadata: ?Metadata = null;
     if (metadata_path) |mp| {
         var inner: Why = .{};
-        metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else @errorName(err) });
+        metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
     }
     const mode: u32 = opts.mode orelse (if (metadata) |m| m.info.perm() else fileMode(path));
     const tmp = try std.fmt.allocPrint(a, "{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
     if (fsx.statAt(fsx.cwd, tmp, false)) |stale| {
         // A privileged writer hands its temporary file to the metadata owner
         // before a crash can interrupt it.
-        const euid = linux.geteuid();
+        const euid = ops.geteuid();
         const owner_ok = stale.uid == euid or (metadata != null and stale.uid == metadata.?.info.uid);
         if (!stale.isReg() or !owner_ok or stale.nlink != 1)
             return refuse(a, why, "temporary file must be an owned regular file with one link: {s}", .{tmp});
@@ -253,18 +343,19 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         sys.close(fd);
         return err;
     };
+    ops.created(fd);
     errdefer discard(tmp, created);
     {
         defer sys.close(fd);
         try sys.writeAll(fd, data);
         var inner: Why = .{};
-        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else @errorName(err) });
+        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
         opts.faults.reach(try std.fmt.allocPrint(a, "{s}.fsync", .{opts.step}));
-        try sys.fsync(fd);
+        _ = try op(ops.fsync, .{fd});
     }
     if (metadata) |m| {
         var inner: Why = .{};
-        const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else @errorName(err) });
+        const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
         if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
     }
     opts.faults.reach(try std.fmt.allocPrint(a, "{s}.rename", .{opts.step}));

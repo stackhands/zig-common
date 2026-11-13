@@ -60,6 +60,12 @@ fn map(rc: usize) Error!?usize {
     };
 }
 
+/// The result of a raw system call: its value, `null` for EINTR (retry), or
+/// the error.
+pub fn result(rc: usize) Error!?usize {
+    return map(rc);
+}
+
 /// Run `f` until it does not fail with EINTR.
 pub inline fn call(comptime f: anytype, args: anytype) Error!usize {
     while (true) {
