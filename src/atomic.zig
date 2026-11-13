@@ -65,10 +65,17 @@ fn realGeteuid() linux.uid_t {
 }
 fn realCreated(_: sys.fd_t) void {}
 
+/// The errno of the last failed call through `op`; sys.Error folds EPERM
+/// and EACCES into AccessDenied, and describe() tells them apart by this.
+var last_errno: linux.E = .SUCCESS;
+
 /// Call one of `ops`, retrying on EINTR.
 fn op(f: anytype, args: anytype) sys.Error!usize {
     while (true) {
-        if (try sys.result(@call(.auto, f, args))) |rc| return rc;
+        const rc = @call(.auto, f, args);
+        const e = linux.errno(rc);
+        if (e != .SUCCESS and e != .INTR) last_errno = e;
+        if (try sys.result(rc)) |r| return r;
     }
 }
 
@@ -77,7 +84,7 @@ fn op(f: anytype, args: anytype) sys.Error!usize {
 pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.NotFound => "[Errno 2] No such file or directory",
-        error.AccessDenied => "[Errno 13] Permission denied",
+        error.AccessDenied => if (last_errno == .PERM) "[Errno 1] Operation not permitted" else "[Errno 13] Permission denied",
         error.Unsupported => "[Errno 95] Operation not supported",
         error.NoData => "[Errno 61] No data available",
         error.InvalidArgument => "[Errno 22] Invalid argument",
@@ -314,6 +321,7 @@ pub const WriteOptions = struct {
 /// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
 /// precede those operations; the destination is never unlinked first.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
+    last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
     try makedirs(parent);
     if (fsx.statAt(fsx.cwd, path, false)) |st| {

@@ -1497,6 +1497,20 @@ test "an ACL copy failure keeps the live bytes" {
     try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
 }
 
+test "a denied fchown reads as Python's EPERM text" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "module.lua");
+    writeFile(path, "old");
+    installOverrides();
+    over.fchown = .PERM;
+    try expectRefused(write(path, "new", replace), "[Errno 1] Operation not permitted");
+    over.fchown = .ACCES;
+    try expectRefused(write(path, "new", replace), "[Errno 13] Permission denied");
+}
+
 test "an ownership copy failure keeps the live bytes" {
     begin();
     defer end();
