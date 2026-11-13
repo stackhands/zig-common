@@ -14,4 +14,5 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("atomic_test.zig");
     _ = @import("state_test.zig");
+    _ = @import("proc_test.zig");
 }

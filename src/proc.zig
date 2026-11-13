@@ -50,6 +50,18 @@ pub const Options = struct {
     /// Set to the child's process group id while it runs, 0 otherwise, so a
     /// signal handler can kill it. Only with `new_session`.
     pgid_out: ?*std.atomic.Value(i32) = null,
+    /// `truncate`: stdout past `stdout_limit` is read and dropped, and the
+    /// call goes on; `fail`: it is an error and the child is killed.
+    stdout_overflow: enum { fail, truncate } = .fail,
+    /// Return once the child exits, whoever else still holds its pipes: its
+    /// group is killed, what the pipes already hold is drained (at most 16
+    /// reads per stream) and they are closed, so a writer that left the
+    /// group gets EPIPE instead of holding the call. Only with `new_session`.
+    end_with_leader: bool = false,
+    /// After the group is killed, wait (up to 10 s) until no member of it
+    /// is alive, so nothing of the child outlives the call. Only with
+    /// `new_session`.
+    wait_for_group: bool = false,
 };
 
 pub const Result = struct {
@@ -156,6 +168,47 @@ fn reap(pid: linux.pid_t) Term {
     }
 }
 
+/// True while a live (not zombie) process is in process group `pgid`.
+fn groupAlive(pgid: linux.pid_t) bool {
+    const dir = sys.openat(linux.AT.FDCWD, "/proc", .{ .DIRECTORY = true }, 0) catch return false;
+    defer sys.close(dir);
+    var dents: [16 * 1024]u8 align(8) = undefined;
+    while (true) {
+        const n = linux.getdents64(dir, &dents, dents.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return false;
+        var pos: usize = 0;
+        while (pos < n) {
+            const d: *align(1) const linux.dirent64 = @ptrCast(dents[pos..].ptr);
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(dents[pos + @offsetOf(linux.dirent64, "name") ..].ptr)));
+            pos += d.reclen;
+            if (name.len == 0 or !std.ascii.isDigit(name[0])) continue;
+            var path_buf: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{name}) catch continue;
+            const fd = sys.openat(linux.AT.FDCWD, path, .{}, 0) catch continue;
+            var buf: [512]u8 = undefined;
+            const got = sys.read(fd, &buf) catch 0;
+            sys.close(fd);
+            const stat = buf[0..got];
+            const close_paren = std.mem.lastIndexOfScalar(u8, stat, ')') orelse continue;
+            var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
+            const state = fields.next() orelse continue;
+            _ = fields.next(); // ppid
+            const pgrp = std.fmt.parseInt(linux.pid_t, fields.next() orelse continue, 10) catch continue;
+            if (pgrp == pgid and state[0] != 'Z' and state[0] != 'X') return true;
+        }
+    }
+}
+
+/// Wait up to 10 s until group `pgid` has no live member.
+fn waitGroupGone(pgid: linux.pid_t) void {
+    const until = nowMs() + 10_000;
+    while (groupAlive(pgid) and nowMs() < until) {
+        kill(pgid, true, .KILL);
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+}
+
 fn kill(pid: linux.pid_t, group: bool, sig: linux.SIG) void {
     _ = linux.kill(if (group) -pid else pid, sig);
 }
@@ -171,6 +224,22 @@ fn pipe() sys.Error!Pipe {
 fn setNonblock(fd: sys.fd_t) void {
     const fl = linux.fcntl(fd, linux.F.GETFL, 0);
     _ = linux.fcntl(fd, linux.F.SETFL, fl | (1 << @bitOffsetOf(linux.O, "NONBLOCK")));
+}
+
+/// Append `bytes` read from stdout (`i` 1) or stderr (2) within the limits.
+fn keep(i: usize, bytes: []const u8, out: *std.ArrayList(u8), err_buf: *std.ArrayList(u8), gpa: Allocator, opts: Options) Error!void {
+    if (i == 1) {
+        if (out.items.len + bytes.len > opts.stdout_limit) {
+            if (opts.stdout_overflow == .fail) return error.StreamTooLong;
+            const room = opts.stdout_limit -| out.items.len;
+            try out.appendSlice(gpa, bytes[0..@min(bytes.len, room)]);
+            return;
+        }
+        try out.appendSlice(gpa, bytes);
+    } else {
+        const room = opts.stderr_limit -| err_buf.items.len;
+        try err_buf.appendSlice(gpa, bytes[0..@min(bytes.len, room)]);
+    }
 }
 
 /// Run `exe` (an absolute path) with `argv` (argv[0] included) and `envp`.
@@ -239,6 +308,31 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             failure = error.Canceled;
             break;
         };
+        if (opts.end_with_leader and opts.new_session and exitedWithin(pid, 0)) {
+            // The child is gone: stop its group, keep what is already in
+            // the pipes, and close them under any writer that left it.
+            kill(pid, true, .KILL);
+            for (fds[1..], 1..) |fd, i| {
+                if (fd < 0) continue;
+                setNonblock(fd);
+                var reads: usize = 0;
+                while (reads < 16) : (reads += 1) {
+                    const rc = linux.read(fd, &buf, buf.len);
+                    if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+                    keep(i, buf[0..rc], &out, &err_buf, gpa, opts) catch |e| {
+                        failure = e;
+                        break;
+                    };
+                }
+                sys.close(fds[i]);
+                fds[i] = -1;
+            }
+            if (fds[0] >= 0) {
+                sys.close(fds[0]);
+                fds[0] = -1;
+            }
+            break;
+        }
         var wait: i32 = -1;
         if (deadline) |d| {
             const left = d - nowMs();
@@ -248,6 +342,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             }
             wait = @intCast(@min(left, std.math.maxInt(i32)));
         }
+        if (opts.end_with_leader and (wait < 0 or wait > 20)) wait = 20;
         var pfds: [3]linux.pollfd = undefined;
         var which_fd: [3]usize = undefined;
         var n: usize = 0;
@@ -291,16 +386,10 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
                 fds[i] = -1;
                 continue;
             }
-            if (i == 1) {
-                if (out.items.len + got > opts.stdout_limit) {
-                    failure = error.StreamTooLong;
-                    break :loop;
-                }
-                try out.appendSlice(gpa, buf[0..got]);
-            } else {
-                const room = opts.stderr_limit -| err_buf.items.len;
-                try err_buf.appendSlice(gpa, buf[0..@min(got, room)]);
-            }
+            keep(i, buf[0..got], &out, &err_buf, gpa, opts) catch |e| {
+                failure = e;
+                break :loop;
+            };
         }
     }
 
@@ -316,12 +405,14 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             if (!exitedWithin(pid, opts.grace_ms)) kill(pid, opts.new_session, .KILL);
         }
         if (opts.new_session) kill(pid, true, .KILL);
+        if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
         _ = reap(pid);
         return err;
     }
     // Members of the child's group outliving it are not ours to keep; the
     // unreaped leader keeps the group id from being reused until this is sent.
     if (opts.new_session) kill(pid, true, .KILL);
+    if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
     const term = reap(pid);
     const o = try out.toOwnedSlice(gpa);
     errdefer gpa.free(o);
