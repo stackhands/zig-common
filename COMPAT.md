@@ -2,6 +2,7 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
+| 0.3.0 | 0.17.1 | eb-staged-rebuild (Zig port; `-Dtest-ops` test artifact); eb-keep-logs builds against it in CI |
 | 0.2.0 | 0.17.1 | eb-staged-rebuild (Zig port); eb-keep-logs builds against it in CI |
 | 0.1.0 | 0.17.1 | eb-keep-logs 0.2.0 |
 
