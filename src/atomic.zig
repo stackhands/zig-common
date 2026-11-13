@@ -35,9 +35,13 @@ pub const Ops = struct {
 var test_ops: Ops = .{};
 const real_ops: Ops = .{};
 
-/// The calls in use. A test build may assign through it (`ops.* = ...`);
-/// in any other build it points at constant real calls.
-pub const ops = if (builtin.is_test) &test_ops else &real_ops;
+/// Whether `ops` can be replaced: in this library's tests, and in a tool's
+/// test artifact built with -Dtest-ops; never in a released binary.
+pub const replaceable = builtin.is_test or @import("zig_common_options").test_ops;
+
+/// The calls in use. A replaceable build may assign through it
+/// (`ops.* = ...`); any other build points it at constant real calls.
+pub const ops = if (replaceable) &test_ops else &real_ops;
 
 fn realList(fd: sys.fd_t, buf: []u8) usize {
     return linux.flistxattr(fd, buf.ptr, buf.len);
