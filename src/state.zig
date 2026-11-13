@@ -133,20 +133,24 @@ test "a file that is not private is not read" {
 pub const RootLock = struct {
     gate: fsx.fd_t,
     posix: fsx.fd_t,
+    /// The process that took the lock. A forked child that releases it only
+    /// closes its descriptors: unlocking the shared gate would drop the
+    /// parent's lock.
+    owner: linux.pid_t,
 
     pub const AcquireError = Error || error{ Busy, NotPrivate, OutOfMemory };
 
     fn takeFlock(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
         const d = deadline_ms orelse {
-            _ = try sys.call(linux.flock, .{ fd, std.posix.LOCK.EX });
+            _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
             return;
         };
         while (true) {
-            const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+            const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
             switch (linux.errno(rc)) {
                 .SUCCESS => return,
                 .AGAIN, .ACCES, .INTR => {},
-                else => return error.Unexpected,
+                else => return mapped(rc),
             }
             if (try pause(d)) return error.Busy;
         }
@@ -158,14 +162,14 @@ pub const RootLock = struct {
         fl.whence = 0; // SEEK_SET, offset 0, length 0: the whole file
         const cmd: i32 = if (deadline_ms == null) linux.F.SETLKW else linux.F.SETLK;
         while (true) {
-            const rc = linux.fcntl(fd, cmd, @intFromPtr(&fl));
+            const rc = lock_ops.fcntl(fd, cmd, @intFromPtr(&fl));
             switch (linux.errno(rc)) {
                 .SUCCESS => return,
                 .INTR => continue,
                 .AGAIN, .ACCES => if (deadline_ms) |d| {
                     if (try pause(d)) return error.Busy;
                 } else return error.Unexpected,
-                else => return error.Unexpected,
+                else => return mapped(rc),
             }
         }
     }
@@ -192,26 +196,76 @@ pub const RootLock = struct {
         const gate = try sys.openat(fsx.cwd, gate_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
         errdefer sys.close(gate);
         try takeFlock(gate, deadline);
-        const posix = try sys.openat(fsx.cwd, posix_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
+        var zb: [sys.path_max:0]u8 = undefined;
+        const posix: fsx.fd_t = @intCast(try lockCall(lock_ops.open_sidecar, .{(try sys.z(&zb, posix_path)).ptr}));
         errdefer sys.close(posix);
         const st = try fsx.fstat(posix);
         if (!st.isReg() or st.nlink != 1) return error.NotPrivate;
         try takeRecord(posix, deadline);
-        _ = try sys.call(linux.ftruncate, .{ gate, @as(i64, 0) });
+        _ = try lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) });
         var buf: [24]u8 = undefined;
-        try sys.writeAll(gate, std.fmt.bufPrint(&buf, "{d}\n", .{linux.getpid()}) catch unreachable);
-        return .{ .gate = gate, .posix = posix };
+        const line = std.fmt.bufPrint(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
+        if ((try lockCall(lock_ops.write, .{ gate, line })) != line.len) return error.NoSpace;
+        return .{ .gate = gate, .posix = posix, .owner = linux.getpid() };
     }
 
+    /// Unlock the record lock, close its descriptor, then unlock and close
+    /// the gate. Both descriptors are closed whatever an unlock returns; a
+    /// forked child only closes them.
     pub fn release(l: RootLock) void {
-        var fl: linux.Flock = std.mem.zeroes(linux.Flock);
-        fl.type = 2; // F_UNLCK
-        _ = linux.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+        if (linux.getpid() == l.owner) {
+            var fl: linux.Flock = std.mem.zeroes(linux.Flock);
+            fl.type = 2; // F_UNLCK
+            _ = lock_ops.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+        }
         sys.close(l.posix);
-        _ = linux.flock(l.gate, std.posix.LOCK.UN);
+        if (linux.getpid() == l.owner) _ = lock_ops.flock(l.gate, std.posix.LOCK.UN);
         sys.close(l.gate);
     }
 };
+
+/// The calls RootLock makes, as raw system-call results. Replaceable in the
+/// same builds as atomic.ops (this library's tests, a tool's -Dtest-ops
+/// artifact); constant real calls in any other build.
+pub const LockOps = struct {
+    flock: *const fn (fd: fsx.fd_t, op: i32) usize = realFlock,
+    fcntl: *const fn (fd: fsx.fd_t, cmd: i32, arg: usize) usize = realFcntl,
+    ftruncate: *const fn (fd: fsx.fd_t, len: i64) usize = realFtruncate,
+    write: *const fn (fd: fsx.fd_t, bytes: []const u8) usize = realWrite,
+    open_sidecar: *const fn (path: [*:0]const u8) usize = realOpenSidecar,
+};
+
+var test_lock_ops: LockOps = .{};
+const real_lock_ops: LockOps = .{};
+pub const lock_ops = if (@import("atomic.zig").replaceable) &test_lock_ops else &real_lock_ops;
+
+fn realFlock(fd: fsx.fd_t, op: i32) usize {
+    return linux.flock(fd, op);
+}
+fn realFcntl(fd: fsx.fd_t, cmd: i32, arg: usize) usize {
+    return linux.fcntl(fd, cmd, arg);
+}
+fn realFtruncate(fd: fsx.fd_t, len: i64) usize {
+    return linux.ftruncate(fd, len);
+}
+fn realWrite(fd: fsx.fd_t, bytes: []const u8) usize {
+    return linux.write(fd, bytes.ptr, bytes.len);
+}
+fn realOpenSidecar(path: [*:0]const u8) usize {
+    return linux.openat(fsx.cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
+}
+
+/// One of `lock_ops`, retrying on EINTR.
+fn lockCall(f: anytype, args: anytype) Error!usize {
+    while (true) {
+        if (try sys.result(@call(.auto, f, args))) |rc| return rc;
+    }
+}
+
+fn mapped(rc: usize) Error {
+    _ = sys.result(rc) catch |e| return e;
+    return error.Unexpected;
+}
 
 fn nowMs() i64 {
     var ts: linux.timespec = undefined;
