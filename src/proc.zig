@@ -55,8 +55,10 @@ pub const Options = struct {
     stdout_overflow: enum { fail, truncate } = .fail,
     /// Return once the child exits, whoever else still holds its pipes: its
     /// group is killed, what the pipes already hold is drained (at most 16
-    /// reads per stream) and they are closed, so a writer that left the
-    /// group gets EPIPE instead of holding the call. Only with `new_session`.
+    /// reads of 16 KiB, 256 KiB, per stream; enough for a default 64 KiB
+    /// pipe, not for one a writer enlarged with F_SETPIPE_SZ) and they are
+    /// closed, so a writer that left the group gets EPIPE instead of holding
+    /// the call. Only with `new_session`.
     end_with_leader: bool = false,
     /// After the group is killed, wait (up to 10 s) until no member of it
     /// is alive, so nothing of the child outlives the call. Only with
@@ -168,8 +170,10 @@ fn reap(pid: linux.pid_t) Term {
     }
 }
 
-/// True while a live (not zombie) process is in process group `pgid`.
-fn groupAlive(pgid: linux.pid_t) bool {
+/// True while a live (not zombie) process is in process group `pgid`. A
+/// /proc read that fails mid-scan answers false, so a wait on this is best
+/// effort.
+pub fn groupAlive(pgid: linux.pid_t) bool {
     const dir = sys.openat(linux.AT.FDCWD, "/proc", .{ .DIRECTORY = true }, 0) catch return false;
     defer sys.close(dir);
     var dents: [16 * 1024]u8 align(8) = undefined;
@@ -199,7 +203,8 @@ fn groupAlive(pgid: linux.pid_t) bool {
     }
 }
 
-/// Wait up to 10 s until group `pgid` has no live member.
+/// Wait up to 10 s until group `pgid` has no live member; best effort, as
+/// groupAlive is.
 fn waitGroupGone(pgid: linux.pid_t) void {
     const until = nowMs() + 10_000;
     while (groupAlive(pgid) and nowMs() < until) {
