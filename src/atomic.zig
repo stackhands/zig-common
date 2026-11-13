@@ -1,0 +1,304 @@
+//! Same-directory replacement of a file whose access metadata must survive:
+//! the bytes, owner, mode and every listed ACL form are written to a
+//! temporary file, read back, made durable, and only then renamed over the
+//! destination. The ACL forms are the GPFS native NFSv4 ACL, the generic
+//! NFSv4 ACL and the POSIX access ACL, most native first; a filesystem may
+//! expose one ACL through several of them.
+const std = @import("std");
+const linux = std.os.linux;
+const sys = @import("sys.zig");
+const fsx = @import("fsx.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const acl_attributes = [_][:0]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
+const posix_access = "system.posix_acl_access";
+
+/// Why a replacement was refused; filled in when an error is returned.
+pub const Why = struct {
+    msg: []const u8 = "",
+};
+
+pub const Error = error{ Refused, OutOfMemory } || sys.Error;
+
+fn refuse(a: Allocator, why: *Why, comptime f: []const u8, args: anytype) Error {
+    why.msg = std.fmt.allocPrint(a, f, args) catch "refused";
+    return error.Refused;
+}
+
+/// The value of each ACL attribute present, keyed by its name.
+pub const Acls = struct {
+    present: [acl_attributes.len]?[]const u8 = .{ null, null, null },
+
+    pub fn eql(x: Acls, y: Acls) bool {
+        for (x.present, y.present) |p, q| {
+            if ((p == null) != (q == null)) return false;
+            if (p != null and !std.mem.eql(u8, p.?, q.?)) return false;
+        }
+        return true;
+    }
+};
+
+pub const Metadata = struct { info: fsx.Stat, acls: Acls };
+
+/// (dev, ino, uid, gid, mode, ctime): what a concurrent change moves.
+fn identity(s: fsx.Stat) [7]i128 {
+    return .{ s.dev, s.ino, s.uid, s.gid, s.mode, s.ctime.sec, s.ctime.nsec };
+}
+
+fn sameIdentity(x: fsx.Stat, y: fsx.Stat) bool {
+    return std.mem.eql(i128, &identity(x), &identity(y));
+}
+
+fn isNfs4Family(name: []const u8) bool {
+    return std.mem.eql(u8, name, "system.gpfs_nfs4_acl") or std.mem.eql(u8, name, "system.nfs4_acl");
+}
+
+/// Names of the listed ACL attributes; any other system.* attribute is
+/// unsupported.
+fn listedAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error![acl_attributes.len]bool {
+    var buf: [64 * 1024]u8 = undefined;
+    const n = try sys.call(linux.flistxattr, .{ fd, &buf, buf.len });
+    var listed = [_]bool{ false, false, false };
+    var it = std.mem.splitScalar(u8, buf[0..n], 0);
+    while (it.next()) |name| {
+        if (name.len == 0) continue;
+        var known = false;
+        for (acl_attributes, 0..) |acl, i| if (std.mem.eql(u8, acl, name)) {
+            listed[i] = true;
+            known = true;
+        };
+        if (!known and std.mem.startsWith(u8, name, "system."))
+            return refuse(a, why, "unsupported access-control attribute {s}", .{name});
+    }
+    return listed;
+}
+
+fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
+    const listed = try listedAcls(a, fd, why);
+    var acls: Acls = .{};
+    var buf: [64 * 1024]u8 = undefined;
+    for (acl_attributes, 0..) |name, i| {
+        const rc = linux.fgetxattr(fd, name.ptr, &buf, buf.len);
+        const e = linux.errno(rc);
+        if (e == .SUCCESS) {
+            acls.present[i] = try a.dupe(u8, buf[0..rc]);
+            continue;
+        }
+        if (listed[i]) {
+            if (e == .NODATA) return refuse(a, why, "{s} was listed but is no longer readable", .{name});
+            return refuse(a, why, "cannot read {s}: {s}", .{ name, @tagName(e) });
+        }
+        if (e == .NODATA or e == .OPNOTSUPP) continue;
+        // An unlisted NFSv4-family name may answer EINVAL where the same
+        // inspection lists a POSIX access ACL, which is read here.
+        if (e == .INVAL and isNfs4Family(name) and listed[2]) continue;
+        return refuse(a, why, "cannot read {s}: {s}", .{ name, @tagName(e) });
+    }
+    if (listed[2] and acls.present[2] == null) return refuse(a, why, "{s} was listed but is no longer readable", .{posix_access});
+    return acls;
+}
+
+/// Every listed or virtual ACL of an open regular file, read twice; a change
+/// between the reads, or of the file's identity, is refused.
+pub fn readAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
+    const before = try fsx.fstat(fd);
+    const acls = try readAllAcls(a, fd, why);
+    const again = try readAllAcls(a, fd, why);
+    if (!acls.eql(again) or !sameIdentity(try fsx.fstat(fd), before))
+        return refuse(a, why, "access metadata changed during inspection", .{});
+    return acls;
+}
+
+pub fn readMetadata(a: Allocator, path: []const u8, why: *Why) Error!Metadata {
+    const fd = try sys.openat(fsx.cwd, path, .{ .NOFOLLOW = true, .NONBLOCK = true }, 0);
+    defer sys.close(fd);
+    const info = try fsx.fstat(fd);
+    if (!info.isReg()) return refuse(a, why, "metadata source is not a regular file: {s}", .{path});
+    const acls = try readAcls(a, fd, why);
+    if (!sameIdentity(try fsx.fstat(fd), info)) return refuse(a, why, "access metadata changed during inspection", .{});
+    return .{ .info = info, .acls = acls };
+}
+
+fn sameMetadata(x: Metadata, y: Metadata) bool {
+    return sameIdentity(x.info, y.info) and x.acls.eql(y.acls);
+}
+
+/// Ownership and mode first (chown can clear set-id bits, chmod can rewrite
+/// an NFSv4 ACL or a POSIX mask), then the most native ACL, then any extra
+/// form removed, then everything read back.
+fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, why: *Why) Error!void {
+    const m = metadata orelse {
+        try sys.fchmod(fd, @intCast(mode));
+        return;
+    };
+    try sys.fchown(fd, m.info.uid, m.info.gid);
+    try sys.fchmod(fd, @intCast(mode));
+    var primary: ?usize = null;
+    for (m.acls.present, 0..) |p, i| if (p != null) {
+        primary = i;
+        break;
+    };
+    if (primary) |i| {
+        if (!(try readAcls(a, fd, why)).eql(m.acls)) {
+            const v = m.acls.present[i].?;
+            _ = try sys.call(linux.fsetxattr, .{ fd, acl_attributes[i].ptr, v.ptr, v.len, @as(usize, 0) });
+        }
+    }
+    for (acl_attributes) |_| {
+        const present = try readAcls(a, fd, why);
+        var extra: ?usize = null;
+        for (present.present, m.acls.present, 0..) |p, want, i| if (p != null and want == null) {
+            extra = i;
+            break;
+        };
+        const i = extra orelse break;
+        _ = try sys.call(linux.fremovexattr, .{ fd, acl_attributes[i].ptr });
+    }
+    const restored = try fsx.fstat(fd);
+    if (restored.uid != m.info.uid or restored.gid != m.info.gid or restored.perm() != mode)
+        return refuse(a, why, "ownership or mode did not round-trip: expected {d}:{d} {o}, found {d}:{d} {o}", .{ m.info.uid, m.info.gid, mode, restored.uid, restored.gid, restored.perm() });
+    if (!(try readAcls(a, fd, why)).eql(m.acls)) return refuse(a, why, "access-control attributes did not round-trip", .{});
+}
+
+/// Called before each named step; a test hook can stop the program there.
+pub const Faults = struct {
+    ctx: ?*anyopaque = null,
+    reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
+
+    pub fn reach(f: Faults, step: []const u8) void {
+        if (f.reach_fn) |r| r(f.ctx, step);
+    }
+};
+
+fn exists(path: []const u8) bool {
+    _ = fsx.statAt(fsx.cwd, path, false) catch return false;
+    return true;
+}
+
+fn currentUmask() u32 {
+    const old = linux.syscall1(.umask, 0);
+    _ = linux.syscall1(.umask, old);
+    return @intCast(old);
+}
+
+/// Mode for a new file: the existing file's mode, otherwise 0644 less the
+/// umask.
+pub fn fileMode(path: []const u8) u32 {
+    if (fsx.statAt(fsx.cwd, path, false)) |st| {
+        if (!st.isLink()) return st.perm();
+    } else |_| {}
+    return 0o644 & ~currentUmask();
+}
+
+pub fn fsyncDir(path: []const u8) sys.Error!void {
+    const fd = try sys.openat(fsx.cwd, path, .{}, 0);
+    defer sys.close(fd);
+    try sys.fsync(fd);
+}
+
+/// os.makedirs(path, exist_ok=True).
+pub fn makedirs(path: []const u8) sys.Error!void {
+    if (fsx.statAt(fsx.cwd, path, true)) |st| {
+        if (st.isDir()) return;
+        return error.NotDir;
+    } else |_| {}
+    if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) try makedirs(parent);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = sys.call(linux.mkdirat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
+        error.Exists => {},
+        else => return err,
+    };
+}
+
+pub const WriteOptions = struct {
+    mode: ?u32 = null,
+    metadata_from: ?[]const u8 = null,
+    faults: Faults = .{},
+    step: []const u8 = "write",
+};
+
+/// atomic_write: replace `path` only after its bytes and access metadata
+/// are durable. An existing file keeps its owner, mode and ACL forms,
+/// including the absence of one; `metadata_from` names another file whose
+/// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
+/// precede those operations; the destination is never unlinked first.
+pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
+    const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
+    try makedirs(parent);
+    if (fsx.statAt(fsx.cwd, path, false)) |st| {
+        if (st.isLink()) return refuse(a, why, "refusing to replace a symlink: {s}", .{path});
+    } else |_| {}
+    const metadata_path: ?[]const u8 = opts.metadata_from orelse (if (exists(path)) path else null);
+    var metadata: ?Metadata = null;
+    if (metadata_path) |mp| {
+        var inner: Why = .{};
+        metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else @errorName(err) });
+    }
+    const mode: u32 = opts.mode orelse (if (metadata) |m| m.info.perm() else fileMode(path));
+    const tmp = try std.fmt.allocPrint(a, "{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
+    if (fsx.statAt(fsx.cwd, tmp, false)) |stale| {
+        // A privileged writer hands its temporary file to the metadata owner
+        // before a crash can interrupt it.
+        const euid = linux.geteuid();
+        const owner_ok = stale.uid == euid or (metadata != null and stale.uid == metadata.?.info.uid);
+        if (!stale.isReg() or !owner_ok or stale.nlink != 1)
+            return refuse(a, why, "temporary file must be an owned regular file with one link: {s}", .{tmp});
+        try sys.unlinkat(fsx.cwd, tmp, 0);
+    } else |_| {}
+
+    opts.faults.reach(try std.fmt.allocPrint(a, "{s}.write", .{opts.step}));
+    const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    const created = fsx.fstat(fd) catch |err| {
+        sys.close(fd);
+        return err;
+    };
+    errdefer discard(tmp, created);
+    {
+        defer sys.close(fd);
+        try sys.writeAll(fd, data);
+        var inner: Why = .{};
+        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else @errorName(err) });
+        opts.faults.reach(try std.fmt.allocPrint(a, "{s}.fsync", .{opts.step}));
+        try sys.fsync(fd);
+    }
+    if (metadata) |m| {
+        var inner: Why = .{};
+        const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else @errorName(err) });
+        if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
+    }
+    opts.faults.reach(try std.fmt.allocPrint(a, "{s}.rename", .{opts.step}));
+    try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
+    try fsyncDir(parent);
+}
+
+fn discard(tmp: []const u8, created: fsx.Stat) void {
+    const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
+    if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
+}
+
+test "atomicWrite keeps the mode and refuses a symlink" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var pb: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "/tmp/zig-common-atomic-{d}", .{linux.getpid()});
+    try makedirs(base);
+    defer fsx.deleteTree(a, fsx.cwd, base) catch {};
+    const p = try std.fmt.allocPrint(a, "{s}/j.json", .{base});
+    var why: Why = .{};
+    try atomicWrite(a, p, "one\n", .{ .mode = 0o640 }, &why);
+    try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(fsx.cwd, p, false)).perm());
+    try atomicWrite(a, p, "two\n", .{}, &why);
+    try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(fsx.cwd, p, false)).perm());
+    const f = try fsx.openRegular(fsx.cwd, p, false);
+    defer sys.close(f.fd);
+    try std.testing.expectEqualStrings("two\n", try fsx.readAll(a, f.fd, 100));
+    const link = try std.fmt.allocPrint(a, "{s}/l.json", .{base});
+    var zl: [sys.path_max:0]u8 = undefined;
+    var zt: [sys.path_max:0]u8 = undefined;
+    _ = linux.symlinkat((try sys.z(&zt, p)).ptr, fsx.cwd, (try sys.z(&zl, link)).ptr);
+    try std.testing.expectError(error.Refused, atomicWrite(a, link, "x", .{}, &why));
+    try std.testing.expect(std.mem.startsWith(u8, why.msg, "refusing to replace a symlink"));
+    try std.testing.expect(!exists(try std.fmt.allocPrint(a, "{s}/.j.json.new", .{base})));
+}

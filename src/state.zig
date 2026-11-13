@@ -121,3 +121,112 @@ test "a file that is not private is not read" {
     defer sys.close(lk);
     try lockExclusive(lk, 100);
 }
+
+// ---- the state-root lock: a flock gate and a POSIX record lock -------------
+
+/// A state root's lock. The flock gate excludes processes on one kernel; the
+/// POSIX record lock on a separate sidecar excludes nodes where the
+/// filesystem keeps record locks coherent. The sidecar is opened only while
+/// the gate is held, because closing any descriptor for it drops this
+/// process's record locks; it is released before the gate. Neither file is
+/// ever unlinked.
+pub const RootLock = struct {
+    gate: fsx.fd_t,
+    posix: fsx.fd_t,
+
+    pub const AcquireError = Error || error{ Busy, NotPrivate, OutOfMemory };
+
+    fn takeFlock(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
+        const d = deadline_ms orelse {
+            _ = try sys.call(linux.flock, .{ fd, std.posix.LOCK.EX });
+            return;
+        };
+        while (true) {
+            const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+            switch (linux.errno(rc)) {
+                .SUCCESS => return,
+                .AGAIN, .ACCES, .INTR => {},
+                else => return error.Unexpected,
+            }
+            if (try pause(d)) return error.Busy;
+        }
+    }
+
+    fn takeRecord(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
+        var fl: linux.Flock = std.mem.zeroes(linux.Flock);
+        fl.type = 1; // F_WRLCK
+        fl.whence = 0; // SEEK_SET, offset 0, length 0: the whole file
+        const cmd: i32 = if (deadline_ms == null) linux.F.SETLKW else linux.F.SETLK;
+        while (true) {
+            const rc = linux.fcntl(fd, cmd, @intFromPtr(&fl));
+            switch (linux.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .AGAIN, .ACCES => if (deadline_ms) |d| {
+                    if (try pause(d)) return error.Busy;
+                } else return error.Unexpected,
+                else => return error.Unexpected,
+            }
+        }
+    }
+
+    /// True once the deadline has passed; otherwise sleeps up to 20 ms.
+    fn pause(deadline_ms: i64) Error!bool {
+        const left = deadline_ms - nowMs();
+        if (left <= 0) return true;
+        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(left, 20) * std.time.ns_per_ms) };
+        _ = linux.nanosleep(&ts, null);
+        return false;
+    }
+
+    /// Lock STATE_ROOT/.lock and STATE_ROOT/.lock.posix, waiting up to
+    /// `timeout_ms` (null: no limit). The gate then records this pid.
+    pub fn acquire(gpa: Allocator, state_root: []const u8, timeout_ms: ?u32) AcquireError!RootLock {
+        const atomic = @import("atomic.zig");
+        try atomic.makedirs(state_root);
+        const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
+        const gate_path = try std.fs.path.join(gpa, &.{ state_root, ".lock" });
+        defer gpa.free(gate_path);
+        const posix_path = try std.fmt.allocPrint(gpa, "{s}.posix", .{gate_path});
+        defer gpa.free(posix_path);
+        const gate = try sys.openat(fsx.cwd, gate_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
+        errdefer sys.close(gate);
+        try takeFlock(gate, deadline);
+        const posix = try sys.openat(fsx.cwd, posix_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
+        errdefer sys.close(posix);
+        const st = try fsx.fstat(posix);
+        if (!st.isReg() or st.nlink != 1) return error.NotPrivate;
+        try takeRecord(posix, deadline);
+        _ = try sys.call(linux.ftruncate, .{ gate, @as(i64, 0) });
+        var buf: [24]u8 = undefined;
+        try sys.writeAll(gate, std.fmt.bufPrint(&buf, "{d}\n", .{linux.getpid()}) catch unreachable);
+        return .{ .gate = gate, .posix = posix };
+    }
+
+    pub fn release(l: RootLock) void {
+        var fl: linux.Flock = std.mem.zeroes(linux.Flock);
+        fl.type = 2; // F_UNLCK
+        _ = linux.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+        sys.close(l.posix);
+        _ = linux.flock(l.gate, std.posix.LOCK.UN);
+        sys.close(l.gate);
+    }
+};
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+test "RootLock refuses a second holder and is free after release" {
+    const gpa = std.testing.allocator;
+    var pb: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "/tmp/zig-common-rootlock-{d}", .{linux.getpid()});
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    const first = try RootLock.acquire(gpa, base, 0);
+    try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));
+    first.release();
+    const again = try RootLock.acquire(gpa, base, 0);
+    again.release();
+}

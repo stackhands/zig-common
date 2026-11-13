@@ -8,6 +8,7 @@ pub const env = @import("env.zig");
 pub const state = @import("state.zig");
 pub const json = @import("json.zig");
 pub const pytext = @import("pytext.zig");
+pub const atomic = @import("atomic.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

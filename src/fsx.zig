@@ -24,6 +24,9 @@ pub const Stat = struct {
     size: u64,
     atime: linux.timespec,
     mtime: linux.timespec,
+    ctime: linux.timespec = .{ .sec = 0, .nsec = 0 },
+    dev: u64 = 0,
+    ino: u64 = 0,
 
     pub fn isReg(s: Stat) bool {
         return s.mode & S.IFMT == S.IFREG;
@@ -48,6 +51,8 @@ const statx_mask: linux.STATX = .{
     .GID = true,
     .ATIME = true,
     .MTIME = true,
+    .CTIME = true,
+    .INO = true,
     .SIZE = true,
 };
 
@@ -60,6 +65,9 @@ fn fromStatx(x: linux.Statx) Stat {
         .size = x.size,
         .atime = .{ .sec = @intCast(x.atime.sec), .nsec = @intCast(x.atime.nsec) },
         .mtime = .{ .sec = @intCast(x.mtime.sec), .nsec = @intCast(x.mtime.nsec) },
+        .ctime = .{ .sec = @intCast(x.ctime.sec), .nsec = @intCast(x.ctime.nsec) },
+        .dev = (@as(u64, x.dev_major) << 32) | x.dev_minor,
+        .ino = x.ino,
     };
 }
 
