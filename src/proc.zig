@@ -1,9 +1,10 @@
-//! Running a child program. The child starts in its own session with an
-//! empty signal mask, default signal handlers and no descriptors above 2;
-//! the program is named by an absolute path, never looked up in a PATH the
-//! child's environment might set. The child's process group is killed when
-//! the deadline passes, and any member left after the child exits is killed
-//! too.
+//! Running a child program. The program is named by an absolute path, never
+//! looked up in a PATH the child's environment might set; `which` does the
+//! lookup, in an explicit PATH, beforehand. The child starts with an empty
+//! signal mask, default signal handlers and no descriptors above 2, and by
+//! default in its own session, so its whole process group can be killed.
+//! Input is written and both outputs are read at the same time, so a child
+//! that fills one pipe while the other is unread does not deadlock.
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
@@ -26,24 +27,48 @@ pub const Term = union(enum) {
 };
 
 pub const Options = struct {
+    /// Bytes written to the child's stdin, which is then closed; null means
+    /// stdin is /dev/null.
+    stdin: ?[]const u8 = null,
     /// More stdout than this is an error and the child is killed.
     stdout_limit: usize = 1 << 20,
-    /// Milliseconds before the child's group is sent SIGTERM.
-    timeout_ms: u32 = 300_000,
-    /// Milliseconds between SIGTERM and SIGKILL.
+    /// Stderr is captured up to this many bytes and the rest discarded; 0
+    /// sends stderr to /dev/null.
+    stderr_limit: usize = 0,
+    /// Milliseconds before the child's group is killed; null waits without
+    /// a limit.
+    timeout_ms: ?u32 = 300_000,
+    /// Milliseconds between SIGTERM and SIGKILL after the deadline.
     grace_ms: u32 = 2_000,
+    /// Start the child in a new session (and process group). Without it the
+    /// child stays in this process's group, so a kill of this group reaches
+    /// it.
+    new_session: bool = true,
+    /// Checked whenever the wait is interrupted (a signal handler sets it):
+    /// when true, the child's group is killed and `error.Canceled` returned.
+    cancel: ?*const std.atomic.Value(bool) = null,
+    /// Set to the child's process group id while it runs, 0 otherwise, so a
+    /// signal handler can kill it. Only with `new_session`.
+    pgid_out: ?*std.atomic.Value(i32) = null,
 };
 
 pub const Result = struct {
     term: Term,
     stdout: []u8,
+    stderr: []u8,
+
+    pub fn deinit(r: Result, gpa: Allocator) void {
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+    }
 };
 
-pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut, NotAbsolute };
+pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut, Canceled, NotAbsolute };
 
 /// Search `path_env` (colon-separated, an empty entry meaning the current
-/// directory, as the shell does) for an executable regular file `name`.
-/// Returns an absolute path, or null.
+/// directory, as execvp does) for an executable regular file `name`.
+/// Returns an absolute path to it, without resolving symbolic links, or
+/// null. A name containing '/' is not looked up.
 pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.Error!?[]u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null or name.len == 0) return null;
     var it = std.mem.splitScalar(u8, path_env, ':');
@@ -55,9 +80,10 @@ pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.E
         if (linux.errno(linux.faccessat(linux.AT.FDCWD, zc.ptr, linux.X_OK, 0)) != .SUCCESS) continue;
         const st = fsx.statAt(fsx.cwd, cand, true) catch continue;
         if (!st.isReg()) continue;
+        if (cand[0] == '/') return try gpa.dupe(u8, cand);
         var rb: [sys.path_max]u8 = undefined;
-        const abs = fsx.realpath(fsx.cwd, cand, &rb) catch continue;
-        return try gpa.dupe(u8, abs);
+        const dir_abs = fsx.realpath(fsx.cwd, if (dir_raw.len == 0) "." else dir_raw, &rb) catch continue;
+        return try std.fs.path.join(gpa, &.{ dir_abs, name });
     }
     return null;
 }
@@ -68,19 +94,27 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
-fn childExec(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: Envp, devnull: sys.fd_t, out_w: sys.fd_t) noreturn {
-    _ = linux.setsid();
+fn childExec(
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: Envp,
+    new_session: bool,
+    in_fd: sys.fd_t,
+    out_fd: sys.fd_t,
+    err_fd: sys.fd_t,
+) noreturn {
+    if (new_session) _ = linux.setsid();
     const empty = linux.sigemptyset();
-    _ = linux.sigprocmask(linux.SIG.SETMASK, &empty, null);
     var act: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = empty, .flags = 0 };
     var s: u32 = 1;
     while (s < linux.NSIG) : (s += 1) {
         if (s == @backingInt(linux.SIG.KILL) or s == @backingInt(linux.SIG.STOP)) continue;
         _ = linux.sigaction(@fromBackingInt(@intCast(s)), &act, null);
     }
-    if (linux.errno(linux.dup2(devnull, 0)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(out_w, 1)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(devnull, 2)) != .SUCCESS) linux.exit_group(127);
+    _ = linux.sigprocmask(linux.SIG.SETMASK, &empty, null);
+    if (linux.errno(linux.dup2(in_fd, 0)) != .SUCCESS) linux.exit_group(127);
+    if (linux.errno(linux.dup2(out_fd, 1)) != .SUCCESS) linux.exit_group(127);
+    if (linux.errno(linux.dup2(err_fd, 2)) != .SUCCESS) linux.exit_group(127);
     _ = linux.close_range(3, std.math.maxInt(linux.fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
     _ = linux.execve(path, argv, envp);
     linux.exit_group(127);
@@ -91,11 +125,11 @@ fn decode(status: u32) Term {
     return .{ .signaled = status & 0x7f };
 }
 
-/// Wait up to `ms` for the child to exit, leaving it unreaped (a zombie
-/// still holds its process group id, so the group cannot be reused while
-/// it is signalled). True once it has exited.
-fn exitedWithin(pid: linux.pid_t, ms: i64) bool {
-    const until = nowMs() + ms;
+/// Wait up to `ms` (null: no limit) for the child to exit, leaving it
+/// unreaped (a zombie still holds its process group id, so the group cannot
+/// be reused while it is signalled). True once it has exited.
+fn exitedWithin(pid: linux.pid_t, ms: ?i64) bool {
+    const until: ?i64 = if (ms) |m| nowMs() + m else null;
     while (true) {
         var info = std.mem.zeroes(linux.siginfo_t);
         const rc = linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null);
@@ -104,8 +138,8 @@ fn exitedWithin(pid: linux.pid_t, ms: i64) bool {
             .INTR => continue,
             else => return true,
         }
-        if (nowMs() >= until) return false;
-        var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        if (until) |u| if (nowMs() >= u) return false;
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         _ = linux.nanosleep(&ts, null);
     }
 }
@@ -122,18 +156,32 @@ fn reap(pid: linux.pid_t) Term {
     }
 }
 
-fn killGroup(pid: linux.pid_t, sig: linux.SIG) void {
-    _ = linux.kill(-pid, sig);
+fn kill(pid: linux.pid_t, group: bool, sig: linux.SIG) void {
+    _ = linux.kill(if (group) -pid else pid, sig);
 }
 
-/// Run `argv` with `envp`, stdin and stderr on /dev/null, and return its
-/// stdout and how it ended. `argv[0]` must be an absolute path.
-pub fn run(gpa: Allocator, argv: []const []const u8, envp: Envp, opts: Options) Error!Result {
-    if (argv.len == 0 or argv[0].len == 0 or argv[0][0] != '/') return error.NotAbsolute;
+const Pipe = struct { r: sys.fd_t, w: sys.fd_t };
+
+fn pipe() sys.Error!Pipe {
+    var p: [2]sys.fd_t = undefined;
+    _ = try sys.call(linux.pipe2, .{ &p, linux.O{ .CLOEXEC = true } });
+    return .{ .r = p[0], .w = p[1] };
+}
+
+fn setNonblock(fd: sys.fd_t) void {
+    const fl = linux.fcntl(fd, linux.F.GETFL, 0);
+    _ = linux.fcntl(fd, linux.F.SETFL, fl | (1 << @bitOffsetOf(linux.O, "NONBLOCK")));
+}
+
+/// Run `exe` (an absolute path) with `argv` (argv[0] included) and `envp`.
+pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp, opts: Options) Error!Result {
+    if (exe.len == 0 or exe[0] != '/') return error.NotAbsolute;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    if (std.mem.indexOfScalar(u8, exe, 0) != null) return error.InvalidArgument;
+    const zexe = try arena.dupeSentinel(u8, exe, 0);
     const zargv = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |a, i| {
         if (std.mem.indexOfScalar(u8, a, 0) != null) return error.InvalidArgument;
@@ -142,29 +190,74 @@ pub fn run(gpa: Allocator, argv: []const []const u8, envp: Envp, opts: Options) 
 
     const devnull = try sys.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR }, 0);
     defer sys.close(devnull);
-    var pipe: [2]sys.fd_t = undefined;
-    _ = try sys.call(linux.pipe2, .{ &pipe, linux.O{ .CLOEXEC = true } });
-    var read_end_open = true;
-    defer if (read_end_open) sys.close(pipe[0]);
+    var fds = [_]sys.fd_t{ -1, -1, -1 }; // parent ends: stdin write, stdout read, stderr read
+    defer for (fds) |fd| if (fd >= 0) sys.close(fd);
+    var child_in: sys.fd_t = devnull;
+    var child_err: sys.fd_t = devnull;
+    var in_p: ?Pipe = null;
+    var err_p: ?Pipe = null;
+    if (opts.stdin != null) {
+        in_p = try pipe();
+        fds[0] = in_p.?.w;
+        child_in = in_p.?.r;
+    }
+    const out_p = try pipe();
+    fds[1] = out_p.r;
+    if (opts.stderr_limit > 0) {
+        err_p = try pipe();
+        fds[2] = err_p.?.r;
+        child_err = err_p.?.w;
+    }
 
     const fork_rc = try sys.call(linux.fork, .{});
-    if (fork_rc == 0) childExec(zargv[0].?, zargv.ptr, envp, devnull, pipe[1]);
+    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err);
     const pid: linux.pid_t = @intCast(fork_rc);
-    sys.close(pipe[1]);
+    if (opts.new_session) {
+        if (opts.pgid_out) |p| p.store(pid, .seq_cst);
+    }
+    defer if (opts.pgid_out) |p| p.store(0, .seq_cst);
+    if (in_p) |p| sys.close(p.r);
+    sys.close(out_p.w);
+    if (err_p) |p| sys.close(p.w);
+    if (fds[0] >= 0) setNonblock(fds[0]);
 
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    const deadline = nowMs() + opts.timeout_ms;
+    defer out.deinit(gpa);
+    var err_buf: std.ArrayList(u8) = .empty;
+    defer err_buf.deinit(gpa);
+    var in_off: usize = 0;
+    if (opts.stdin) |s| if (s.len == 0) {
+        sys.close(fds[0]);
+        fds[0] = -1;
+    };
+
+    const deadline: ?i64 = if (opts.timeout_ms) |t| nowMs() + t else null;
     var failure: ?Error = null;
     var buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const left = deadline - nowMs();
-        if (left <= 0) {
-            failure = error.TimedOut;
+    loop: while (fds[0] >= 0 or fds[1] >= 0 or fds[2] >= 0) {
+        if (opts.cancel) |c| if (c.load(.seq_cst)) {
+            failure = error.Canceled;
             break;
+        };
+        var wait: i32 = -1;
+        if (deadline) |d| {
+            const left = d - nowMs();
+            if (left <= 0) {
+                failure = error.TimedOut;
+                break;
+            }
+            wait = @intCast(@min(left, std.math.maxInt(i32)));
         }
-        var pfd = [_]linux.pollfd{.{ .fd = pipe[0], .events = linux.POLL.IN }};
-        const prc = linux.poll(&pfd, 1, @intCast(@min(left, std.math.maxInt(i32))));
+        var pfds: [3]linux.pollfd = undefined;
+        var which_fd: [3]usize = undefined;
+        var n: usize = 0;
+        for (fds, 0..) |fd, i| {
+            if (fd < 0) continue;
+            pfds[n] = .{ .fd = fd, .events = if (i == 0) linux.POLL.OUT else linux.POLL.IN };
+            which_fd[n] = i;
+            n += 1;
+        }
+        const prc = linux.poll(&pfds, n, wait);
         switch (linux.errno(prc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -173,53 +266,106 @@ pub fn run(gpa: Allocator, argv: []const []const u8, envp: Envp, opts: Options) 
                 break;
             },
         }
-        if (prc == 0) continue;
-        const n = sys.read(pipe[0], &buf) catch |err| {
-            failure = err;
-            break;
-        };
-        if (n == 0) break;
-        if (out.items.len + n > opts.stdout_limit) {
-            failure = error.StreamTooLong;
-            break;
+        for (pfds[0..n], which_fd[0..n]) |p, i| {
+            if (p.revents == 0) continue;
+            if (i == 0) {
+                const s = opts.stdin.?;
+                const rc = linux.write(fds[0], s[in_off..].ptr, s.len - in_off);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => in_off += rc,
+                    .AGAIN, .INTR => {},
+                    else => in_off = s.len, // EPIPE: the child stopped reading
+                }
+                if (in_off >= s.len) {
+                    sys.close(fds[0]);
+                    fds[0] = -1;
+                }
+                continue;
+            }
+            const got = sys.read(fds[i], &buf) catch |e| {
+                failure = e;
+                break :loop;
+            };
+            if (got == 0) {
+                sys.close(fds[i]);
+                fds[i] = -1;
+                continue;
+            }
+            if (i == 1) {
+                if (out.items.len + got > opts.stdout_limit) {
+                    failure = error.StreamTooLong;
+                    break :loop;
+                }
+                try out.appendSlice(gpa, buf[0..got]);
+            } else {
+                const room = opts.stderr_limit -| err_buf.items.len;
+                try err_buf.appendSlice(gpa, buf[0..@min(got, room)]);
+            }
         }
-        try out.appendSlice(gpa, buf[0..n]);
     }
-    sys.close(pipe[0]);
-    read_end_open = false;
 
-    if (failure == null and !exitedWithin(pid, @max(deadline - nowMs(), 0))) failure = error.TimedOut;
+    if (failure == null) {
+        const left: ?i64 = if (deadline) |d| @max(d - nowMs(), 0) else null;
+        if (!exitedWithin(pid, left)) failure = error.TimedOut;
+    }
     if (failure) |err| {
-        killGroup(pid, .TERM);
-        if (!exitedWithin(pid, opts.grace_ms)) killGroup(pid, .KILL);
-        killGroup(pid, .KILL);
+        if (err == error.Canceled) {
+            kill(pid, opts.new_session, .KILL);
+        } else {
+            kill(pid, opts.new_session, .TERM);
+            if (!exitedWithin(pid, opts.grace_ms)) kill(pid, opts.new_session, .KILL);
+        }
+        if (opts.new_session) kill(pid, true, .KILL);
         _ = reap(pid);
         return err;
     }
     // Members of the child's group outliving it are not ours to keep; the
     // unreaped leader keeps the group id from being reused until this is sent.
-    killGroup(pid, .KILL);
+    if (opts.new_session) kill(pid, true, .KILL);
     const term = reap(pid);
-    return .{ .term = term, .stdout = try out.toOwnedSlice(gpa) };
+    const o = try out.toOwnedSlice(gpa);
+    errdefer gpa.free(o);
+    return .{ .term = term, .stdout = o, .stderr = try err_buf.toOwnedSlice(gpa) };
 }
 
-test "run captures stdout and the exit code" {
+const no_env: Envp = &[_:null]?[*:0]const u8{};
+
+test "run captures stdout, stderr and the exit code" {
     const gpa = std.testing.allocator;
-    const envp: Envp = &[_:null]?[*:0]const u8{};
-    const r = try run(gpa, &.{ "/bin/sh", "-c", "echo hi; exit 3" }, envp, .{});
-    defer gpa.free(r.stdout);
+    const r = try run(gpa, "/bin/sh", &.{ "sh", "-c", "echo hi; echo no >&2; exit 3" }, no_env, .{ .stderr_limit = 100 });
+    defer r.deinit(gpa);
     try std.testing.expectEqualStrings("hi\n", r.stdout);
+    try std.testing.expectEqualStrings("no\n", r.stderr);
     try std.testing.expectEqual(@as(u32, 3), r.term.code());
+}
+
+test "stdin and both outputs larger than a pipe do not deadlock" {
+    const gpa = std.testing.allocator;
+    const input = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(input);
+    @memset(input, 'x');
+    const r = try run(gpa, "/bin/sh", &.{ "sh", "-c", "cat; head -c 300000 /dev/zero >&2" }, no_env, .{
+        .stdin = input,
+        .stdout_limit = 2 << 20,
+        .stderr_limit = 1 << 20,
+    });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(input.len, r.stdout.len);
+    try std.testing.expectEqual(@as(usize, 300000), r.stderr.len);
 }
 
 test "run kills a child past its deadline" {
     const gpa = std.testing.allocator;
-    const envp: Envp = &[_:null]?[*:0]const u8{};
-    try std.testing.expectError(error.TimedOut, run(gpa, &.{ "/bin/sh", "-c", "sleep 30" }, envp, .{ .timeout_ms = 200, .grace_ms = 200 }));
+    try std.testing.expectError(error.TimedOut, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .timeout_ms = 200, .grace_ms = 200 }));
+}
+
+test "a set cancel flag kills the child" {
+    const gpa = std.testing.allocator;
+    var flag = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
 }
 
 test "run refuses a relative program" {
     const gpa = std.testing.allocator;
-    const envp: Envp = &[_:null]?[*:0]const u8{};
-    try std.testing.expectError(error.NotAbsolute, run(gpa, &.{"sh"}, envp, .{}));
+    try std.testing.expectError(error.NotAbsolute, run(gpa, "sh", &.{"sh"}, no_env, .{}));
 }
