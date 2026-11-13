@@ -39,6 +39,8 @@ the entry and its hash.
 | `logs` | `gzip -9` in place with gzip's header (name, mtime, OS byte), owner, mode and times kept; rewrite of `.licensed-logs` entries |
 | `env` | the environment as raw bytes with getenv's first-entry rule, duplicate names found, a child environment built with each name once, shell name check |
 | `state` | private files in a shared directory: trusted only when the open file is a regular file of this user with one link and no group or other bits, a lock trusted the same way, atomic 0600 writes |
+| `json` | a JSON reader with Python's two string encodings (surrogateescape text, one byte per code point), Python values, and `json.dumps(indent=N, sort_keys=True)` byte for byte, float repr included |
+| `pytext` | byte strings as Python text: the surrogateescape character, the 'replace' decoder, str.isspace, strip and split, shlex.quote |
 | `cli` | messages to stdout and stderr that ignore a closed stream, exit code 2 for a refused invocation, the version line |
 
 ## Test
