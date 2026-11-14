@@ -69,37 +69,21 @@ fn realGeteuid() linux.uid_t {
 }
 fn realCreated(_: sys.fd_t) void {}
 
-/// The errno of the last failed call through `op`; sys.Error folds EPERM
-/// and EACCES into AccessDenied, and describe() tells them apart by this.
-var last_errno: linux.E = .SUCCESS;
-
 /// Call one of `ops`, retrying on EINTR.
 fn op(f: anytype, args: anytype) sys.Error!usize {
     while (true) {
-        const rc = @call(.auto, f, args);
-        const e = linux.errno(rc);
-        if (e != .SUCCESS and e != .INTR) last_errno = e;
-        if (try sys.result(rc)) |r| return r;
+        if (try sys.result(@call(.auto, f, args))) |r| return r;
     }
 }
 
 /// Python's OSError text for an error from one of the calls, so a message
-/// reads "[Errno 13] Permission denied" as the Python tool prints it.
-pub fn describe(err: anyerror) []const u8 {
+/// reads "[Errno 13] Permission denied" as the Python tool prints it; the
+/// errno comes from `sys.last_errno` (see `sys.describe`).
+pub fn describe(err: Error) []const u8 {
     return switch (err) {
-        error.NotFound => "[Errno 2] No such file or directory",
-        error.AccessDenied => if (last_errno == .PERM) "[Errno 1] Operation not permitted" else "[Errno 13] Permission denied",
-        error.Unsupported => "[Errno 95] Operation not supported",
-        error.NoData => "[Errno 61] No data available",
-        error.InvalidArgument => "[Errno 22] Invalid argument",
-        error.Exists => "[Errno 17] File exists",
-        error.NoSpace => "[Errno 28] No space left on device",
-        error.ReadOnly => "[Errno 30] Read-only file system",
-        error.SymLink => "[Errno 40] Too many levels of symbolic links",
-        error.IsDir => "[Errno 21] Is a directory",
-        error.NotDir => "[Errno 20] Not a directory",
-        error.Unexpected => "[Errno 5] Input/output error",
-        else => @errorName(err),
+        error.Refused => "refused",
+        error.OutOfMemory => "[Errno 12] Cannot allocate memory",
+        else => |e| sys.describe(@errorCast(e)),
     };
 }
 
@@ -285,7 +269,7 @@ pub const Faults = struct {
 
 /// The refusal text for a step a test made fail: Python's str() of
 /// OSError(errno.EIO, "injected failure at STEP"). It is a refusal, so
-/// `last_errno` is left as it was and describe() does not apply.
+/// describe() does not apply to it.
 pub fn injected(a: Allocator, why: *Why, step: []const u8) Error {
     return refuse(a, why, "[Errno 5] injected failure at {s}", .{step});
 }
@@ -344,7 +328,7 @@ pub const WriteOptions = struct {
 /// precede those operations, and in a replaceable build can fail them
 /// (Faults.fails); the destination is never unlinked first.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
-    last_errno = .SUCCESS;
+    sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
     try makedirs(parent);
     if (fsx.statAt(fsx.cwd, path, false)) |st| {
