@@ -213,8 +213,6 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
     }
 }
 
-/// Wait up to 10 s until group `pgid` has no live member; best effort, as
-/// groupAlive is.
 /// SIGKILL the group `pgid` and wait (up to 10 s) until no member of it is
 /// alive. Only system calls and stack buffers, so a signal handler may call
 /// it, with the pgid that `Options.pgid_out` published.
@@ -224,6 +222,8 @@ pub fn stopGroup(pgid: linux.pid_t) void {
     waitGroupGone(pgid);
 }
 
+/// Wait up to 10 s until group `pgid` has no live member; best effort, as
+/// groupAlive is.
 fn waitGroupGone(pgid: linux.pid_t) void {
     const until = nowMs() + 10_000;
     while (groupAlive(pgid) and nowMs() < until) {

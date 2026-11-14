@@ -158,7 +158,7 @@ pub const RootLock = struct {
 
     fn takeRecord(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
         var fl: linux.Flock = std.mem.zeroes(linux.Flock);
-        fl.type = 1; // F_WRLCK
+        fl.type = linux.F.WRLCK;
         fl.whence = 0; // SEEK_SET, offset 0, length 0: the whole file
         const cmd: i32 = if (deadline_ms == null) linux.F.SETLKW else linux.F.SETLK;
         while (true) {
@@ -215,7 +215,7 @@ pub const RootLock = struct {
     pub fn release(l: RootLock) void {
         if (linux.getpid() == l.owner) {
             var fl: linux.Flock = std.mem.zeroes(linux.Flock);
-            fl.type = 2; // F_UNLCK
+            fl.type = linux.F.UNLCK;
             _ = lock_ops.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
         }
         sys.close(l.posix);
