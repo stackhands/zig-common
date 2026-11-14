@@ -208,6 +208,14 @@ pub fn describe(err: Error) []const u8 {
     return describeErrno(e);
 }
 
+/// `err` as a `sys.Error` when it is one; null for any other error.
+pub fn asError(err: anyerror) ?Error {
+    inline for (@typeInfo(Error).error_set.error_names.?) |name| {
+        if (std.mem.eql(u8, @errorName(err), name)) return @errorCast(err);
+    }
+    return null;
+}
+
 /// "[Errno N] text" for one errno, as Python prints an OSError: a static
 /// string for every errno Linux names, so it stays valid however many are
 /// taken. Only an errno Linux does not name is formatted into a
@@ -354,4 +362,5 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     };
     // An error that the last errno does not map to gets its usual errno.
     try std.testing.expectEqualStrings("[Errno 2] No such file or directory", describe(error.NotFound));
+    try std.testing.expectEqual(@as(?Error, null), asError(error.OutOfMemory));
 }
