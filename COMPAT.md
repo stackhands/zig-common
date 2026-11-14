@@ -2,6 +2,7 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
+| 0.8.1 | 0.17.1 | eb-staged-rebuild, eb-keep-logs and eessi-arch-guard on their next releases (umask read without changing it, std names without deprecated aliases) |
 | 0.8.0 | 0.17.1 | eb-staged-rebuild 1.0.0 (errno text as Python prints it, from the errno the kernel gave); eb-keep-logs builds against it in CI |
 | 0.7.0 | 0.17.1 | eb-staged-rebuild (Zig port; exec errors and the ledger group stop of its build-events path); eb-keep-logs builds against it in CI |
 | 0.6.0 | 0.17.1 | eb-staged-rebuild (Zig port; failing fault points in its -Dtest-ops artifact); eb-keep-logs builds against it in CI |
