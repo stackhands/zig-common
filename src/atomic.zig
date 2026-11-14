@@ -284,7 +284,8 @@ pub const Faults = struct {
 };
 
 /// The refusal text for a step a test made fail: Python's str() of
-/// OSError(errno.EIO, "injected failure at STEP").
+/// OSError(errno.EIO, "injected failure at STEP"). It is a refusal, so
+/// `last_errno` is left as it was and describe() does not apply.
 pub fn injected(a: Allocator, why: *Why, step: []const u8) Error {
     return refuse(a, why, "[Errno 5] injected failure at {s}", .{step});
 }
@@ -340,7 +341,8 @@ pub const WriteOptions = struct {
 /// are durable. An existing file keeps its owner, mode and ACL forms,
 /// including the absence of one; `metadata_from` names another file whose
 /// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
-/// precede those operations; the destination is never unlinked first.
+/// precede those operations, and in a replaceable build can fail them
+/// (Faults.fails); the destination is never unlinked first.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
@@ -441,7 +443,9 @@ test "a step a test makes fail leaves the destination and no temporary file" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const dir = try std.fmt.allocPrint(a, "/tmp/zc-fails-{d}", .{linux.getpid()});
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try std.fmt.allocPrint(a, "{s}/.zig-cache/fails-test-{d}", .{ cwd, linux.getpid() });
     try makedirs(dir);
     defer fsx.deleteTree(a, fsx.cwd, dir) catch {};
     const path = try std.fmt.allocPrint(a, "{s}/f", .{dir});
