@@ -285,21 +285,26 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     defer sys.close(devnull);
     var fds = [_]sys.fd_t{ -1, -1, -1 }; // parent ends: stdin write, stdout read, stderr read
     defer for (fds) |fd| if (fd >= 0) sys.close(fd);
+    // The child's ends, closed in the parent once the child has them, and
+    // on every error before that.
+    var child_ends = [_]sys.fd_t{ -1, -1, -1 };
+    defer for (child_ends) |fd| if (fd >= 0) sys.close(fd);
     var child_in: sys.fd_t = devnull;
     var child_err: sys.fd_t = devnull;
-    var in_p: ?Pipe = null;
-    var err_p: ?Pipe = null;
     if (opts.stdin != null) {
-        in_p = try pipe();
-        fds[0] = in_p.?.w;
-        child_in = in_p.?.r;
+        const p = try pipe();
+        fds[0] = p.w;
+        child_ends[0] = p.r;
+        child_in = p.r;
     }
     const out_p = try pipe();
     fds[1] = out_p.r;
+    child_ends[1] = out_p.w;
     if (opts.stderr_limit > 0) {
-        err_p = try pipe();
-        fds[2] = err_p.?.r;
-        child_err = err_p.?.w;
+        const p = try pipe();
+        fds[2] = p.r;
+        child_ends[2] = p.w;
+        child_err = p.w;
     }
 
     // The write end is close-on-exec and kept at 3 or above, past the
@@ -330,10 +335,20 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         if (opts.pgid_out) |p| p.store(pid, .seq_cst);
     }
     defer if (opts.pgid_out) |p| p.store(0, .seq_cst);
-    if (in_p) |p| sys.close(p.r);
-    sys.close(out_p.w);
-    if (err_p) |p| sys.close(p.w);
+    for (&child_ends) |*fd| if (fd.* >= 0) {
+        sys.close(fd.*);
+        fd.* = -1;
+    };
     if (fds[0] >= 0) setNonblock(fds[0]);
+    // Writing stdin to a child that stopped reading raises SIGPIPE, which
+    // would end this process; with it ignored the write fails with EPIPE,
+    // as in Python, which ignores SIGPIPE at startup. Restored on return.
+    var old_pipe: linux.Sigaction = undefined;
+    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    const pipe_ignored = fds[0] >= 0 and linux.errno(linux.sigaction(.PIPE, &ignore, &old_pipe)) == .SUCCESS;
+    defer if (pipe_ignored) {
+        _ = linux.sigaction(.PIPE, &old_pipe, null);
+    };
     if (exec_p) |p| {
         sys.close(p.w);
         var e: u32 = 0;

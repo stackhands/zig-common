@@ -302,3 +302,22 @@ test "stopGroup leaves no member of a published group alive" {
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
     try testing.expect(!alive(try waitPid(root, "worker")));
 }
+
+test "stdin to a child that does not read it fails with EPIPE, not SIGPIPE" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try a.alloc(u8, 1 << 20);
+    @memset(input, 'x');
+    // The runner may start with SIGPIPE at its default; make sure it does,
+    // so a write after `true` exits would end the test without the guard.
+    var before: linux.Sigaction = undefined;
+    const default: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.PIPE, &default, &before);
+    defer _ = linux.sigaction(.PIPE, &before, null);
+    const res = try proc.run(a, "/bin/true", &.{"true"}, no_env, .{ .stdin = input });
+    try testing.expectEqual(@as(u8, 0), res.term.code());
+    var after: linux.Sigaction = undefined;
+    _ = linux.sigaction(.PIPE, null, &after);
+    try testing.expect(after.handler.handler == linux.SIG.DFL);
+}
