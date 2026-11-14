@@ -113,14 +113,17 @@ pub const Builder = struct {
         return b.values.get(name);
     }
 
-    /// A NULL-terminated block for execve, valid until `deinit`. Names or
-    /// values with a NUL byte cannot be passed and are an error.
+    /// A NULL-terminated block for execve, valid until `deinit`. An empty
+    /// name, a name with "=", or a NUL byte anywhere cannot be passed and is
+    /// an error.
     pub fn envp(b: *Builder) (Allocator.Error || error{InvalidArgument})!Envp {
         const a = b.arena.allocator();
         const block = try a.allocSentinel(?[*:0]const u8, b.names.items.len, null);
         for (b.names.items, 0..) |n, i| {
             const v = b.values.get(n).?;
-            if (std.mem.findScalar(u8, n, 0) != null or std.mem.findScalar(u8, v, 0) != null) return error.InvalidArgument;
+            // A NUL ends the entry early and an "=" in the name moves the
+            // split, so either would pass another variable than asked.
+            if (n.len == 0 or std.mem.findScalar(u8, n, '=') != null or std.mem.findScalar(u8, n, 0) != null or std.mem.findScalar(u8, v, 0) != null) return error.InvalidArgument;
             const entry = try a.allocSentinel(u8, n.len + 1 + v.len, 0);
             @memcpy(entry[0..n.len], n);
             entry[n.len] = '=';
@@ -160,4 +163,19 @@ test "validName" {
     try std.testing.expect(!validName("1A"));
     try std.testing.expect(!validName("A-B"));
     try std.testing.expect(!validName(""));
+}
+
+test "a name the execve block cannot carry is refused" {
+    var b = Builder.init(std.testing.allocator);
+    defer b.deinit();
+    try b.set("A=B", "x");
+    try std.testing.expectError(error.InvalidArgument, b.envp());
+    var c = Builder.init(std.testing.allocator);
+    defer c.deinit();
+    try c.set("", "x");
+    try std.testing.expectError(error.InvalidArgument, c.envp());
+    var d = Builder.init(std.testing.allocator);
+    defer d.deinit();
+    try d.set("BASH_FUNC_f%%", "() { :; }");
+    _ = try d.envp();
 }
