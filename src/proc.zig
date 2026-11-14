@@ -342,6 +342,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             if (linux.errno(rc) != .INTR) break if (linux.errno(rc) == .SUCCESS) rc else 0;
         };
         if (got == 4) {
+            if (opts.pgid_out) |o| o.store(0, .seq_cst);
             _ = reap(pid);
             _ = try sys.result(@bitCast(-@as(isize, @intCast(e))));
             return error.Unexpected;
@@ -464,6 +465,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         }
         if (opts.new_session) kill(pid, true, .KILL);
         if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
+        if (opts.pgid_out) |o| o.store(0, .seq_cst);
         _ = reap(pid);
         return err;
     }
@@ -471,6 +473,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     // unreaped leader keeps the group id from being reused until this is sent.
     if (opts.new_session) kill(pid, true, .KILL);
     if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
+    if (opts.pgid_out) |o| o.store(0, .seq_cst);
     const term = reap(pid);
     const o = try out.toOwnedSlice(gpa);
     errdefer gpa.free(o);
