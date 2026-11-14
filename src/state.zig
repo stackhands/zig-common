@@ -96,8 +96,10 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
 
 test "a file that is not private is not read" {
     const gpa = std.testing.allocator;
-    var pb: [64]u8 = undefined;
-    const base = try std.mem.print(&pb, "/tmp/zig-common-state-{d}", .{linux.getpid()});
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-state-{d}", .{ cwd, linux.getpid() });
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
     const d = try fsx.openDir(fsx.cwd, base, false);
@@ -275,8 +277,10 @@ fn nowMs() i64 {
 
 test "RootLock refuses a second holder and is free after release" {
     const gpa = std.testing.allocator;
-    var pb: [64]u8 = undefined;
-    const base = try std.mem.print(&pb, "/tmp/zig-common-rootlock-{d}", .{linux.getpid()});
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-rootlock-{d}", .{ cwd, linux.getpid() });
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     const first = try RootLock.acquire(gpa, base, 0);
     try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));

@@ -421,8 +421,10 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var pb: [64]u8 = undefined;
-    const base = try std.mem.print(&pb, "/tmp/zig-common-atomic-{d}", .{linux.getpid()});
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-atomic-{d}", .{ cwd, linux.getpid() });
     try makedirs(base);
     defer fsx.deleteTree(a, fsx.cwd, base) catch {};
     const p = try a.print("{s}/j.json", .{base});

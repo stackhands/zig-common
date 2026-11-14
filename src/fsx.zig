@@ -331,8 +331,10 @@ test "DirIter starts from the first entry on a reused descriptor" {
 
 test "replaceContents keeps the mode" {
     const gpa = std.testing.allocator;
-    var tmp_path_buf: [64]u8 = undefined;
-    const base = try std.mem.print(&tmp_path_buf, "/tmp/zig-common-test-{d}", .{linux.getpid()});
+    var tmp_path_buf: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&tmp_path_buf, "{s}/.zig-cache/zig-common-test-{d}", .{ here, linux.getpid() });
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
     const d = try openDir(cwd, base, false);
