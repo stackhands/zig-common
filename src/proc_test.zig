@@ -251,3 +251,54 @@ test "a noisy helper cannot outlive a killed caller" {
     }
     try testing.expect(gone);
 }
+
+test "a failed exec is its errno's error with exec_error and exit 127 without" {
+    const root = begin();
+    defer end(root);
+    var opts = bounded(30_000);
+    opts.exec_error = true;
+    const missing = std.fmt.allocPrint(A, "{s}/missing", .{root}) catch unreachable;
+    try testing.expectError(error.NotFound, proc.run(A, missing, &.{missing}, no_env, opts));
+    const plain = std.fmt.allocPrint(A, "{s}/plain", .{root}) catch unreachable;
+    const fd = try sys.openat(linux.AT.FDCWD, plain, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(fd);
+    try testing.expectError(error.AccessDenied, proc.run(A, plain, &.{plain}, no_env, opts));
+    const ok = try proc.run(A, "/bin/sh", &.{ "sh", "-c", "echo ran" }, no_env, opts);
+    try testing.expectEqual(@as(u32, 0), ok.term.code());
+    try testing.expectEqualStrings("ran\n", ok.stdout);
+    opts.exec_error = false;
+    const r = try proc.run(A, missing, &.{missing}, no_env, opts);
+    try testing.expectEqual(@as(u32, 127), r.term.code());
+}
+
+var stop_pgid = std.atomic.Value(i32).init(0);
+var stop_root: []const u8 = "";
+
+fn stopWhenStarted() void {
+    for (0..1000) |_| {
+        if (readPid(stop_root, "worker") != null and stop_pgid.load(.seq_cst) > 0) break;
+        sleepMs(10);
+    }
+    const g = stop_pgid.load(.seq_cst);
+    proc.stopGroup(g);
+}
+
+test "stopGroup leaves no member of a published group alive" {
+    const root = begin();
+    defer end(root);
+    stop_root = root;
+    stop_pgid.store(0, .seq_cst);
+    var opts = bounded(60_000);
+    opts.pgid_out = &stop_pgid;
+    const thread = try std.Thread.spawn(.{}, stopWhenStarted, .{});
+    const r = sh(root,
+        \\echo $$ > leader
+        \\( trap '' TERM; while :; do printf x >> output; sleep 0.01; done ) &
+        \\echo $! > worker
+        \\sleep 3600
+    , opts) catch null;
+    thread.join();
+    if (r) |res| try testing.expect(res.term.code() != 0);
+    try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
+    try testing.expect(!alive(try waitPid(root, "worker")));
+}

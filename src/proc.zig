@@ -64,6 +64,9 @@ pub const Options = struct {
     /// is alive, so nothing of the child outlives the call. Only with
     /// `new_session`.
     wait_for_group: bool = false,
+    /// A failed exec is returned as its errno's error, as Python's Popen
+    /// raises OSError, instead of a child that exits 127.
+    exec_error: bool = false,
 };
 
 pub const Result = struct {
@@ -116,6 +119,7 @@ fn childExec(
     in_fd: sys.fd_t,
     out_fd: sys.fd_t,
     err_fd: sys.fd_t,
+    exec_err_fd: sys.fd_t,
 ) noreturn {
     if (new_session) _ = linux.setsid();
     const empty = linux.sigemptyset();
@@ -129,8 +133,14 @@ fn childExec(
     if (linux.errno(linux.dup2(in_fd, 0)) != .SUCCESS) linux.exit_group(127);
     if (linux.errno(linux.dup2(out_fd, 1)) != .SUCCESS) linux.exit_group(127);
     if (linux.errno(linux.dup2(err_fd, 2)) != .SUCCESS) linux.exit_group(127);
-    _ = linux.close_range(3, std.math.maxInt(linux.fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
-    _ = linux.execve(path, argv, envp);
+    const keep_fd = exec_err_fd;
+    if (keep_fd > 3) _ = linux.close_range(3, @intCast(keep_fd - 1), .{ .UNSHARE = false, .CLOEXEC = false });
+    _ = linux.close_range(if (keep_fd >= 3) @intCast(keep_fd + 1) else 3, std.math.maxInt(linux.fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
+    const rc = linux.execve(path, argv, envp);
+    if (keep_fd >= 3) {
+        const e: u32 = @backingInt(linux.errno(rc));
+        _ = linux.write(keep_fd, std.mem.asBytes(&e), 4);
+    }
     linux.exit_group(127);
 }
 
@@ -205,6 +215,15 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
 
 /// Wait up to 10 s until group `pgid` has no live member; best effort, as
 /// groupAlive is.
+/// SIGKILL the group `pgid` and wait (up to 10 s) until no member of it is
+/// alive. Only system calls and stack buffers, so a signal handler may call
+/// it, with the pgid that `Options.pgid_out` published.
+pub fn stopGroup(pgid: linux.pid_t) void {
+    if (pgid <= 0) return;
+    kill(pgid, true, .KILL);
+    waitGroupGone(pgid);
+}
+
 fn waitGroupGone(pgid: linux.pid_t) void {
     const until = nowMs() + 10_000;
     while (groupAlive(pgid) and nowMs() < until) {
@@ -283,8 +302,29 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         child_err = err_p.?.w;
     }
 
-    const fork_rc = try sys.call(linux.fork, .{});
-    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err);
+    // The write end is close-on-exec and kept at 3 or above, past the
+    // child's dup2 targets; a failed exec writes its errno there.
+    var exec_p: ?Pipe = null;
+    defer if (exec_p) |p| sys.close(p.r);
+    if (opts.exec_error) {
+        var p = try pipe();
+        if (p.w < 3) {
+            const moved = sys.call(linux.fcntl, .{ p.w, linux.F.DUPFD_CLOEXEC, @as(usize, 3) }) catch |e| {
+                sys.close(p.r);
+                sys.close(p.w);
+                return e;
+            };
+            sys.close(p.w);
+            p.w = @intCast(moved);
+        }
+        exec_p = p;
+    }
+
+    const fork_rc = sys.call(linux.fork, .{}) catch |e| {
+        if (exec_p) |p| sys.close(p.w);
+        return e;
+    };
+    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err, if (exec_p) |p| p.w else -1);
     const pid: linux.pid_t = @intCast(fork_rc);
     if (opts.new_session) {
         if (opts.pgid_out) |p| p.store(pid, .seq_cst);
@@ -294,6 +334,19 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     sys.close(out_p.w);
     if (err_p) |p| sys.close(p.w);
     if (fds[0] >= 0) setNonblock(fds[0]);
+    if (exec_p) |p| {
+        sys.close(p.w);
+        var e: u32 = 0;
+        const got = while (true) {
+            const rc = linux.read(p.r, std.mem.asBytes(&e), 4);
+            if (linux.errno(rc) != .INTR) break if (linux.errno(rc) == .SUCCESS) rc else 0;
+        };
+        if (got == 4) {
+            _ = reap(pid);
+            _ = try sys.result(@bitCast(-@as(isize, @intCast(e))));
+            return error.Unexpected;
+        }
+    }
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
