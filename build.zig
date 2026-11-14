@@ -20,4 +20,13 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run the library tests").dependOn(&run_tests.step);
+
+    // The API reference from the doc comments, into <prefix>/docs.
+    const lib = b.addLibrary(.{ .name = "zig_common", .root_module = mod });
+    const docs = b.addInstallDirectory(.{
+        .source_dir = lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    b.step("docs", "Generate the API reference").dependOn(&docs.step);
 }

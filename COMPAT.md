@@ -2,9 +2,9 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
-| 0.5.0 | 0.17.1 | eb-staged-rebuild (Zig port; bounded ledger call); eb-keep-logs builds against it in CI |
 | 0.7.0 | 0.17.1 | eb-staged-rebuild (Zig port; exec errors and the ledger group stop of its build-events path); eb-keep-logs builds against it in CI |
 | 0.6.0 | 0.17.1 | eb-staged-rebuild (Zig port; failing fault points in its -Dtest-ops artifact); eb-keep-logs builds against it in CI |
+| 0.5.0 | 0.17.1 | eb-staged-rebuild (Zig port; bounded ledger call); eb-keep-logs builds against it in CI |
 | 0.4.0 | 0.17.1 | eb-staged-rebuild (Zig port); eb-keep-logs builds against it in CI |
 | 0.3.0 | 0.17.1 | eb-staged-rebuild (Zig port; `-Dtest-ops` test artifact); eb-keep-logs builds against it in CI |
 | 0.2.0 | 0.17.1 | eb-staged-rebuild (Zig port); eb-keep-logs builds against it in CI |
