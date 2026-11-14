@@ -24,7 +24,7 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
     defer sys.close(src.fd);
     if (src.stat.nlink > 1) return error.TooManyLinks;
 
-    const gz_name = try std.fmt.allocPrint(gpa, "{s}.gz", .{name});
+    const gz_name = try gpa.print("{s}.gz", .{name});
     defer gpa.free(gz_name);
     const dst = try sys.openat(dir, gz_name, .{
         .ACCMODE = .WRONLY,

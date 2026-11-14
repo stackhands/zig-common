@@ -87,7 +87,7 @@ pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut
 /// Returns an absolute path to it, without resolving symbolic links, or
 /// null. A name containing '/' is not looked up.
 pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.Error!?[]u8 {
-    if (std.mem.indexOfScalar(u8, name, '/') != null or name.len == 0) return null;
+    if (std.mem.findScalar(u8, name, '/') != null or name.len == 0) return null;
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir_raw| {
         const cand = try std.fs.path.join(gpa, &.{ if (dir_raw.len == 0) "." else dir_raw, name });
@@ -197,13 +197,13 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
             pos += d.reclen;
             if (name.len == 0 or !std.ascii.isDigit(name[0])) continue;
             var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{name}) catch continue;
+            const path = std.mem.print(&path_buf, "/proc/{s}/stat", .{name}) catch continue;
             const fd = sys.openat(linux.AT.FDCWD, path, .{}, 0) catch continue;
             var buf: [512]u8 = undefined;
             const got = sys.read(fd, &buf) catch 0;
             sys.close(fd);
             const stat = buf[0..got];
-            const close_paren = std.mem.lastIndexOfScalar(u8, stat, ')') orelse continue;
+            const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse continue;
             var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
             const state = fields.next() orelse continue;
             _ = fields.next(); // ppid
@@ -273,11 +273,11 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    if (std.mem.indexOfScalar(u8, exe, 0) != null) return error.InvalidArgument;
+    if (std.mem.findScalar(u8, exe, 0) != null) return error.InvalidArgument;
     const zexe = try arena.dupeSentinel(u8, exe, 0);
     const zargv = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |a, i| {
-        if (std.mem.indexOfScalar(u8, a, 0) != null) return error.InvalidArgument;
+        if (std.mem.findScalar(u8, a, 0) != null) return error.InvalidArgument;
         zargv[i] = try arena.dupeSentinel(u8, a, 0);
     }
 

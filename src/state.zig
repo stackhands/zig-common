@@ -80,7 +80,7 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const tmp = try std.fmt.allocPrint(gpa, ".{s}.{d}.{x}.tmp", .{ name, linux.getpid(), rnd });
+    const tmp = try gpa.print(".{s}.{d}.{x}.tmp", .{ name, linux.getpid(), rnd });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     var done = false;
@@ -97,7 +97,7 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
 test "a file that is not private is not read" {
     const gpa = std.testing.allocator;
     var pb: [64]u8 = undefined;
-    const base = try std.fmt.bufPrint(&pb, "/tmp/zig-common-state-{d}", .{linux.getpid()});
+    const base = try std.mem.print(&pb, "/tmp/zig-common-state-{d}", .{linux.getpid()});
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
     const d = try fsx.openDir(fsx.cwd, base, false);
@@ -191,7 +191,7 @@ pub const RootLock = struct {
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
         const gate_path = try std.fs.path.join(gpa, &.{ state_root, ".lock" });
         defer gpa.free(gate_path);
-        const posix_path = try std.fmt.allocPrint(gpa, "{s}.posix", .{gate_path});
+        const posix_path = try gpa.print("{s}.posix", .{gate_path});
         defer gpa.free(posix_path);
         const gate = try sys.openat(fsx.cwd, gate_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
         errdefer sys.close(gate);
@@ -204,7 +204,7 @@ pub const RootLock = struct {
         try takeRecord(posix, deadline);
         _ = try lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) });
         var buf: [24]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
+        const line = std.mem.print(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
         if ((try lockCall(lock_ops.write, .{ gate, line })) != line.len) return error.NoSpace;
         return .{ .gate = gate, .posix = posix, .owner = linux.getpid() };
     }
@@ -276,7 +276,7 @@ fn nowMs() i64 {
 test "RootLock refuses a second holder and is free after release" {
     const gpa = std.testing.allocator;
     var pb: [64]u8 = undefined;
-    const base = try std.fmt.bufPrint(&pb, "/tmp/zig-common-rootlock-{d}", .{linux.getpid()});
+    const base = try std.mem.print(&pb, "/tmp/zig-common-rootlock-{d}", .{linux.getpid()});
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     const first = try RootLock.acquire(gpa, base, 0);
     try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));

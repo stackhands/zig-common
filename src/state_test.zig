@@ -22,7 +22,7 @@ fn begin() []const u8 {
     var cwd_buf: [sys.path_max]u8 = undefined;
     const cwd = fsx.realpath(fsx.cwd, ".", &cwd_buf) catch unreachable;
     counter += 1;
-    const root = std.fmt.allocPrint(A, "{s}/.zig-cache/lock-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
+    const root = A.print("{s}/.zig-cache/lock-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
     atomic.makedirs(root) catch unreachable;
     return root;
 }
@@ -73,7 +73,7 @@ fn assertRemoteExcluded(root: []const u8) !void {
 
 /// The gate itself is held: a new descriptor cannot flock it.
 fn assertGateHeld(root: []const u8) !void {
-    const fd = try sys.openat(fsx.cwd, try std.fmt.allocPrint(A, "{s}/.lock", .{root}), .{ .ACCMODE = .RDWR }, 0);
+    const fd = try sys.openat(fsx.cwd, try A.print("{s}/.lock", .{root}), .{ .ACCMODE = .RDWR }, 0);
     defer sys.close(fd);
     const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
     try testing.expectEqual(linux.E.AGAIN, linux.errno(rc));
@@ -192,12 +192,12 @@ test "a release error still closes both layers" {
 test "a hard-linked sidecar is refused" {
     const root = begin();
     defer end(root);
-    const sidecar = try std.fmt.allocPrint(A, "{s}/.lock.posix", .{root});
+    const sidecar = try A.print("{s}/.lock.posix", .{root});
     const fd = try sys.openat(fsx.cwd, sidecar, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     sys.close(fd);
     var za: [sys.path_max:0]u8 = undefined;
     var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.linkat(linux.AT.FDCWD, (try sys.z(&za, sidecar)).ptr, linux.AT.FDCWD, (try sys.z(&zb, try std.fmt.allocPrint(A, "{s}/sidecar-alias", .{root}))).ptr, 0);
+    _ = linux.linkat(linux.AT.FDCWD, (try sys.z(&za, sidecar)).ptr, linux.AT.FDCWD, (try sys.z(&zb, try A.print("{s}/sidecar-alias", .{root}))).ptr, 0);
     try testing.expectError(error.NotPrivate, RootLock.acquire(A, root, 0));
 }
 

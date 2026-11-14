@@ -65,7 +65,7 @@ fn tmpdir() []const u8 {
     var cwd_buf: [sys.path_max]u8 = undefined;
     const cwd = fsx.realpath(fsx.cwd, ".", &cwd_buf) catch unreachable;
     counter += 1;
-    const path = std.fmt.allocPrint(A, "{s}/.zig-cache/atomic-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
+    const path = A.print("{s}/.zig-cache/atomic-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
     atomic.makedirs(path) catch unreachable;
     return path;
 }
@@ -75,7 +75,7 @@ fn cleanup(dir: []const u8) void {
 }
 
 fn join(dir: []const u8, name: []const u8) []const u8 {
-    return std.fmt.allocPrint(A, "{s}/{s}", .{ dir, name }) catch unreachable;
+    return A.print("{s}/{s}", .{ dir, name }) catch unreachable;
 }
 
 fn writeFile(path: []const u8, data: []const u8) void {
@@ -114,7 +114,7 @@ fn isDir(path: []const u8) bool {
 
 fn fdPath(fd: sys.fd_t) []const u8 {
     var buf: [sys.path_max]u8 = undefined;
-    const link = std.fmt.allocPrint(A, "/proc/self/fd/{d}", .{fd}) catch unreachable;
+    const link = A.print("/proc/self/fd/{d}", .{fd}) catch unreachable;
     const n = linux.readlinkat(linux.AT.FDCWD, z(link).ptr, &buf, buf.len);
     if (linux.errno(n) != .SUCCESS) return "";
     return A.dupe(u8, buf[0..n]) catch unreachable;
@@ -144,7 +144,7 @@ var last_why: []const u8 = "";
 fn expectRefused(result: atomic.Error!void, comptime contains: ?[]const u8) !void {
     try testing.expectError(error.Refused, result);
     if (contains) |c| {
-        if (std.mem.indexOf(u8, last_why, c) == null) {
+        if (std.mem.find(u8, last_why, c) == null) {
             std.debug.print("refusal '{s}' does not contain '{s}'\n", .{ last_why, c });
             return error.TestUnexpectedResult;
         }
@@ -415,8 +415,8 @@ fn mChmod(fd: sys.fd_t, mode: u32) usize {
     const rc = linux.fchmod(fd, @intCast(mode));
     if (m.kernel) return rc;
     const at = m.attrs(fd);
-    if (m.chmod_rewrites and at[m.native] != null) m.writeNative(at, std.fmt.allocPrint(A, "chmod-regenerated:{o}", .{mode}) catch unreachable);
-    if (m.virtual and at[NFS4] != null) at[NFS4] = std.fmt.allocPrint(A, "mode-derived:{o}", .{mode}) catch unreachable;
+    if (m.chmod_rewrites and at[m.native] != null) m.writeNative(at, A.print("chmod-regenerated:{o}", .{mode}) catch unreachable);
+    if (m.virtual and at[NFS4] != null) at[NFS4] = A.print("mode-derived:{o}", .{mode}) catch unreachable;
     return rc;
 }
 

@@ -23,7 +23,7 @@ fn begin() []const u8 {
     var cwd_buf: [sys.path_max]u8 = undefined;
     const cwd = fsx.realpath(fsx.cwd, ".", &cwd_buf) catch unreachable;
     counter += 1;
-    const root = std.fmt.allocPrint(A, "{s}/.zig-cache/proc-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
+    const root = A.print("{s}/.zig-cache/proc-test-{d}-{d}", .{ cwd, linux.getpid(), counter }) catch unreachable;
     atomic.makedirs(root) catch unreachable;
     return root;
 }
@@ -46,12 +46,12 @@ fn bounded(timeout_ms: u32) proc.Options {
 }
 
 fn sh(root: []const u8, script: []const u8, opts: proc.Options) proc.Error!proc.Result {
-    const full = std.fmt.allocPrint(A, "cd '{s}' || exit 99\n{s}", .{ root, script }) catch unreachable;
+    const full = A.print("cd '{s}' || exit 99\n{s}", .{ root, script }) catch unreachable;
     return proc.run(A, "/bin/sh", &.{ "sh", "-c", full }, no_env, opts);
 }
 
 fn readPid(root: []const u8, name: []const u8) ?linux.pid_t {
-    const path = std.fmt.allocPrint(A, "{s}/{s}", .{ root, name }) catch unreachable;
+    const path = A.print("{s}/{s}", .{ root, name }) catch unreachable;
     const f = fsx.openRegular(fsx.cwd, path, false) catch return null;
     defer sys.close(f.fd);
     const text = fsx.readAll(A, f.fd, 64) catch return null;
@@ -73,12 +73,12 @@ fn sleepMs(ms: u64) void {
 
 /// A live (not zombie) process.
 fn alive(pid: linux.pid_t) bool {
-    const path = std.fmt.allocPrint(A, "/proc/{d}/stat", .{pid}) catch unreachable;
+    const path = A.print("/proc/{d}/stat", .{pid}) catch unreachable;
     const fd = sys.openat(linux.AT.FDCWD, path, .{}, 0) catch return false;
     defer sys.close(fd);
     var buf: [512]u8 = undefined;
     const n = sys.read(fd, &buf) catch return false;
-    const close_paren = std.mem.lastIndexOfScalar(u8, buf[0..n], ')') orelse return false;
+    const close_paren = std.mem.findScalarLast(u8, buf[0..n], ')') orelse return false;
     const state = std.mem.trimStart(u8, buf[close_paren + 1 .. n], " ");
     return state.len > 0 and state[0] != 'Z' and state[0] != 'X';
 }
@@ -91,12 +91,12 @@ fn groupMembers(pgid: linux.pid_t) usize {
     var n: usize = 0;
     while (it.next() catch null) |e| {
         if (e.name.len == 0 or !std.ascii.isDigit(e.name[0])) continue;
-        const path = std.fmt.allocPrint(A, "/proc/{s}/stat", .{e.name}) catch continue;
+        const path = A.print("/proc/{s}/stat", .{e.name}) catch continue;
         const fd = sys.openat(linux.AT.FDCWD, path, .{}, 0) catch continue;
         var buf: [512]u8 = undefined;
         const got = sys.read(fd, &buf) catch 0;
         sys.close(fd);
-        const close_paren = std.mem.lastIndexOfScalar(u8, buf[0..got], ')') orelse continue;
+        const close_paren = std.mem.findScalarLast(u8, buf[0..got], ')') orelse continue;
         var fields = std.mem.tokenizeScalar(u8, buf[close_paren + 1 .. got], ' ');
         const state = fields.next() orelse continue;
         _ = fields.next();
@@ -150,7 +150,7 @@ test "writing descendants are stopped when the leader exits" {
         \\echo done
     , bounded(30_000));
     try testing.expectEqual(@as(u32, 0), r.term.code());
-    try testing.expect(std.mem.indexOf(u8, r.stdout, "done") != null);
+    try testing.expect(std.mem.find(u8, r.stdout, "done") != null);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
     for ([_][]const u8{ "worker1", "worker2", "worker3", "worker4" }) |w| try testing.expect(!alive(try waitPid(root, w)));
 }
@@ -257,9 +257,9 @@ test "a failed exec is its errno's error with exec_error and exit 127 without" {
     defer end(root);
     var opts = bounded(30_000);
     opts.exec_error = true;
-    const missing = std.fmt.allocPrint(A, "{s}/missing", .{root}) catch unreachable;
+    const missing = A.print("{s}/missing", .{root}) catch unreachable;
     try testing.expectError(error.NotFound, proc.run(A, missing, &.{missing}, no_env, opts));
-    const plain = std.fmt.allocPrint(A, "{s}/plain", .{root}) catch unreachable;
+    const plain = A.print("{s}/plain", .{root}) catch unreachable;
     const fd = try sys.openat(linux.AT.FDCWD, plain, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     sys.close(fd);
     try testing.expectError(error.AccessDenied, proc.run(A, plain, &.{plain}, no_env, opts));

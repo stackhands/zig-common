@@ -90,7 +90,7 @@ pub fn statAt(dir: fd_t, path: []const u8, follow: bool) Error!Stat {
 /// The absolute path the kernel holds for an open descriptor.
 pub fn realpathFd(fd: fd_t, out: *[sys.path_max]u8) Error![]const u8 {
     var link_buf: [64]u8 = undefined;
-    const link = std.fmt.bufPrintSentinel(&link_buf, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable;
+    const link = std.mem.printSentinel(&link_buf, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable;
     const n = try sys.call(linux.readlinkat, .{ linux.AT.FDCWD, link.ptr, out, out.len });
     if (n == 0 or n >= out.len or out[0] != '/') return error.NotFound;
     return out[0..n];
@@ -202,7 +202,7 @@ fn copyAcls(from: fd_t, to: fd_t) Error!void {
 pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     const old = try openRegular(dir, name, false);
     defer sys.close(old.fd);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ name, linux.getpid() });
+    const tmp = try gpa.print("{s}.tmp.{d}", .{ name, linux.getpid() });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{
         .ACCMODE = .WRONLY,
@@ -332,7 +332,7 @@ test "DirIter starts from the first entry on a reused descriptor" {
 test "replaceContents keeps the mode" {
     const gpa = std.testing.allocator;
     var tmp_path_buf: [64]u8 = undefined;
-    const base = try std.fmt.bufPrint(&tmp_path_buf, "/tmp/zig-common-test-{d}", .{linux.getpid()});
+    const base = try std.mem.print(&tmp_path_buf, "/tmp/zig-common-test-{d}", .{linux.getpid()});
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
     const d = try openDir(cwd, base, false);

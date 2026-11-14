@@ -229,7 +229,7 @@ pub fn describeErrno(e: linux.E) []const u8 {
     const S = struct {
         threadlocal var buf: [48]u8 = undefined;
     };
-    return std.fmt.bufPrint(&S.buf, "[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) }) catch "[Errno ?] Unknown error";
+    return std.mem.print(&S.buf, "[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) }) catch "[Errno ?] Unknown error";
 }
 
 fn describeNamed(comptime e: linux.E) []const u8 {
@@ -290,7 +290,7 @@ pub inline fn call(comptime f: anytype, args: anytype) Error!usize {
 /// A NUL-terminated copy of `s` in `buf`. Paths with a NUL byte are refused.
 pub fn z(buf: *[path_max:0]u8, s: []const u8) Error![:0]const u8 {
     if (s.len >= path_max) return error.NameTooLong;
-    if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidArgument;
+    if (std.mem.findScalar(u8, s, 0) != null) return error.InvalidArgument;
     @memcpy(buf[0..s.len], s);
     buf[s.len] = 0;
     return buf[0..s.len :0];

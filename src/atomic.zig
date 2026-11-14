@@ -95,7 +95,7 @@ pub const Why = struct {
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
 fn refuse(a: Allocator, why: *Why, comptime f: []const u8, args: anytype) Error {
-    why.msg = std.fmt.allocPrint(a, f, args) catch "refused";
+    why.msg = a.print(f, args) catch "refused";
     return error.Refused;
 }
 
@@ -364,7 +364,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
     }
     const mode: u32 = opts.mode orelse (if (metadata) |m| m.info.perm() else fileMode(path));
-    const tmp = try std.fmt.allocPrint(a, "{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
+    const tmp = try a.print("{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
     if (fsx.statAt(fsx.cwd, tmp, false)) |stale| {
         // A privileged writer hands its temporary file to the metadata owner
         // before a crash can interrupt it.
@@ -376,7 +376,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     } else |_| {}
 
     {
-        const step = try std.fmt.allocPrint(a, "{s}.write", .{opts.step});
+        const step = try a.print("{s}.write", .{opts.step});
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
     const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
@@ -392,7 +392,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         var inner: Why = .{};
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
         {
-            const step = try std.fmt.allocPrint(a, "{s}.fsync", .{opts.step});
+            const step = try a.print("{s}.fsync", .{opts.step});
             if (opts.faults.fails(step)) return injected(a, why, step);
         }
         _ = try op(ops.fsync, .{fd});
@@ -403,7 +403,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
     }
     {
-        const step = try std.fmt.allocPrint(a, "{s}.rename", .{opts.step});
+        const step = try a.print("{s}.rename", .{opts.step});
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
     try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
@@ -420,10 +420,10 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var pb: [64]u8 = undefined;
-    const base = try std.fmt.bufPrint(&pb, "/tmp/zig-common-atomic-{d}", .{linux.getpid()});
+    const base = try std.mem.print(&pb, "/tmp/zig-common-atomic-{d}", .{linux.getpid()});
     try makedirs(base);
     defer fsx.deleteTree(a, fsx.cwd, base) catch {};
-    const p = try std.fmt.allocPrint(a, "{s}/j.json", .{base});
+    const p = try a.print("{s}/j.json", .{base});
     var why: Why = .{};
     try atomicWrite(a, p, "one\n", .{ .mode = 0o640 }, &why);
     try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(fsx.cwd, p, false)).perm());
@@ -432,13 +432,13 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     const f = try fsx.openRegular(fsx.cwd, p, false);
     defer sys.close(f.fd);
     try std.testing.expectEqualStrings("two\n", try fsx.readAll(a, f.fd, 100));
-    const link = try std.fmt.allocPrint(a, "{s}/l.json", .{base});
+    const link = try a.print("{s}/l.json", .{base});
     var zl: [sys.path_max:0]u8 = undefined;
     var zt: [sys.path_max:0]u8 = undefined;
     _ = linux.symlinkat((try sys.z(&zt, p)).ptr, fsx.cwd, (try sys.z(&zl, link)).ptr);
     try std.testing.expectError(error.Refused, atomicWrite(a, link, "x", .{}, &why));
     try std.testing.expect(std.mem.startsWith(u8, why.msg, "refusing to replace a symlink"));
-    try std.testing.expect(!exists(try std.fmt.allocPrint(a, "{s}/.j.json.new", .{base})));
+    try std.testing.expect(!exists(try a.print("{s}/.j.json.new", .{base})));
 }
 
 fn failAt(ctx: ?*anyopaque, step: []const u8) bool {
@@ -452,21 +452,21 @@ test "a step a test makes fail leaves the destination and no temporary file" {
     const a = arena_state.allocator();
     var cwd_buf: [sys.path_max]u8 = undefined;
     const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    const dir = try std.fmt.allocPrint(a, "{s}/.zig-cache/fails-test-{d}", .{ cwd, linux.getpid() });
+    const dir = try a.print("{s}/.zig-cache/fails-test-{d}", .{ cwd, linux.getpid() });
     try makedirs(dir);
     defer fsx.deleteTree(a, fsx.cwd, dir) catch {};
-    const path = try std.fmt.allocPrint(a, "{s}/f", .{dir});
+    const path = try a.print("{s}/f", .{dir});
     var why: Why = .{};
     try atomicWrite(a, path, "old\n", .{}, &why);
     for ([_][]const u8{ "j.write", "j.fsync", "j.rename" }) |step| {
         var want: []const u8 = step;
         const faults: Faults = .{ .ctx = @ptrCast(&want), .fail_fn = failAt };
         try std.testing.expectError(error.Refused, atomicWrite(a, path, "new\n", .{ .faults = faults, .step = "j" }, &why));
-        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "[Errno 5] injected failure at {s}", .{step}), why.msg);
+        try std.testing.expectEqualStrings(try a.print("[Errno 5] injected failure at {s}", .{step}), why.msg);
         const f = try fsx.openRegular(fsx.cwd, path, false);
         defer sys.close(f.fd);
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
-        try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try std.fmt.allocPrint(a, "{s}/.f.new", .{dir}), false));
+        try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try a.print("{s}/.f.new", .{dir}), false));
     }
 }
 

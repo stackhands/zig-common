@@ -16,7 +16,7 @@ pub fn validName(name: []const u8) bool {
 }
 
 fn split(entry: []const u8) struct { name: []const u8, value: ?[]const u8 } {
-    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return .{ .name = entry, .value = null };
+    const eq = std.mem.findScalar(u8, entry, '=') orelse return .{ .name = entry, .value = null };
     return .{ .name = entry[0..eq], .value = entry[eq + 1 ..] };
 }
 
@@ -120,7 +120,7 @@ pub const Builder = struct {
         const block = try a.allocSentinel(?[*:0]const u8, b.names.items.len, null);
         for (b.names.items, 0..) |n, i| {
             const v = b.values.get(n).?;
-            if (std.mem.indexOfScalar(u8, n, 0) != null or std.mem.indexOfScalar(u8, v, 0) != null) return error.InvalidArgument;
+            if (std.mem.findScalar(u8, n, 0) != null or std.mem.findScalar(u8, v, 0) != null) return error.InvalidArgument;
             const entry = try a.allocSentinel(u8, n.len + 1 + v.len, 0);
             @memcpy(entry[0..n.len], n);
             entry[n.len] = '=';

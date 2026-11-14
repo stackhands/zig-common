@@ -15,7 +15,7 @@ pub fn put(fd: sys.fd_t, bytes: []const u8) void {
 
 pub fn print(fd: sys.fd_t, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch {
+    const s = std.mem.print(&buf, fmt, args) catch {
         var w: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer w.deinit();
         w.writer.print(fmt, args) catch return;

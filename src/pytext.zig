@@ -138,7 +138,7 @@ pub fn pySplit(arena: Allocator, s: []const u8) Allocator.Error![]const []const 
 pub fn shellQuote(gpa: Allocator, v: []const u8) Allocator.Error![]u8 {
     if (v.len == 0) return gpa.dupe(u8, "''");
     const safe = for (v) |c| {
-        if (!(isAlnumU(c) or std.mem.indexOfScalar(u8, "@%+=:,./-", c) != null)) break false;
+        if (!(isAlnumU(c) or std.mem.findScalar(u8, "@%+=:,./-", c) != null)) break false;
     } else true;
     if (safe) return gpa.dupe(u8, v);
     var out: std.ArrayList(u8) = .empty;

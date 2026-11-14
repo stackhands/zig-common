@@ -311,10 +311,10 @@ fn escapeCp(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) Allocator.Error!vo
             var b: [12]u8 = undefined;
             if (cp >= 0x10000) {
                 const v = cp - 0x10000;
-                const s = std.fmt.bufPrint(&b, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) }) catch unreachable;
+                const s = std.mem.print(&b, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) }) catch unreachable;
                 try out.appendSlice(gpa, s);
             } else {
-                const s = std.fmt.bufPrint(&b, "\\u{x:0>4}", .{cp}) catch unreachable;
+                const s = std.mem.print(&b, "\\u{x:0>4}", .{cp}) catch unreachable;
                 try out.appendSlice(gpa, s);
             }
         },
@@ -453,9 +453,9 @@ fn writeFloat(out: *std.ArrayList(u8), gpa: Allocator, f: f64) Allocator.Error!v
     if (std.math.isNan(f)) return out.appendSlice(gpa, "NaN");
     if (std.math.isInf(f)) return out.appendSlice(gpa, if (f > 0) "Infinity" else "-Infinity");
     var buf: [64]u8 = undefined;
-    const sci = std.fmt.bufPrint(&buf, "{e}", .{f}) catch unreachable;
+    const sci = std.mem.print(&buf, "{e}", .{f}) catch unreachable;
     // sci is [-]D[.DDD]e[-]X
-    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const e_at = std.mem.findScalar(u8, sci, 'e').?;
     const exp = std.fmt.parseInt(i32, sci[e_at + 1 ..], 10) catch 0;
     const neg = sci[0] == '-';
     const mant = sci[@intFromBool(neg)..e_at];
@@ -490,7 +490,7 @@ fn writeFloat(out: *std.ArrayList(u8), gpa: Allocator, f: f64) Allocator.Error!v
             try out.appendSlice(gpa, digits[1..nd]);
         }
         var eb: [8]u8 = undefined;
-        const es = std.fmt.bufPrint(&eb, "e{c}{d:0>2}", .{ @as(u8, if (exp < 0) '-' else '+'), @abs(exp) }) catch unreachable;
+        const es = std.mem.print(&eb, "e{c}{d:0>2}", .{ @as(u8, if (exp < 0) '-' else '+'), @abs(exp) }) catch unreachable;
         try out.appendSlice(gpa, es);
     }
 }
@@ -521,7 +521,7 @@ fn dumpsInner(out: *std.ArrayList(u8), gpa: Allocator, v: Py, indent: usize, lev
         .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
         .int => |i| {
             var buf: [24]u8 = undefined;
-            try out.appendSlice(gpa, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+            try out.appendSlice(gpa, std.mem.print(&buf, "{d}", .{i}) catch unreachable);
         },
         .float => |f| try writeFloat(out, gpa, f),
         .str => |s| try writeCacheString(out, gpa, s),
