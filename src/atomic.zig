@@ -279,10 +279,33 @@ fn exists(path: []const u8) bool {
     return true;
 }
 
+/// The process umask, read from the Umask line of /proc/self/status
+/// (Linux 4.7 and later) so that no other thread sees it changed. Without
+/// that line it is set to 0 and back, which another thread creating a file
+/// at that moment would see.
 fn currentUmask() u32 {
+    if (umaskFromProc()) |m| return m;
     const old = linux.syscall1(.umask, 0);
     _ = linux.syscall1(.umask, old);
     return @intCast(old);
+}
+
+fn umaskFromProc() ?u32 {
+    const fd = sys.openat(fsx.cwd, "/proc/self/status", .{}, 0) catch return null;
+    defer sys.close(fd);
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = sys.read(fd, buf[len..]) catch return null;
+        if (n == 0) break;
+        len += n;
+    }
+    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    while (lines.next()) |line| {
+        const rest = if (std.mem.startsWith(u8, line, "Umask:")) line["Umask:".len..] else continue;
+        return std.fmt.parseInt(u32, std.mem.trim(u8, rest, " \t"), 8) catch null;
+    }
+    return null;
 }
 
 /// Mode for a new file: the existing file's mode, otherwise 0644 less the
@@ -445,4 +468,12 @@ test "a step a test makes fail leaves the destination and no temporary file" {
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
         try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try std.fmt.allocPrint(a, "{s}/.f.new", .{dir}), false));
     }
+}
+
+test "the umask is read without changing it" {
+    const old: u32 = @intCast(linux.syscall1(.umask, 0o027));
+    defer _ = linux.syscall1(.umask, old);
+    try std.testing.expectEqual(@as(?u32, 0o027), umaskFromProc());
+    try std.testing.expectEqual(@as(u32, 0o027), currentUmask());
+    try std.testing.expectEqual(@as(u32, 0o640), fileMode("/nonexistent/zig-common-umask-test"));
 }
