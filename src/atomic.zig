@@ -382,6 +382,8 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     const created = fsx.fstat(fd) catch |err| {
         sys.close(fd);
+        // Created above with O_EXCL, so it is this call's file.
+        sys.unlinkat(fsx.cwd, tmp, 0) catch {};
         return err;
     };
     ops.created(fd);
