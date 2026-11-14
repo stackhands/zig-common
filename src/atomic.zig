@@ -263,14 +263,31 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
 }
 
 /// Called before each named step; a test hook can stop the program there.
+/// In a replaceable build (tests, a tool's -Dtest-ops artifact) `fail_fn`
+/// can also make the step fail; in any other build it is never asked.
 pub const Faults = struct {
     ctx: ?*anyopaque = null,
     reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
+    fail_fn: ?*const fn (?*anyopaque, []const u8) bool = null,
 
     pub fn reach(f: Faults, step: []const u8) void {
         if (f.reach_fn) |r| r(f.ctx, step);
     }
+
+    /// Reach `step`, then whether a test asked it to fail.
+    pub fn fails(f: Faults, step: []const u8) bool {
+        f.reach(step);
+        if (comptime !replaceable) return false;
+        const ff = f.fail_fn orelse return false;
+        return ff(f.ctx, step);
+    }
 };
+
+/// The refusal text for a step a test made fail: Python's str() of
+/// OSError(errno.EIO, "injected failure at STEP").
+pub fn injected(a: Allocator, why: *Why, step: []const u8) Error {
+    return refuse(a, why, "[Errno 5] injected failure at {s}", .{step});
+}
 
 fn exists(path: []const u8) bool {
     _ = fsx.statAt(fsx.cwd, path, false) catch return false;
@@ -349,7 +366,10 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         try sys.unlinkat(fsx.cwd, tmp, 0);
     } else |_| {}
 
-    opts.faults.reach(try std.fmt.allocPrint(a, "{s}.write", .{opts.step}));
+    {
+        const step = try std.fmt.allocPrint(a, "{s}.write", .{opts.step});
+        if (opts.faults.fails(step)) return injected(a, why, step);
+    }
     const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     const created = fsx.fstat(fd) catch |err| {
         sys.close(fd);
@@ -362,7 +382,10 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         try sys.writeAll(fd, data);
         var inner: Why = .{};
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
-        opts.faults.reach(try std.fmt.allocPrint(a, "{s}.fsync", .{opts.step}));
+        {
+            const step = try std.fmt.allocPrint(a, "{s}.fsync", .{opts.step});
+            if (opts.faults.fails(step)) return injected(a, why, step);
+        }
         _ = try op(ops.fsync, .{fd});
     }
     if (metadata) |m| {
@@ -370,7 +393,10 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
         if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
     }
-    opts.faults.reach(try std.fmt.allocPrint(a, "{s}.rename", .{opts.step}));
+    {
+        const step = try std.fmt.allocPrint(a, "{s}.rename", .{opts.step});
+        if (opts.faults.fails(step)) return injected(a, why, step);
+    }
     try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
     try fsyncDir(parent);
 }
@@ -404,4 +430,31 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     try std.testing.expectError(error.Refused, atomicWrite(a, link, "x", .{}, &why));
     try std.testing.expect(std.mem.startsWith(u8, why.msg, "refusing to replace a symlink"));
     try std.testing.expect(!exists(try std.fmt.allocPrint(a, "{s}/.j.json.new", .{base})));
+}
+
+fn failAt(ctx: ?*anyopaque, step: []const u8) bool {
+    const want: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    return std.mem.eql(u8, want.*, step);
+}
+
+test "a step a test makes fail leaves the destination and no temporary file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(a, "/tmp/zc-fails-{d}", .{linux.getpid()});
+    try makedirs(dir);
+    defer fsx.deleteTree(a, fsx.cwd, dir) catch {};
+    const path = try std.fmt.allocPrint(a, "{s}/f", .{dir});
+    var why: Why = .{};
+    try atomicWrite(a, path, "old\n", .{}, &why);
+    for ([_][]const u8{ "j.write", "j.fsync", "j.rename" }) |step| {
+        var want: []const u8 = step;
+        const faults: Faults = .{ .ctx = @ptrCast(&want), .fail_fn = failAt };
+        try std.testing.expectError(error.Refused, atomicWrite(a, path, "new\n", .{ .faults = faults, .step = "j" }, &why));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "[Errno 5] injected failure at {s}", .{step}), why.msg);
+        const f = try fsx.openRegular(fsx.cwd, path, false);
+        defer sys.close(f.fd);
+        try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
+        try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try std.fmt.allocPrint(a, "{s}/.f.new", .{dir}), false));
+    }
 }
