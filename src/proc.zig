@@ -623,3 +623,12 @@ test "a closed stderr at start leaves the child's stderr on /dev/null" {
         }
     }.body);
 }
+
+test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
+    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.CHLD, &ignore, &old);
+    defer _ = linux.sigaction(.CHLD, &old, null);
+    try std.testing.expectError(error.NoChild, run(std.testing.allocator, "/bin/sh", &.{ "sh", "-c", "exit 3" }, no_env, .{}));
+    try std.testing.expectEqual(linux.E.CHILD, sys.last_errno);
+}
