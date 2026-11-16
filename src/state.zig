@@ -180,6 +180,14 @@ test "lockExclusive waits out the timeout while signals arrive" {
     try std.testing.expect(ms >= 300 and ms < 5000);
 }
 
+test "a lock that fails reports its errno, with or without a timeout" {
+    for ([_]?u32{ null, 0, 50 }) |timeout| {
+        sys.last_errno = .SUCCESS;
+        try std.testing.expectError(error.InvalidArgument, lockExclusive(-1, timeout));
+        try std.testing.expectEqualStrings("[Errno 9] Bad file descriptor", sys.describe(error.InvalidArgument));
+    }
+}
+
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
 
 /// A state root's lock. The flock gate excludes processes on one kernel; the
