@@ -412,6 +412,27 @@ test "parse objects, duplicates and nesting" {
     try std.testing.expectError(error.Syntax, parse(a, "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"));
 }
 
+/// `inner` inside `n` arrays, or objects when `open` opens one.
+fn nested(a: Allocator, n: usize, open: []const u8, inner: []const u8, close: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..n) |_| try out.appendSlice(a, open);
+    try out.appendSlice(a, inner);
+    for (0..n) |_| try out.appendSlice(a, close);
+    return out.items;
+}
+
+test "arrays and objects nest at most 32 deep" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    _ = try parse(a, try nested(a, 32, "[", "1", "]"));
+    _ = try parse(a, try nested(a, 31, "[", "[]", "]"));
+    _ = try parse(a, try nested(a, 31, "{\"k\":", "{}", "}"));
+    try std.testing.expectError(error.Syntax, parse(a, try nested(a, 33, "[", "1", "]")));
+    try std.testing.expectError(error.Syntax, parse(a, try nested(a, 32, "[", "[]", "]")));
+    try std.testing.expectError(error.Syntax, parse(a, try nested(a, 32, "{\"k\":", "{}", "}")));
+}
+
 // ---- Python values and json.dumps -----------------------------------------
 
 /// A value as a Python program built it for json.dumps. Strings are byte
