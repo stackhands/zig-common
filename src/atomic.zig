@@ -12,7 +12,7 @@ const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const acl_attributes = [_][:0]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
+pub const acl_attributes = fsx.acl_attributes;
 const posix_access = "system.posix_acl_access";
 
 /// The calls atomicWrite makes on a file descriptor, as raw system-call
