@@ -12,4 +12,7 @@ Nothing here is a step to follow.
    :maxdepth: 1
 
    descriptor-checks
+   process-groups-and-deadlines
+   system-calls-without-libc
+   python-compatibility
 #+end_export

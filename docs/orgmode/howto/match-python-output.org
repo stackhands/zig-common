@@ -1,0 +1,127 @@
+#+TITLE: Match a Python tool's output
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Match a Python tool's output
+
+Use this when a Zig tool replaces a Python one and must print, write and read the same bytes, so that the two can run side by side and one test suite checks both.
+[[zig:zig_common.json]] writes JavaScript Object Notation (JSON) as Python's =json.dumps= does and reads it as =json.loads= does, [[zig:zig_common.pytext]] treats a byte string as Python's text, and [[zig:zig_common.sys.describe]] words an error as Python's =OSError=.
+[[file:../explanation/python-compatibility.org][Python compatibility]] says why the tools keep to Python's bytes.
+
+** Before you start
+
+- The tool depends on zig-common; [[file:../tutorials/first-tool.org][the tutorial]] sets that up.
+- The Python version to match is installed, here Python 3.12.3, to compare against.
+
+** Steps
+
+1. Find the Python call that makes each output, and its counterpart:
+
+   | Python                                    | zig-common                                                              |
+   |-------------------------------------------+-------------------------------------------------------------------------|
+   | =json.dumps(v, indent=2, sort_keys=True)= | [[zig:zig_common.json.dumps]] with =2, true=                            |
+   | =json.loads(s)=                           | [[zig:zig_common.json.parse]], then [[zig:zig_common.json.toPy]]        |
+   | =os.fsdecode(b)=                          | the bytes as they are: =json= and =pytext= read them as Python does     |
+   | =s.strip()= and =s.split()=               | [[zig:zig_common.pytext.pyStrip]] and [[zig:zig_common.pytext.pySplit]] |
+   | =shlex.quote(s)=                          | [[zig:zig_common.pytext.shellQuote]]                                    |
+   | =b.decode("utf-8", "replace")=            | [[zig:zig_common.pytext.decodeReplace]]                                 |
+   | =str(OSError(...))=                       | [[zig:zig_common.sys.describe]]                                         |
+
+2. Build each value as the Python tool builds it, with [[zig:zig_common.json.Py]], and write it:
+
+   #+begin_src zig
+   const Py = common.json.Py;
+   const doc: Py = .{ .dict = &.{
+       .{ .key = "target", .value = Py.s("x86_64/amd/zen4") },
+       .{ .key = "modules", .value = .{ .list = &.{Py.s("Example/1.0-GCCcore-15.2.0")} } },
+       .{ .key = "prefix", .value = Py.s("/home/alice/caf\xe9") },
+       .{ .key = "checked", .value = .{ .float = 1794549600.5 } },
+       .{ .key = "user", .value = Py.opt(null) },
+   } };
+   common.cli.out("{s}\n", .{try common.json.dumps(arena, doc, 2, true)});
+   #+end_src
+
+   The byte =\xe9= is not valid 8-bit Unicode Transformation Format (UTF-8).
+   Python's =os.fsdecode= makes it the lone surrogate U+DCE9, and =dumps= writes it as =json.dumps= does, =\udce9=.
+
+3. Word text and errors with the same calls:
+
+   #+begin_src zig
+   common.cli.out("{s}\n", .{try common.pytext.shellQuote(arena, "it's in /home/alice")});
+   common.cli.out("{s}\n", .{common.pytext.pyStrip("\xc2\xa0 zen4\n")});
+   common.cli.out("{s}\n", .{common.sys.describe(error.NotFound)});
+   #+end_src
+
+   =pyStrip= removes what =str.strip= removes, the no-break space U+00A0 included, written here as its two UTF-8 bytes =\xc2\xa0=.
+   After a failed call, =describe= gives the errno the kernel returned, so call it before the next system call.
+
+4. Write the Python lines that print the same, in =want.py=:
+
+   #+begin_src python
+   import errno
+   import json
+   import os
+   import shlex
+
+   doc = {
+       "target": "x86_64/amd/zen4",
+       "modules": ["Example/1.0-GCCcore-15.2.0"],
+       "prefix": os.fsdecode(b"/home/alice/caf\xe9"),
+       "checked": 1794549600.5,
+       "user": None,
+   }
+   print(json.dumps(doc, indent=2, sort_keys=True))
+   print(shlex.quote("it's in /home/alice"))
+   print("\u00a0 zen4\n".strip())
+   print(OSError(errno.ENOENT, os.strerror(errno.ENOENT)))
+   #+end_src
+
+** Check that it worked
+
+Run both and compare the bytes:
+
+#+begin_src bash
+python3 want.py > want.txt
+tool > got.txt
+cmp want.txt got.txt && echo "same"
+#+end_src
+
+#+begin_example
+same
+#+end_example
+
+Both print:
+
+#+begin_example
+{
+  "checked": 1794549600.5,
+  "modules": [
+    "Example/1.0-GCCcore-15.2.0"
+  ],
+  "prefix": "/home/alice/caf\udce9",
+  "target": "x86_64/amd/zen4",
+  "user": null
+}
+'it'"'"'s in /home/alice'
+zen4
+[Errno 2] No such file or directory
+#+end_example
+
+** If it fails
+
+=cmp= names the first byte that differs; =diff want.txt got.txt= shows the lines.
+
+| What differs                                | Cause                                                                            | What to do                                                                                                 |
+|---------------------------------------------+----------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------|
+| the keys come in another order              | the Python call sorts the keys and the Zig call does not, or the other way round | pass =sort_keys= as =dumps='s last argument; unsorted, list the entries in Python's order                  |
+| =2= where Python wrote =2.0=                | the value is an =.int=; Python had a float                                       | use =.float=                                                                                               |
+| =\u00e9= where Python wrote =\udce9=        | one side decoded the bytes as Latin-1, the other with surrogateescape            | use one encoding on both sides; the =json= module's summary names the two                                  |
+| the whole document on one line in Python    | the Python call has no =indent=                                                  | =dumps= writes only the indented form; write the compact one with [[zig:zig_common.json.writeCacheString]] |
+| =[Errno 13]= where Python wrote =[Errno 1]= | another system call failed in between, and =describe= read its errno             | call =describe= right after the call that failed                                                           |
+| no newline at the end                       | =print= adds one; =cli.out= does not                                             | end the format with =\n=                                                                                   |
+
+** Related
+
+- [[file:../reference/api/zig/zig_common.json.md][The json module's API]] and [[file:../reference/api/zig/zig_common.pytext.md][the pytext module's API]].
+- [[file:../reference/compatibility.org][Compatibility]]: where errno text differs from Python's.
+- [[https://docs.python.org/3/library/json.html][Python's json module]].

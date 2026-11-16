@@ -1,0 +1,78 @@
+#+TITLE: Upgrade zig-common in a tool
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Upgrade zig-common in a tool
+
+Use this when a zig-common release has a fix or a call that a tool needs.
+A tool's =build.zig.zon= names one tagged release and a hash of its contents; the upgrade replaces both and builds the tool against the new code.
+Each tool moves in a commit of its own, as [[https://github.com/stackhands/zig-common/blob/main/RELEASING.md][RELEASING.md]] says.
+
+** Before you start
+
+- The tool builds, and its tests pass at the current pin:
+
+  #+begin_src bash
+  zig build test --summary all
+  #+end_src
+
+- The Zig on =PATH= is the version the new release needs, which [[file:../reference/compatibility.org][Compatibility]] gives: Zig 0.17.1 for every release up to 0.9.0.
+
+** Steps
+
+1. Read the [[file:../changelog.org][changelog]] entries after the pinned version, up to the new one.
+   A release's Removals section lists what a tool may have to change, and its Fixes section what a call now does differently.
+
+2. Move the pin to the new tag:
+
+   #+begin_src bash
+   zig fetch --save git+https://github.com/stackhands/zig-common#v0.9.0
+   #+end_src
+
+   #+begin_example
+   info: resolved ref "v0.9.0" to commit 82b1fbd43f2497a8e5e434e7e60a7487d1c5122c
+   warning: overwriting existing dependency named "zig_common"
+   #+end_example
+
+   =zig fetch= writes the =.url= and the =.hash= of =.zig_common= together.
+   Do not edit the =.url= by hand: Zig looks a package up by its =.hash= first, so a new =.url= beside the old =.hash= goes on building the old release, without a message.
+
+3. Build the tool and run its tests:
+
+   #+begin_src bash
+   zig build test --summary all
+   #+end_src
+
+   A compile error at a call into zig-common is a change that the changelog lists; change the call as the entry says.
+
+4. Commit =build.zig.zon= and those changes together, with the new version in the message.
+
+** Check that it worked
+
+=build.zig.zon= names the new tag, its commit, and a hash that starts with the version:
+
+#+begin_src bash
+grep -F -A2 '.zig_common = ' build.zig.zon
+#+end_src
+
+#+begin_example
+        .zig_common = .{
+            .url = "git+https://github.com/stackhands/zig-common?ref=v0.9.0#82b1fbd43f2497a8e5e434e7e60a7487d1c5122c",
+            .hash = "zig_common-0.9.0-kBaPeTD7AwAbkwHxmKWBkkYReiqxirdKRJq9VSO4dPvU",
+#+end_example
+
+=zig build test --summary all= passes.
+
+** If it fails
+
+| Message                                                                                                         | Cause                                                                                                              | What to do                                                |
+|-----------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------+-----------------------------------------------------------|
+| =error: ref not found: v9.9.9=                                                                                  | there is no tag of that name                                                                                       | take the version from the changelog; tags are =vX.Y.Z=    |
+| =error: hash mismatch: manifest declares zig_common-0.8.1-... but the fetched package has zig_common-0.9.0-...= | the =.url= was edited without the =.hash=, and the old release was not on this machine, so Zig fetched the new one | run the =zig fetch --save= of step 2 again                |
+| a compile error at a call into zig-common                                                                       | the call changed between the two releases                                                                          | read that call's entry in the changelog, and its API page |
+
+** Related
+
+- [[file:../reference/compatibility.org][Compatibility]]: the Zig version and the tools of each release.
+- [[file:../changelog.org][Changelog]]: what each release changed.
+- [[https://github.com/stackhands/zig-common/blob/main/RELEASING.md][RELEASING.md]]: how a release is made.

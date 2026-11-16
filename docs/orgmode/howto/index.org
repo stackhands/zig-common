@@ -12,4 +12,9 @@ The title names the task.
    :maxdepth: 1
 
    stop-a-slow-child
+   replace-a-file-keeping-its-acls
+   keep-private-state-in-tmp
+   compress-and-mark-logs
+   match-python-output
+   upgrade-zig-common
 #+end_export

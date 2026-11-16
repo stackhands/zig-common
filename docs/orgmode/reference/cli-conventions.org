@@ -1,0 +1,60 @@
+#+TITLE: Command-line conventions
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Command-line conventions
+
+The messages, exit statuses and version line that the stackhands Zig tools share, through [[zig:zig_common.cli]].
+
+** Messages
+
+| Call                         | Writes                                      | To                   |
+|------------------------------+---------------------------------------------+----------------------|
+| [[zig:zig_common.cli.put]]   | the bytes as given                          | the descriptor given |
+| [[zig:zig_common.cli.print]] | the arguments, formatted                    | the descriptor given |
+| [[zig:zig_common.cli.out]]   | the arguments, formatted                    | stdout, descriptor 1 |
+| [[zig:zig_common.cli.err]]   | the arguments, formatted                    | stderr, descriptor 2 |
+| [[zig:zig_common.cli.die]]   | =TOOL: message= and a newline, then exits 2 | stderr, descriptor 2 |
+
+- Only =die= adds a newline.
+- A write that fails, as one to a closed stdout or to =/dev/full= does, is ignored: it changes neither what the tool did nor its exit status.
+- A message longer than 8 KiB is formatted on the heap; when that allocation fails, nothing is written.
+
+** Exit status
+
+| Status  | Meaning                                                                                                                         |
+|---------+---------------------------------------------------------------------------------------------------------------------------------|
+| 2       | the invocation was refused: [[zig:zig_common.cli.usage_exit]], which =die= exits with                                           |
+| 128 + N | a child the tool ran was killed by signal N, as [[zig:zig_common.proc.Term.code]] gives it, when the tool passes that status on |
+
+Every other status is the tool's own, and its reference pages list them.
+
+** Version line
+
+#+begin_example
+TOOL VERSION (ARCH-OS-ABI, MODE, zig ZIG_VERSION, COMMIT)
+#+end_example
+
+[[zig:zig_common.cli.versionLine]] builds the line at compile time, with a newline at the end.
+
+| Field       | Value                                                                                                                                             |
+|-------------+---------------------------------------------------------------------------------------------------------------------------------------------------|
+| TOOL        | the tool's name, the first argument                                                                                                               |
+| VERSION     | the tool's version, the second argument                                                                                                           |
+| ARCH-OS-ABI | the architecture, operating system and application binary interface (ABI) of the build: =x86_64-linux-musl= or =aarch64-linux-musl= for a release |
+| MODE        | the optimize mode: =debug=, =safe=, =fast= or =small=                                                                                             |
+| ZIG_VERSION | the version of Zig that built the binary                                                                                                          |
+| COMMIT      | the third argument; the tools pass their =-Dcommit= build option, which is =unknown= when it is not given                                         |
+
+The first two words are what a script that read an older version line reads.
+
+eb-keep-logs 0.2.1, built with =zig build -Drelease=true -Dcommit=0123abc=:
+
+#+begin_example
+eb-keep-logs 0.2.1 (x86_64-linux-musl, safe, zig 0.17.1, 0123abc)
+#+end_example
+
+** See also
+
+- [[file:api/zig/zig_common.cli.md][The cli module's API]].
+- [[file:../explanation/system-calls-without-libc.org][System calls without a C library]], for why a release is one static file per architecture.

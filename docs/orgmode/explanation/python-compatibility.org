@@ -1,0 +1,66 @@
+#+TITLE: Python compatibility
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Python compatibility
+
+Why do [[zig:zig_common.json]], [[zig:zig_common.pytext]] and [[zig:zig_common.sys.describe]] reproduce what Python writes, byte for byte, in a library for Zig programs?
+
+** The problem
+
+Several stackhands tools began as Python programs, and their Zig builds replace them on machines where the Python ones are in use.
+For a time both run on the same nodes, and on the same files.
+eessi-arch-guard's Python guard stays the default prolog until its Zig build has passed a shadow comparison, and its cache, a JavaScript Object Notation (JSON) file under =TMPDIR= or =/tmp=, is part of the interface its =COMPAT.md= tells a port to keep: the name, the key order, the escapes.
+eb-staged-rebuild has two builds of the same tool, the Zig binary its releases carry and the Python package, whose outputs agree byte for byte except where its =COMPAT.md= lists a difference.
+
+One set of tests checks both.
+eb-staged-rebuild's =tests/differential.sh= runs the two builds on the same invocations and fails on any difference in exit code, stdout or stderr, and compares the journals and trees they leave.
+eessi-arch-guard's test suite runs against the binary through =TOOL_BIN=.
+
+A Zig program that writes the same data in its own way passes its own tests and breaks all of this.
+Zig 0.17.1's =std.json= writes the float =2.0= as =2= and =1e16= as =10000000000000000=, where Python writes =2.0= and =1e+16=.
+It writes a byte string that is not valid 8-bit Unicode Transformation Format (UTF-8) as an array of numbers, and its parser refuses =\udce9=, the escape Python writes for such a byte.
+A cache entry the other build cannot read is a miss on every task, and a journal that differs fails the differential test.
+
+** How zig-common handles it
+
+Text stays bytes, read as Python reads them.
+A Python tool decodes a byte string from the system with surrogateescape, so a byte that is not UTF-8 becomes one character, U+DC80 to U+DCFF, which encodes back to the same byte.
+[[zig:zig_common.pytext.nextChar]] reads a byte string as that decoder does, and [[zig:zig_common.pytext.pyStrip]], [[zig:zig_common.pytext.pySplit]], [[zig:zig_common.pytext.shellQuote]] and [[zig:zig_common.json.pyTextLess]], Python's string order, work on those characters.
+
+JSON strings come in the two encodings the tools used:
+
+- cache text, =json.dumps= of surrogateescape text with =ensure_ascii=, in which a byte that is not UTF-8 is a lone =\udcXX=: [[zig:zig_common.json.decodeCache]] and [[zig:zig_common.json.writeCacheString]];
+- wire text, one character per byte as Latin-1 decodes it, so that every byte is =\u00XX= or itself: [[zig:zig_common.json.decodeWire]] and [[zig:zig_common.json.writeWireString]].
+
+[[zig:zig_common.json.Py]] holds values as a Python program builds them, with ints and floats apart, and [[zig:zig_common.json.dumps]] writes them as =json.dumps(indent=N, sort_keys=...)= does, the =repr= of a float included.
+
+An error is worded as Python words an =OSError=.
+[[zig:zig_common.sys.describe]] gives =[Errno N] text= for the errno the kernel returned, with glibc's =strerror= text, which Python's =os.strerror= also gives.
+A person or a script that searched the Python tool's output for =[Errno 13] Permission denied= finds the same line.
+
+** What was considered and turned down
+
+- /Zig's =std.json=./
+  It writes numbers and byte strings differently, as above, and refuses an escape Python writes.
+- /A new file format with a version number./
+  The two builds could not then share a cache while both are in use, and the files on disk at the switch would be unreadable to the new build.
+- /Comparing outputs by meaning rather than by bytes./
+  A test that parses both outputs before comparing them misses what a reader of the bytes meets: the order of keys, the digits of a float, an escape.
+
+** Limits
+
+zig-common reproduces what the tools needed, not all of Python:
+
+- =dumps= writes the indented form only.
+  The compact form, Python's default, is written by the tool from =writeCacheString= or =writeWireString=, as eessi-arch-guard writes its requests.
+- [[zig:zig_common.json.parse]] refuses arrays and objects nested more than [[zig:zig_common.json.max_depth]], 32, deep, and =NaN= and =Infinity=, all of which =json.loads= reads.
+- [[zig:zig_common.json.toPy]] refuses an integer that does not fit in 64 bits, which Python keeps exact.
+- The errno text is glibc's; an errno that Zig does not name prints as =[Errno N] Unknown error N=, as [[file:../reference/compatibility.org][Compatibility]] shows.
+- Each tool's =COMPAT.md= lists where its Zig build differs from its Python one on purpose.
+
+** Further reading
+
+- [[file:../howto/match-python-output.org][Match a Python tool's output]].
+- [[https://peps.python.org/pep-0383/][Python Enhancement Proposal (PEP) 383]], which defines surrogateescape.
+- [[https://docs.python.org/3/library/json.html][Python's json module]].
