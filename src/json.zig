@@ -436,12 +436,24 @@ pub const Py = union(enum) {
     }
 };
 
-/// The parsed document as Python values, strings decoded as cache text.
+/// A number as json.loads reads it: an int when the text has no fraction or
+/// exponent, a float otherwise. An int that does not fit an i64, which
+/// Python keeps exact, cannot be represented and is an error, not a
+/// rounded float.
+fn pyNumber(n: []const u8) error{Encoding}!Py {
+    if (std.mem.findAny(u8, n, ".eE") != null) {
+        return .{ .float = std.fmt.parseFloat(f64, n) catch return error.Encoding };
+    }
+    return .{ .int = std.fmt.parseInt(i64, n, 10) catch return error.Encoding };
+}
+
+/// The parsed document as Python values, strings decoded as cache text; an
+/// integer past i64 is `error.Encoding`.
 pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
     return switch (v) {
         .null => .null,
         .bool => |b| .{ .bool = b },
-        .number => |n| if (std.fmt.parseInt(i64, n, 10)) |i| .{ .int = i } else |_| .{ .float = std.fmt.parseFloat(f64, n) catch return error.Encoding },
+        .number => |n| try pyNumber(n),
         .string => |raw| .{ .str = try decodeCache(arena, raw) },
         .array => |items| blk: {
             const out = try arena.alloc(Py, items.len);
