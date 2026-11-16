@@ -155,18 +155,6 @@ fn listedAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error![acl_attributes.len]b
     return listed;
 }
 
-fn errnoText(e: linux.E) []const u8 {
-    return switch (e) {
-        .ACCES => "Permission denied",
-        .PERM => "Operation not permitted",
-        .IO => "Input/output error",
-        .INVAL => "Invalid argument",
-        .NODATA => "No data available",
-        .OPNOTSUPP => "Operation not supported",
-        else => @tagName(e),
-    };
-}
-
 fn freeAcls(a: Allocator, acls: Acls) void {
     for (acls.present) |p| if (p) |s| a.free(s);
 }
@@ -195,13 +183,13 @@ fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
         }
         if (listed[i]) {
             if (e == .NODATA) return refuse(a, why, "{s} was listed but is no longer readable", .{name});
-            return refuse(a, why, "cannot read {s}: [Errno {d}] {s}", .{ name, @backingInt(e), errnoText(e) });
+            return refuse(a, why, "cannot read {s}: {s}", .{ name, sys.describeErrno(e) });
         }
         if (e == .NODATA or e == .OPNOTSUPP) continue;
         // An unlisted NFSv4-family name may answer EINVAL where the same
         // inspection lists a POSIX access ACL, which is read here.
         if (e == .INVAL and isNfs4Family(name) and listed[2]) continue;
-        return refuse(a, why, "cannot read {s}: [Errno {d}] {s}", .{ name, @backingInt(e), errnoText(e) });
+        return refuse(a, why, "cannot read {s}: {s}", .{ name, sys.describeErrno(e) });
     }
     if (listed[2] and acls.present[2] == null) return refuse(a, why, "{s} was listed but is no longer readable", .{posix_access});
     return acls;
