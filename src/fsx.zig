@@ -5,35 +5,53 @@ const linux = std.os.linux;
 const sys = @import("sys.zig");
 
 const Allocator = std.mem.Allocator;
+/// A file descriptor, as `sys.fd_t`.
 pub const fd_t = sys.fd_t;
+/// The errors of this module's calls: `sys.Error`.
 pub const Error = sys.Error;
+/// The `dir` that makes a path relative to the current directory,
+/// `AT_FDCWD`. An absolute path ignores `dir`.
 pub const cwd: fd_t = linux.AT.FDCWD;
 
+/// The file type bits of `Stat.mode`, as stat(2) names them.
 pub const S = struct {
+    /// The mask of the file type bits.
     pub const IFMT: u32 = 0o170000;
+    /// A regular file.
     pub const IFREG: u32 = 0o100000;
+    /// A directory.
     pub const IFDIR: u32 = 0o040000;
+    /// A symbolic link.
     pub const IFLNK: u32 = 0o120000;
 };
 
+/// What `fstat` and `statAt` return: the statx(2) fields these tools use.
 pub const Stat = struct {
+    /// The file type bits (`S`) and the permission bits (`perm`).
     mode: u32,
     uid: linux.uid_t,
     gid: linux.gid_t,
     nlink: u32,
+    /// Bytes.
     size: u64,
     atime: linux.timespec,
     mtime: linux.timespec,
     ctime: linux.timespec = .{ .sec = 0, .nsec = 0 },
+    /// The device the file is on: the major number in the high 32 bits, the
+    /// minor number in the low 32.
     dev: u64 = 0,
     ino: u64 = 0,
 
+    /// True for a regular file.
     pub fn isReg(s: Stat) bool {
         return s.mode & S.IFMT == S.IFREG;
     }
+    /// True for a directory.
     pub fn isDir(s: Stat) bool {
         return s.mode & S.IFMT == S.IFDIR;
     }
+    /// True for a symbolic link. `statAt` with `follow` true never returns
+    /// one.
     pub fn isLink(s: Stat) bool {
         return s.mode & S.IFMT == S.IFLNK;
     }
@@ -71,6 +89,7 @@ fn fromStatx(x: linux.Statx) Stat {
     };
 }
 
+/// The `Stat` of an open descriptor, from statx(2) with `AT_EMPTY_PATH`.
 pub fn fstat(fd: fd_t) Error!Stat {
     var x: linux.Statx = undefined;
     _ = try sys.call(linux.statx, .{ fd, "", linux.AT.EMPTY_PATH, statx_mask, &x });
@@ -115,6 +134,10 @@ pub fn openRegular(dir: fd_t, path: []const u8, follow: bool) Error!struct { fd:
     return .{ .fd = fd, .stat = st };
 }
 
+/// Open the directory `dir/path` for reading with `O_DIRECTORY`. `follow`
+/// decides whether a final symbolic link is followed; one that is not is
+/// `error.NotDir`, as the kernel reports `O_NOFOLLOW` on a link with
+/// `O_DIRECTORY`. The caller closes the descriptor.
 pub fn openDir(dir: fd_t, path: []const u8, follow: bool) Error!fd_t {
     return sys.openat(dir, path, .{ .DIRECTORY = true, .NOFOLLOW = !follow }, 0);
 }
@@ -304,10 +327,17 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
     done = true;
 }
 
+/// The `d_type` values of a directory entry, as `std.os.linux.DT`:
+/// `DT.REG`, `DT.DIR`, `DT.LNK`, `DT.UNKNOWN` and the rest.
 pub const DT = linux.DT;
 
+/// One entry of a directory, as `DirIter.next` returns it.
 pub const Entry = struct {
+    /// Points into the iterator's buffer: valid until the next call to
+    /// `DirIter.next`.
     name: []const u8,
+    /// A `DT` value; `DT.UNKNOWN` when the file system does not say, which
+    /// `entryType` resolves.
     type: u8,
 };
 
@@ -326,10 +356,13 @@ pub const DirIter = struct {
         return .{ .fd = fd, .buf = try gpa.alignedAlloc(u8, .@"8", 32 * 1024) };
     }
 
+    /// Free the buffer `init` allocated. The descriptor stays open; the
+    /// caller closes it.
     pub fn deinit(it: *DirIter, gpa: Allocator) void {
         gpa.free(it.buf);
     }
 
+    /// The next entry, or null after the last one.
     pub fn next(it: *DirIter) Error!?Entry {
         while (true) {
             if (it.pos >= it.end) {

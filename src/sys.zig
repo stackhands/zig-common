@@ -4,11 +4,34 @@
 const std = @import("std");
 const linux = std.os.linux;
 
+/// A file descriptor, as `std.os.linux.fd_t`.
 pub const fd_t = linux.fd_t;
+/// The open(2) flags, as `std.os.linux.O`. `openat` adds `CLOEXEC` to
+/// every set it is given.
 pub const O = linux.O;
+/// The constants of the `*at` calls, as `std.os.linux.AT`: `AT.FDCWD`,
+/// `AT.REMOVEDIR`, `AT.SYMLINK_NOFOLLOW` and the rest.
 pub const AT = linux.AT;
+/// The size of a path buffer, NUL included: Linux's `PATH_MAX`. `z` refuses
+/// a path of this many bytes or more with `error.NameTooLong`.
 pub const path_max = 4096;
 
+/// The error a failed call returns, named for its errno. Several errnos
+/// share one error, and `last_errno` keeps the errno itself:
+///
+/// - `AccessDenied`: EACCES and EPERM
+/// - `NoSpace`: ENOSPC and EDQUOT
+/// - `Busy`: EBUSY and ETXTBSY
+/// - `InvalidArgument`: EINVAL and EBADF
+/// - `Unsupported`: EOPNOTSUPP and ENOSYS
+/// - `Unexpected`: any errno not named here
+///
+/// Each other error has one errno: `NotFound` ENOENT, `Exists` EEXIST,
+/// `SymLink` ELOOP, `NotDir` ENOTDIR, `IsDir` EISDIR, `NotEmpty` ENOTEMPTY,
+/// `CrossDevice` EXDEV, `NameTooLong` ENAMETOOLONG, `TooManyLinks` EMLINK,
+/// `ReadOnly` EROFS, `NoData` ENODATA, `Range` ERANGE, `NoChild` ECHILD and
+/// `NoProcess` ESRCH. EINTR is not an error: `call` retries it, and
+/// `result` returns null for it.
 pub const Error = error{
     NotFound,
     Exists,
@@ -296,6 +319,11 @@ pub fn z(buf: *[path_max:0]u8, s: []const u8) Error![:0]const u8 {
     return buf[0..s.len :0];
 }
 
+/// openat(2) of `path` relative to `dir`, with `CLOEXEC` added to `flags`;
+/// `mode` applies when `flags` creates the file. Returns the new
+/// descriptor, which the caller closes. A path with a NUL byte is
+/// `error.InvalidArgument`, one of `path_max` bytes or more
+/// `error.NameTooLong`.
 pub fn openat(dir: fd_t, path: []const u8, flags: O, mode: linux.mode_t) Error!fd_t {
     var buf: [path_max:0]u8 = undefined;
     var f = flags;
@@ -304,14 +332,19 @@ pub fn openat(dir: fd_t, path: []const u8, flags: O, mode: linux.mode_t) Error!f
     return @intCast(rc);
 }
 
+/// close(2). The result is ignored: Linux frees the descriptor even when
+/// close fails, so there is nothing to retry.
 pub fn close(fd: fd_t) void {
     _ = linux.close(fd);
 }
 
+/// read(2) into `buf`: the number of bytes read, 0 at the end of the file.
 pub fn read(fd: fd_t, buf: []u8) Error!usize {
     return call(linux.read, .{ fd, buf.ptr, buf.len });
 }
 
+/// write(2) until all of `bytes` is written, going on after a short write.
+/// A write that returns 0 is `error.NoSpace`.
 pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -321,29 +354,40 @@ pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {
     }
 }
 
+/// fchmod(2): set the permission bits of an open file to `mode`.
 pub fn fchmod(fd: fd_t, mode: linux.mode_t) Error!void {
     _ = try call(linux.fchmod, .{ fd, mode });
 }
 
+/// fchown(2): set the owner and group of an open file. Changing the owner
+/// needs privilege, and is `error.AccessDenied` without it.
 pub fn fchown(fd: fd_t, uid: linux.uid_t, gid: linux.gid_t) Error!void {
     _ = try call(linux.fchown, .{ fd, uid, gid });
 }
 
+/// fsync(2): return once the file's data and metadata are on stable
+/// storage. For a directory, that includes the names in it.
 pub fn fsync(fd: fd_t) Error!void {
     _ = try call(linux.fsync, .{fd});
 }
 
+/// unlinkat(2) of `path` relative to `dir`. `flags` is 0 for a file and
+/// `AT.REMOVEDIR` for an empty directory.
 pub fn unlinkat(dir: fd_t, path: []const u8, flags: u32) Error!void {
     var buf: [path_max:0]u8 = undefined;
     _ = try call(linux.unlinkat, .{ dir, (try z(&buf, path)).ptr, flags });
 }
 
+/// renameat(2): rename `old_dir/old` to `new_dir/new`, replacing `new` in
+/// one step when it exists. Both must be on one file system, or it is
+/// `error.CrossDevice`.
 pub fn renameat(old_dir: fd_t, old: []const u8, new_dir: fd_t, new: []const u8) Error!void {
     var a: [path_max:0]u8 = undefined;
     var b: [path_max:0]u8 = undefined;
     _ = try call(linux.renameat, .{ old_dir, (try z(&a, old)).ptr, new_dir, (try z(&b, new)).ptr });
 }
 
+/// The real user id of this process, getuid(2).
 pub fn getuid() linux.uid_t {
     return linux.getuid();
 }

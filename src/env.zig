@@ -5,6 +5,8 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+/// An environment block as execve(2) takes it: NUL-terminated
+/// `NAME=value` strings, ended by a null pointer.
 pub const Envp = [*:null]const ?[*:0]const u8;
 
 /// True for a name the shell accepts: [A-Za-z_][A-Za-z0-9_]*.
@@ -22,8 +24,12 @@ fn split(entry: []const u8) struct { name: []const u8, value: ?[]const u8 } {
 
 /// A read-only view of an environment block.
 pub const Env = struct {
+    /// The block's strings in order. An entry with no `=` is kept here and
+    /// is not a variable.
     entries: []const [*:0]const u8,
 
+    /// A view of `envp` up to its null pointer. Nothing is copied: the view
+    /// is valid while the block is.
     pub fn fromEnvp(envp: Envp) Env {
         var n: usize = 0;
         while (envp[n] != null) n += 1;
@@ -68,10 +74,14 @@ pub const Builder = struct {
     names: std.ArrayList([]const u8) = .empty,
     values: std.StringHashMapUnmanaged([]const u8) = .empty,
 
+    /// An empty environment. What it stores comes from an arena over
+    /// `gpa`, which `deinit` frees.
     pub fn init(gpa: Allocator) Builder {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     }
 
+    /// Free every name, value and block the builder made, the blocks
+    /// `envp` returned included.
     pub fn deinit(b: *Builder) void {
         b.arena.deinit();
     }
@@ -89,6 +99,9 @@ pub const Builder = struct {
         return b;
     }
 
+    /// Set `name` to `value`, both copied. A name already set keeps its
+    /// place in the order; a new name goes last. The name is checked only
+    /// when `envp` builds the block.
     pub fn set(b: *Builder, name: []const u8, value: []const u8) Allocator.Error!void {
         const a = b.arena.allocator();
         const v = try a.dupe(u8, value);
@@ -101,6 +114,7 @@ pub const Builder = struct {
         try b.values.put(a, n, v);
     }
 
+    /// Remove `name`. A name that is not set is no error.
     pub fn unset(b: *Builder, name: []const u8) void {
         if (!b.values.remove(name)) return;
         for (b.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
@@ -109,6 +123,7 @@ pub const Builder = struct {
         };
     }
 
+    /// The value `name` has in the builder, or null when it is not set.
     pub fn get(b: *const Builder, name: []const u8) ?[]const u8 {
         return b.values.get(name);
     }

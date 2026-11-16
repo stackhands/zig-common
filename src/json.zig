@@ -15,6 +15,10 @@ const text = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// One parsed JSON value. Strings and numbers are their JSON text, sliced
+/// from the text given to `parse`, which must outlive the value; the codecs
+/// and `toPy` decode them. Arrays and objects are allocated from the arena
+/// given to `parse`.
 pub const Value = union(enum) {
     null,
     bool: bool,
@@ -26,6 +30,10 @@ pub const Value = union(enum) {
     /// Members in order; a later duplicate key wins, as json.loads keeps it.
     object: []const Member,
 
+    /// The value of `key` in an object, or null when `v` is not an object
+    /// or has no such key. A key that appears twice gives its last value,
+    /// as json.loads does. A stored key is compared with its escapes
+    /// decoded, so `"\u006bind"` matches `kind`.
     pub fn get(v: Value, key: []const u8) ?Value {
         if (v != .object) return null;
         var found: ?Value = null;
@@ -36,6 +44,8 @@ pub const Value = union(enum) {
     }
 };
 
+/// One member of an object: the key's JSON text between the quotes, escapes
+/// not yet decoded, and its value.
 pub const Member = struct { key: []const u8, value: Value };
 
 /// A raw JSON key equals `want` (ASCII, as every key the guard looks up
@@ -82,6 +92,8 @@ fn hex4(raw: []const u8, i: usize) error{Encoding}!u16 {
     return std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch unreachable;
 }
 
+/// The errors of `parse`: `error.Syntax` for text that is not one JSON
+/// document nested at most `max_depth` deep, or `error.OutOfMemory`.
 pub const ParseError = Allocator.Error || error{Syntax};
 
 /// Arrays and objects nest at most this deep. The parser recurses once per
@@ -238,6 +250,8 @@ pub fn parse(arena: Allocator, s: []const u8) ParseError!Value {
     return v;
 }
 
+/// The errors of the decoders and `toPy`: `error.Encoding` for a string
+/// or number the codec cannot represent, or `error.OutOfMemory`.
 pub const DecodeError = Allocator.Error || error{Encoding};
 
 /// Code points of a raw JSON string, surrogate pairs joined; a lone
@@ -457,12 +471,16 @@ pub const Py = union(enum) {
     list: []const Py,
     dict: []const Entry,
 
+    /// One key and its value in a `Py.dict`. `dumps` writes them in this
+    /// order unless it sorts the keys.
     pub const Entry = struct { key: []const u8, value: Py };
 
+    /// `v` as a Python string.
     pub fn s(v: []const u8) Py {
         return .{ .str = v };
     }
 
+    /// `v` as a Python string, or `null` (Python's None) when `v` is null.
     pub fn opt(v: ?[]const u8) Py {
         return if (v) |x| .{ .str = x } else .null;
     }

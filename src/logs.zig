@@ -9,8 +9,13 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const flate = std.compress.flate;
 
+/// The name of the list of log files that may carry a licence number, one
+/// path per line. `renameInList` gives its text after files are renamed.
 pub const licensed_list = ".licensed-logs";
 
+/// The errors of `gzipInPlace`: the `sys.Error` of a failed call,
+/// `error.OutOfMemory`, or `error.WriteFailed` from writing the
+/// compressed stream.
 pub const GzipError = sys.Error || Allocator.Error || error{WriteFailed};
 
 /// Replace `dir/name` with `dir/name.gz`, as `gzip -9 name` does: the header

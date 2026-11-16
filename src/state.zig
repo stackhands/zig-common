@@ -9,6 +9,7 @@ const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
+/// The errors of this module's calls: `sys.Error`.
 pub const Error = sys.Error;
 
 /// Regular, owned by `uid`, one link, mode & 0o077 == 0.
@@ -40,6 +41,8 @@ pub fn openPrivate(dir: fsx.fd_t, name: []const u8, create: bool) Error!?fsx.fd_
     return fd;
 }
 
+/// The errors of `lockExclusive`: the `sys.Error` of a failed flock, or
+/// `error.TimedOut` when another holder kept the lock past the timeout.
 pub const LockError = Error || error{TimedOut};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
@@ -205,14 +208,20 @@ test "a lock that fails reports its errno, with or without a timeout" {
 /// name is never opened, and the file behind a planted hard link, or a file
 /// another user owns, is never truncated.
 pub const RootLock = struct {
+    /// STATE_ROOT/.lock, with the flock held.
     gate: fsx.fd_t,
+    /// STATE_ROOT/.lock.posix, with the record lock held.
     posix: fsx.fd_t,
     /// The process that took the lock. A forked child that releases it only
     /// closes its descriptors: unlocking the shared gate would drop the
     /// parent's lock.
     owner: linux.pid_t,
 
+    /// The errors of `acquire`, beside the `sys.Error` of a failed call.
+    /// `error.OutOfMemory` stays in the set with the `gpa` argument; it is
+    /// not returned.
     pub const AcquireError = Error || error{
+        /// Another holder kept a lock past `timeout_ms`.
         Busy,
         /// STATE_ROOT/.lock.posix is not a regular file of this user with
         /// one link.
@@ -370,6 +379,8 @@ pub const LockOps = struct {
 
 var test_lock_ops: LockOps = .{};
 const real_lock_ops: LockOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`lock_ops.* = ...`); any other build points it at constant real calls.
 pub const lock_ops = if (@import("atomic.zig").replaceable) &test_lock_ops else &real_lock_ops;
 
 fn realFlock(fd: fsx.fd_t, op: i32) usize {

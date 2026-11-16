@@ -13,6 +13,9 @@ pub fn put(fd: sys.fd_t, bytes: []const u8) void {
     sys.writeAll(fd, bytes) catch {};
 }
 
+/// Format `args` with `fmt` and `put` the text to `fd`. A text longer than
+/// 8 KiB is formatted on the heap; when that allocation fails, nothing is
+/// written.
 pub fn print(fd: sys.fd_t, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
     const s = std.mem.print(&buf, fmt, args) catch {
@@ -25,10 +28,12 @@ pub fn print(fd: sys.fd_t, comptime fmt: []const u8, args: anytype) void {
     put(fd, s);
 }
 
+/// `print` to stdout. No newline is added.
 pub fn out(comptime fmt: []const u8, args: anytype) void {
     print(1, fmt, args);
 }
 
+/// `print` to stderr. No newline is added.
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     print(2, fmt, args);
 }
