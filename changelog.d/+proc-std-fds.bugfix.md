@@ -1,0 +1,1 @@
+`proc.run` gives the child /dev/null or its pipes on fds 0 to 2 when the caller started with one of them closed: the child's stderr no longer lands in the captured stdout, and its stdin or stderr is no longer closed at exec.

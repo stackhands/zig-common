@@ -130,9 +130,18 @@ fn childExec(
         _ = linux.sigaction(@fromBackingInt(@intCast(s)), &act, null);
     }
     _ = linux.sigprocmask(linux.SIG.SETMASK, &empty, null);
-    if (linux.errno(linux.dup2(in_fd, 0)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(out_fd, 1)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(err_fd, 2)) != .SUCCESS) linux.exit_group(127);
+    // A source at 0, 1 or 2 (the caller started with that descriptor
+    // closed) moves above 2 first: a dup2 onto it would clobber it, and a
+    // dup2 onto itself keeps its close-on-exec flag.
+    var src = [3]sys.fd_t{ in_fd, out_fd, err_fd };
+    for (&src) |*fd| if (fd.* < 3) {
+        const moved = linux.fcntl(fd.*, linux.F.DUPFD, 3);
+        if (linux.errno(moved) != .SUCCESS) linux.exit_group(127);
+        fd.* = @intCast(moved);
+    };
+    for (src, 0..) |fd, target| {
+        if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(127);
+    }
     const keep_fd = exec_err_fd;
     if (keep_fd > 3) _ = linux.close_range(3, @intCast(keep_fd - 1), .{ .UNSHARE = false, .CLOEXEC = false });
     _ = linux.close_range(if (keep_fd >= 3) @intCast(keep_fd + 1) else 3, std.math.maxInt(linux.fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
@@ -564,4 +573,53 @@ test "groupAlive stays true for a live group while signals arrive" {
 test "run refuses a relative program" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.NotAbsolute, run(gpa, "sh", &.{"sh"}, no_env, .{}));
+}
+
+/// Run `body` in a forked child, which may close the descriptors the test
+/// runner talks over, and expect it to exit 0.
+fn expectChildPasses(comptime body: fn () u8) !void {
+    const pid: isize = @bitCast(linux.fork());
+    if (pid < 0) return error.Unexpected;
+    if (pid == 0) linux.exit_group(body());
+    var status: i32 = 0;
+    while (linux.errno(linux.wait4(@intCast(pid), &status, 0, null)) == .INTR) {}
+    try std.testing.expectEqual(Term{ .exited = 0 }, decode(@bitCast(status)));
+}
+
+/// 0 when `script` under /bin/sh prints `want`, 1 when it prints something
+/// else, 2 when it cannot be run.
+fn shPrints(script: []const u8, stdin: ?[]const u8, want: []const u8) u8 {
+    const r = run(std.heap.page_allocator, "/bin/sh", &.{ "sh", "-c", script }, no_env, .{ .stdin = stdin }) catch return 2;
+    if (std.mem.eql(u8, r.stdout, want)) return 0;
+    std.debug.print("stdout \"{s}\", want \"{s}\"\n", .{ r.stdout, want });
+    return 1;
+}
+
+test "a closed stdout at start does not send the child's stderr to its stdout" {
+    try expectChildPasses(struct {
+        fn body() u8 {
+            sys.close(1);
+            return shPrints("echo out; echo err >&2", null, "out\n");
+        }
+    }.body);
+}
+
+test "a closed stdin at start leaves the child's stdin and stderr on their files" {
+    try expectChildPasses(struct {
+        fn body() u8 {
+            sys.close(0);
+            const r = shPrints("readlink /proc/self/fd/0 || echo closed", null, "/dev/null\n");
+            if (r != 0) return r;
+            return shPrints("cat; readlink /proc/self/fd/2", "in\n", "in\n/dev/null\n");
+        }
+    }.body);
+}
+
+test "a closed stderr at start leaves the child's stderr on /dev/null" {
+    try expectChildPasses(struct {
+        fn body() u8 {
+            sys.close(2);
+            return shPrints("readlink /proc/self/fd/2 || echo closed", null, "/dev/null\n");
+        }
+    }.body);
 }
