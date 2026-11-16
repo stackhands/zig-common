@@ -130,9 +130,18 @@ fn childExec(
         _ = linux.sigaction(@fromBackingInt(@intCast(s)), &act, null);
     }
     _ = linux.sigprocmask(linux.SIG.SETMASK, &empty, null);
-    if (linux.errno(linux.dup2(in_fd, 0)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(out_fd, 1)) != .SUCCESS) linux.exit_group(127);
-    if (linux.errno(linux.dup2(err_fd, 2)) != .SUCCESS) linux.exit_group(127);
+    // A source at 0, 1 or 2 (the caller started with that descriptor
+    // closed) moves above 2 first: a dup2 onto it would clobber it, and a
+    // dup2 onto itself keeps its close-on-exec flag.
+    var src = [3]sys.fd_t{ in_fd, out_fd, err_fd };
+    for (&src) |*fd| if (fd.* < 3) {
+        const moved = linux.fcntl(fd.*, linux.F.DUPFD, 3);
+        if (linux.errno(moved) != .SUCCESS) linux.exit_group(127);
+        fd.* = @intCast(moved);
+    };
+    for (src, 0..) |fd, target| {
+        if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(127);
+    }
     const keep_fd = exec_err_fd;
     if (keep_fd > 3) _ = linux.close_range(3, @intCast(keep_fd - 1), .{ .UNSHARE = false, .CLOEXEC = false });
     _ = linux.close_range(if (keep_fd >= 3) @intCast(keep_fd + 1) else 3, std.math.maxInt(linux.fd_t), .{ .UNSHARE = false, .CLOEXEC = false });
