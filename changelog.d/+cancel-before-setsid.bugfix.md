@@ -1,0 +1,1 @@
+`proc.run` kills a child that is canceled or times out before it has made its process group, instead of signalling a group that does not exist yet, which let the child run to the end and what it started outlive the call. `proc.stopGroup` likewise kills a child whose pgid `Options.pgid_out` has only just published.
