@@ -542,7 +542,11 @@ test "a set cancel flag kills the child" {
     try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
 }
 
-fn onUsr1Proc(_: linux.SIG) callconv(.c) void {}
+var usr1_caught = std.atomic.Value(u32).init(0);
+
+fn onUsr1Proc(_: linux.SIG) callconv(.c) void {
+    _ = usr1_caught.fetchAdd(1, .monotonic);
+}
 
 test "groupAlive stays true for a live group while signals arrive" {
     const handler: linux.Sigaction = .{ .handler = .{ .handler = &onUsr1Proc }, .mask = linux.sigemptyset(), .flags = 0 };
@@ -552,10 +556,19 @@ test "groupAlive stays true for a live group while signals arrive" {
     const Stop = struct {
         var go = std.atomic.Value(bool).init(true);
         fn buzz() void {
+            // This thread must not catch SIGUSR1, or the signal may interrupt
+            // it instead of the scan.
             var blocked = linux.sigemptyset();
             linux.sigaddset(&blocked, .USR1);
             _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            while (go.load(.acquire)) _ = linux.kill(linux.getpid(), .USR1);
+            // Without the pause a signal is always pending, the scan takes
+            // one after every system call, and the checks below take a
+            // minute on more than one CPU.
+            while (go.load(.acquire)) {
+                _ = linux.kill(linux.getpid(), .USR1);
+                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = linux.nanosleep(&ts, null);
+            }
         }
     };
     Stop.go.store(true, .release);
@@ -565,7 +578,17 @@ test "groupAlive stays true for a live group while signals arrive" {
         buzz.join();
     }
     const pgid: linux.pid_t = @intCast(linux.getpgid(0));
-    for (0..50) |_| try std.testing.expect(groupAlive(pgid));
+    // At least 50 checks, and on until 10 have caught a signal mid-scan, so
+    // the test fails rather than passes when no signal lands.
+    const until = nowMs() + 10_000;
+    var checks: usize = 0;
+    var interrupted: usize = 0;
+    while (checks < 50 or (interrupted < 10 and nowMs() < until)) : (checks += 1) {
+        const caught = usr1_caught.load(.monotonic);
+        try std.testing.expect(groupAlive(pgid));
+        if (usr1_caught.load(.monotonic) != caught) interrupted += 1;
+    }
+    try std.testing.expect(interrupted >= 10);
 }
 
 test "run refuses a relative program" {
