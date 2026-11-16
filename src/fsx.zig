@@ -121,23 +121,26 @@ pub fn openDir(dir: fd_t, path: []const u8, follow: bool) Error!fd_t {
 
 fn copyFd(src: fd_t, dst: fd_t) Error!void {
     var buf: [64 * 1024]u8 = undefined;
+    var off: linux.off_t = 0;
     while (true) {
-        const n = try sys.read(src, &buf);
+        const n = try sys.call(linux.pread, .{ src, &buf, buf.len, off });
         if (n == 0) return;
         try sys.writeAll(dst, buf[0..n]);
+        off += @intCast(n);
     }
 }
 
-/// Copy an open regular file to `dir/name`. The bytes are written to a
-/// temporary file in `dir`, synced, and renamed over `name`, so a short
-/// write (a full disk, a file-size limit) leaves an existing destination
-/// as it was and does not publish a partial file under `name`. An existing
-/// regular file keeps its owner, when this process may set it, and its
-/// mode; a new file gets the source's permission bits less the umask. A
-/// destination that is a symbolic link or not a regular file is refused.
-/// A destination with other hard links keeps those links on the previous
-/// inode; `name` is the new inode. Returns the open destination, which the
-/// caller closes.
+/// Copy an open regular file to `dir/name`: all of it, whatever the
+/// descriptor's offset, which is left where it was. The bytes are written
+/// to a temporary file in `dir`, synced, and renamed over `name`, so a
+/// short write (a full disk, a file-size limit) leaves an existing
+/// destination as it was and does not publish a partial file under `name`.
+/// An existing regular file keeps its owner, when this process may set it,
+/// and its mode; a new file gets the source's permission bits less the
+/// umask. A destination that is a symbolic link or not a regular file is
+/// refused. A destination with other hard links keeps those links on the
+/// previous inode; `name` is the new inode. Returns the open destination,
+/// which the caller closes.
 pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t {
     const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
         error.NotFound => null,
