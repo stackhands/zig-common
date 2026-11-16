@@ -83,6 +83,18 @@ fn alive(pid: linux.pid_t) bool {
     return state.len > 0 and state[0] != 'Z' and state[0] != 'X';
 }
 
+/// The process whose pid the script noted in `name`, if it did, is gone
+/// within a second; one that is not is killed, so it cannot outlive the test.
+fn expectGone(root: []const u8, name: []const u8) !void {
+    const pid = readPid(root, name) orelse return;
+    for (0..100) |_| {
+        if (!alive(pid)) return;
+        sleepMs(10);
+    }
+    _ = linux.kill(pid, .KILL);
+    return error.TestUnexpectedResult;
+}
+
 /// Live processes whose process group is `pgid`.
 fn groupMembers(pgid: linux.pid_t) usize {
     const dir = sys.openat(linux.AT.FDCWD, "/proc", .{ .DIRECTORY = true }, 0) catch return 0;
@@ -228,6 +240,24 @@ test "an interrupted call returns after every group member has exited" {
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
 }
 
+// A flag set before the call cancels as soon as the child is forked, mostly
+// before it has called setsid and made the group the kill is sent to.
+test "a cancel before the child has made its group kills it and all it starts" {
+    const root = begin();
+    defer end(root);
+    var flag = std.atomic.Value(bool).init(true);
+    for (0..100) |i| {
+        const name = A.print("background{d}", .{i}) catch unreachable;
+        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
+        const started = nowMs();
+        const r = sh(root, script, .{ .cancel = &flag });
+        const took = nowMs() - started;
+        try expectGone(root, name);
+        try testing.expectError(error.Canceled, r);
+        try testing.expect(took < 1000);
+    }
+}
+
 test "a noisy helper cannot outlive a killed caller" {
     const root = begin();
     defer end(root);
@@ -301,6 +331,49 @@ test "stopGroup leaves no member of a published group alive" {
     if (r) |res| try testing.expect(res.term.code() != 0);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
     try testing.expect(!alive(try waitPid(root, "worker")));
+}
+
+fn stopWhenPublished() void {
+    const until = nowMs() + 10_000;
+    while (nowMs() < until) {
+        const g = stop_pgid.load(.seq_cst);
+        if (g > 0) return proc.stopGroup(g);
+        std.atomic.spinLoopHint();
+    }
+}
+
+// A handler that stops the group and exits leaves nothing to stop the
+// child later, so stopGroup must reach it before it has made its group too.
+test "stopGroup on a pgid as soon as it is published kills the child" {
+    const root = begin();
+    defer end(root);
+    // On one CPU the child waits while this thread and the stopping one
+    // run, so the stop comes before its setsid nearly every time. With more,
+    // stopGroup's scan of the group mostly gives it time to make the group.
+    var cpus: linux.cpu_set_t = undefined;
+    const pinned = linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &cpus)) == .SUCCESS;
+    if (pinned) {
+        var one = std.mem.zeroes(linux.cpu_set_t);
+        for (cpus, &one) |c, *o| if (c != 0) {
+            o.* = c & -%c;
+            break;
+        };
+        try linux.sched_setaffinity(0, &one);
+    }
+    defer if (pinned) linux.sched_setaffinity(0, &cpus) catch {};
+    for (0..100) |i| {
+        stop_pgid.store(0, .seq_cst);
+        const name = A.print("background{d}", .{i}) catch unreachable;
+        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
+        const thread = try std.Thread.spawn(.{}, stopWhenPublished, .{});
+        const started = nowMs();
+        const r = sh(root, script, .{ .pgid_out = &stop_pgid });
+        thread.join();
+        const took = nowMs() - started;
+        try expectGone(root, name);
+        try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
+        try testing.expect(took < 1000);
+    }
 }
 
 test "stdin to a child that does not read it fails with EPIPE, not SIGPIPE" {
