@@ -683,6 +683,22 @@ test "a denied read of a listed ACL is refused" {
     }
 }
 
+test "a failed ACL read prints its errno's full text" {
+    begin();
+    defer end();
+    for (models()) |m0| {
+        var m = m0;
+        const s = scenario(&m);
+        defer cleanup(s.dir);
+        target = s.path;
+        hook_errno = .STALE;
+        m.hooks.get = hFail;
+        try expectRefused(write(s.path, "new", replace), "[Errno 116] Stale file handle");
+        reset(&m);
+        try assertUnchanged(&m, s);
+    }
+}
+
 test "a listed, then unreadable ACL is refused" {
     begin();
     defer end();
