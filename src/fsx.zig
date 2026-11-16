@@ -228,7 +228,11 @@ pub fn readAll(gpa: Allocator, fd: fd_t, limit: usize) (Error || Allocator.Error
     return list.toOwnedSlice(gpa);
 }
 
-const acl_names = [_][:0]const u8{ "system.posix_acl_access", "system.nfs4_acl" };
+/// The access ACL forms, most native first: the GPFS native NFSv4 ACL, the
+/// generic NFSv4 ACL and the POSIX access ACL. A filesystem may expose one
+/// ACL through several of them.
+pub const acl_attributes = [_][:0]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
+const posix_access = acl_attributes[2];
 
 /// The xattr calls copyAcls makes, as raw system-call results; a test
 /// emulates a filesystem's ACL model with its own.
@@ -241,23 +245,34 @@ const Xattrs = struct {
     }
 };
 
-/// Copy the access ACL xattrs of `from` onto `to`. An ACL that exists on
-/// `from` and cannot be set on `to` is an error.
+/// Copy the access ACL of `from` onto `to` in the most native form `from`
+/// has; the filesystem derives any other form it shows from that one. An
+/// ACL that cannot be set on `to` is an error, and so is a form that cannot
+/// be read when no other can be copied.
 fn copyAcls(comptime X: type, from: fd_t, to: fd_t) Error!void {
     var buf: [64 * 1024]u8 = undefined;
-    for (acl_names) |name| {
+    var unreadable = false;
+    for (acl_attributes) |name| {
         const n = sys.call(X.get, .{ from, name, &buf }) catch |err| switch (err) {
             error.NoData, error.Unsupported => continue,
+            // GPFS answers EINVAL for an NFSv4 form of a file whose ACL is
+            // POSIX, which the last form reads.
+            error.InvalidArgument => if (std.mem.eql(u8, name, posix_access)) return err else {
+                unreadable = true;
+                continue;
+            },
             else => return err,
         };
         _ = try sys.call(X.set, .{ to, name, buf[0..n] });
+        return;
     }
+    if (unreadable) return error.InvalidArgument;
 }
 
 /// Replace the contents of the regular file `dir/name` atomically. The new
 /// file keeps the old one's owner (when this process may set it), mode and
-/// access ACLs; it is written beside the old one, synced, then renamed over
-/// it.
+/// access ACL, in the most native of the `acl_attributes` forms the old one
+/// has; it is written beside the old one, synced, then renamed over it.
 pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     const old = try openRegular(dir, name, false);
     defer sys.close(old.fd);

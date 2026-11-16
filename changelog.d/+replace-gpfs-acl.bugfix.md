@@ -1,0 +1,1 @@
+`fsx.replaceContents` copies a GPFS native NFSv4 ACL (`system.gpfs_nfs4_acl`), which it dropped, and, as `atomic` does, copies only the most native ACL form the old file has. GPFS's EINVAL for an NFSv4 form of a file with a POSIX ACL no longer fails the replacement. `fsx.acl_attributes` is the one list of forms, and `atomic` uses it.
