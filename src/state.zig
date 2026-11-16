@@ -45,7 +45,8 @@ pub const LockError = Error || error{TimedOut};
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
 /// The deadline is read from the monotonic clock. A signal that cuts a
 /// sleep short does not consume the whole wait: the next check looks at
-/// the clock again.
+/// the clock again. A failure other than contention is the flock error,
+/// with its errno in `sys.last_errno`.
 pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
     const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
     if (deadline == null) {
@@ -57,7 +58,7 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
         switch (linux.errno(rc)) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
-            else => return error.Unexpected,
+            else => return mapped(rc),
         }
         const left = deadline.? - nowMs();
         if (left <= 0) return error.TimedOut;
@@ -178,6 +179,14 @@ test "lockExclusive waits out the timeout while signals arrive" {
     buzz.join();
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
     try std.testing.expect(ms >= 300 and ms < 5000);
+}
+
+test "a lock that fails reports its errno, with or without a timeout" {
+    for ([_]?u32{ null, 0, 50 }) |timeout| {
+        sys.last_errno = .SUCCESS;
+        try std.testing.expectError(error.InvalidArgument, lockExclusive(-1, timeout));
+        try std.testing.expectEqualStrings("[Errno 9] Bad file descriptor", sys.describe(error.InvalidArgument));
+    }
 }
 
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
