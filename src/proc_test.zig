@@ -376,6 +376,78 @@ test "stopGroup on a pgid as soon as it is published kills the child" {
     }
 }
 
+var kill_pgid = std.atomic.Value(i32).init(0);
+var winches = std.atomic.Value(u32).init(0);
+
+fn onUsr2KillGroup(_: linux.SIG) callconv(.c) void {
+    proc.killGroup(kill_pgid.load(.seq_cst), .KILL);
+}
+
+fn onWinch(_: linux.SIG) callconv(.c) void {
+    _ = winches.fetchAdd(1, .seq_cst);
+}
+
+fn signalWhenStarted(root: []const u8, tid: linux.pid_t) void {
+    for (0..1000) |_| {
+        if (readPid(root, "background") != null) break;
+        sleepMs(10);
+    }
+    _ = linux.tgkill(linux.getpid(), tid, .USR2);
+}
+
+/// Child `pid`, forked by the test, ends by SIGKILL within a second; one
+/// that does not is killed, so it cannot outlive the test.
+fn expectKilled(pid: linux.pid_t) !void {
+    var status: u32 = 0;
+    for (0..100) |_| {
+        if (linux.wait4(pid, @ptrCast(&status), linux.W.NOHANG, null) == @as(usize, @intCast(pid))) {
+            return testing.expectEqual(@as(u32, 9), status & 0x7f);
+        }
+        sleepMs(10);
+    }
+    _ = linux.kill(pid, .KILL);
+    _ = linux.wait4(pid, @ptrCast(&status), 0, null);
+    return error.TestUnexpectedResult;
+}
+
+test "killGroup in a signal handler kills a child before and after it has made its group" {
+    const root = begin();
+    defer end(root);
+    var prev_usr2: linux.Sigaction = undefined;
+    const on_usr2: linux.Sigaction = .{ .handler = .{ .handler = &onUsr2KillGroup }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.USR2, &on_usr2, &prev_usr2);
+    defer _ = linux.sigaction(.USR2, &prev_usr2, null);
+    var prev_winch: linux.Sigaction = undefined;
+    const on_winch: linux.Sigaction = .{ .handler = .{ .handler = &onWinch }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.WINCH, &on_winch, &prev_winch);
+    defer _ = linux.sigaction(.WINCH, &prev_winch, null);
+    const tid = linux.gettid();
+
+    // pgid_out's 0, no child, is not this process's own group.
+    proc.killGroup(0, .WINCH);
+    try testing.expectEqual(@as(u32, 0), winches.load(.seq_cst));
+
+    // Between fork and setsid the child is in this process's group and no
+    // group has its pid for id, so only a kill of the child itself reaches it.
+    const child: isize = @bitCast(linux.fork());
+    if (child == 0) {
+        sleepMs(30_000);
+        linux.exit_group(0);
+    }
+    try testing.expect(child > 0);
+    kill_pgid.store(@intCast(child), .seq_cst);
+    _ = linux.tgkill(linux.getpid(), tid, .USR2);
+    try expectKilled(@intCast(child));
+
+    // Once it has made the group, all of it, here while run waits on it.
+    kill_pgid.store(0, .seq_cst);
+    const thread = try std.Thread.spawn(.{}, signalWhenStarted, .{ root, tid });
+    const r = sh(root, "sleep 30 >/dev/null &\necho $! > background\nsleep 30\n", .{ .pgid_out = &kill_pgid });
+    thread.join();
+    try expectGone(root, "background");
+    try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
+}
+
 test "stdin to a child that does not read it fails with EPIPE, not SIGPIPE" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

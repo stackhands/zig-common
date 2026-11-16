@@ -48,9 +48,9 @@ pub const Options = struct {
     /// when true, the child's group is killed and `error.Canceled` returned.
     cancel: ?*const std.atomic.Value(bool) = null,
     /// Set to the child's process group id while it runs, 0 otherwise, so a
-    /// signal handler can kill it with `stopGroup`. It is set before the
-    /// child has made the group, which a kill of the group alone then
-    /// misses. Only with `new_session`.
+    /// signal handler can kill it with `killGroup` or `stopGroup`. It is set
+    /// before the child has made the group, which a kill of the group alone
+    /// then misses. Only with `new_session`.
     pgid_out: ?*std.atomic.Value(i32) = null,
     /// `truncate`: stdout past `stdout_limit` is read and dropped, and the
     /// call goes on; `fail`: it is an error and the child is killed.
@@ -223,13 +223,29 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
     }
 }
 
-/// SIGKILL the group `pgid`, or process `pgid` itself while it has not made
-/// that group yet, and wait (up to 10 s) until no member of the group is
-/// alive. Only system calls and stack buffers, so a signal handler may call
-/// it, with the pgid that `Options.pgid_out` published.
+/// Send `sig` to the process group `pgid` of a child that `run` started in
+/// a new session, as `Options.pgid_out` publishes it. The child makes that
+/// group with setsid after the fork, so until then there is no such group:
+/// the child itself is signalled, as it has started nothing before it
+/// execs, and then the group again in case it was made meanwhile. The child
+/// is reaped only after pgid_out is cleared, so a published pid is still
+/// the child's. A `pgid` of 0 or less does nothing: 0 is pgid_out's "no
+/// child", which kill would take for this process's own group. Safe in a
+/// signal handler: only kill system calls, and no waiting; `stopGroup`
+/// also waits until the group is gone.
+pub fn killGroup(pgid: linux.pid_t, sig: linux.SIG) void {
+    if (pgid <= 0) return;
+    if (linux.errno(linux.kill(-pgid, sig)) != .SRCH) return;
+    _ = linux.kill(pgid, sig);
+    _ = linux.kill(-pgid, sig);
+}
+
+/// `killGroup(pgid, .KILL)`, then wait (up to 10 s) until no member of the
+/// group is alive. Only system calls and stack buffers, so a signal handler
+/// may call it, with the pgid that `Options.pgid_out` published.
 pub fn stopGroup(pgid: linux.pid_t) void {
     if (pgid <= 0) return;
-    kill(pgid, true, .KILL);
+    killGroup(pgid, .KILL);
     waitGroupGone(pgid);
 }
 
@@ -238,20 +254,16 @@ pub fn stopGroup(pgid: linux.pid_t) void {
 fn waitGroupGone(pgid: linux.pid_t) void {
     const until = nowMs() + 10_000;
     while (groupAlive(pgid) and nowMs() < until) {
-        kill(pgid, true, .KILL);
+        killGroup(pgid, .KILL);
         var ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         _ = linux.nanosleep(&ts, null);
     }
 }
 
-/// Signal the child `pid`, or with `group` its process group. The child
-/// makes that group with setsid after the fork, so until then there is no
-/// such group: the child itself is signalled, as it has started nothing
-/// before it execs, and then the group again in case it was made meanwhile.
+/// Signal the child `pid`, or with `group` its process group.
 fn kill(pid: linux.pid_t, group: bool, sig: linux.SIG) void {
-    if (group and linux.errno(linux.kill(-pid, sig)) != .SRCH) return;
+    if (group) return killGroup(pid, sig);
     _ = linux.kill(pid, sig);
-    if (group) _ = linux.kill(-pid, sig);
 }
 
 const Pipe = struct { r: sys.fd_t, w: sys.fd_t };
@@ -404,7 +416,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         if (opts.end_with_leader and opts.new_session and exitedWithin(pid, 0)) {
             // The child is gone: stop its group, keep what is already in
             // the pipes, and close them under any writer that left it.
-            kill(pid, true, .KILL);
+            killGroup(pid, .KILL);
             for (fds[1..], 1..) |fd, i| {
                 if (fd < 0) continue;
                 setNonblock(fd);
@@ -497,7 +509,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             kill(pid, opts.new_session, .TERM);
             if (!exitedWithin(pid, opts.grace_ms)) kill(pid, opts.new_session, .KILL);
         }
-        if (opts.new_session) kill(pid, true, .KILL);
+        if (opts.new_session) killGroup(pid, .KILL);
         if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
         if (opts.pgid_out) |o| o.store(0, .seq_cst);
         _ = reap(pid) catch null;
@@ -505,7 +517,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     }
     // Members of the child's group outliving it are not ours to keep; the
     // unreaped leader keeps the group id from being reused until this is sent.
-    if (opts.new_session) kill(pid, true, .KILL);
+    if (opts.new_session) killGroup(pid, .KILL);
     if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
     if (opts.pgid_out) |o| o.store(0, .seq_cst);
     const term = try reap(pid);
