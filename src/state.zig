@@ -45,7 +45,8 @@ pub const LockError = Error || error{TimedOut};
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
 /// The deadline is read from the monotonic clock. A signal that cuts a
 /// sleep short does not consume the whole wait: the next check looks at
-/// the clock again.
+/// the clock again. A failure other than contention is the flock error,
+/// with its errno in `sys.last_errno`.
 pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
     const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
     if (deadline == null) {
@@ -57,7 +58,7 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
         switch (linux.errno(rc)) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
-            else => return error.Unexpected,
+            else => return mapped(rc),
         }
         const left = deadline.? - nowMs();
         if (left <= 0) return error.TimedOut;
