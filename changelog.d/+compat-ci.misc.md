@@ -1,0 +1,1 @@
+CI builds and tests the `main` of every tool built on the library (eb-keep-logs, eb-local, eb-staged-rebuild and eessi-arch-guard) against each commit, as COMPAT.md says, with `zig build --fork`; it built only eb-keep-logs, from its stale `zig` branch.
