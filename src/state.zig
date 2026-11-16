@@ -43,12 +43,15 @@ pub fn openPrivate(dir: fsx.fd_t, name: []const u8, create: bool) Error!?fsx.fd_
 pub const LockError = Error || error{TimedOut};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
+/// The deadline is read from the monotonic clock. A signal that cuts a
+/// sleep short does not consume the whole wait: the next check looks at
+/// the clock again.
 pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
-    const ms = timeout_ms orelse {
+    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
+    if (deadline == null) {
         _ = try sys.call(linux.flock, .{ fd, std.posix.LOCK.EX });
         return;
-    };
-    var left: i64 = ms;
+    }
     while (true) {
         const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         switch (linux.errno(rc)) {
@@ -56,11 +59,10 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
             .AGAIN, .INTR => {},
             else => return error.Unexpected,
         }
+        const left = deadline.? - nowMs();
         if (left <= 0) return error.TimedOut;
-        const step: i64 = @min(left, 20);
-        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(step * std.time.ns_per_ms) };
+        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(left, 20) * std.time.ns_per_ms) };
         _ = linux.nanosleep(&ts, null);
-        left -= step;
     }
 }
 
@@ -124,6 +126,60 @@ test "a file that is not private is not read" {
     try lockExclusive(lk, 100);
 }
 
+fn onUsr1(_: linux.SIG) callconv(.c) void {}
+
+test "lockExclusive waits out the timeout while signals arrive" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-locktime-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+    const held = try sys.openat(d, "L", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    defer sys.close(held);
+    const waiter = try sys.openat(d, "L", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(waiter);
+    _ = try sys.call(linux.flock, .{ held, std.posix.LOCK.EX });
+    defer _ = linux.flock(held, std.posix.LOCK.UN);
+
+    const handler: linux.Sigaction = .{ .handler = .{ .handler = &onUsr1 }, .mask = linux.sigemptyset(), .flags = 0 };
+    var prev: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &handler, &prev);
+    defer _ = linux.sigaction(.USR1, &prev, null);
+    const Stop = struct {
+        var go = std.atomic.Value(bool).init(true);
+        fn buzz() void {
+            // This thread must not catch SIGUSR1, or the waiter's sleep is
+            // never the one the signal interrupts.
+            var blocked = linux.sigemptyset();
+            linux.sigaddset(&blocked, .USR1);
+            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
+            while (go.load(.acquire)) {
+                _ = linux.kill(linux.getpid(), .USR1);
+                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = linux.nanosleep(&ts, null);
+            }
+        }
+    };
+    Stop.go.store(true, .release);
+    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
+    var t0: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t0);
+    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 400));
+    var t1: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &t1);
+    Stop.go.store(false, .release);
+    buzz.join();
+    const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
+    try std.testing.expect(ms >= 300 and ms < 5000);
+}
+
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
 
 /// A state root's lock. The flock gate excludes processes on one kernel; the
@@ -136,8 +192,9 @@ test "a file that is not private is not read" {
 /// Others may be able to write the state root. The root is opened without
 /// following a symbolic link as its last component, both files through its
 /// descriptor without following one at their names, and each is trusted
-/// only as a regular file with one link: a FIFO planted at a name is never
-/// opened, and the file behind a planted hard link is never truncated.
+/// only as a regular file of this user with one link: a FIFO planted at a
+/// name is never opened, and the file behind a planted hard link, or a file
+/// another user owns, is never truncated.
 pub const RootLock = struct {
     gate: fsx.fd_t,
     posix: fsx.fd_t,
@@ -148,9 +205,10 @@ pub const RootLock = struct {
 
     pub const AcquireError = Error || error{
         Busy,
-        /// STATE_ROOT/.lock.posix is not a regular file with one link.
+        /// STATE_ROOT/.lock.posix is not a regular file of this user with
+        /// one link.
         NotPrivate,
-        /// STATE_ROOT/.lock is not a regular file with one link.
+        /// STATE_ROOT/.lock is not a regular file of this user with one link.
         GateNotPrivate,
         OutOfMemory,
     };
@@ -207,10 +265,10 @@ pub const RootLock = struct {
     /// STATE_ROOT is created when absent and opened O_DIRECTORY|O_NOFOLLOW;
     /// a symbolic link there is NotDir. Each lock file is opened relative to
     /// that descriptor with O_NOFOLLOW, created mode 0600, only when its name
-    /// is absent or a regular file with one link, and its descriptor must be
-    /// that file. The gate is checked again once both locks are held, right
-    /// before it is truncated. Allocates nothing; `gpa` stays for source
-    /// compatibility.
+    /// is absent or a regular file of this user with one link, and its
+    /// descriptor must be that file. The gate is checked again once both
+    /// locks are held, right before it is truncated. Allocates nothing;
+    /// `gpa` stays for source compatibility.
     pub fn acquire(gpa: Allocator, state_root: []const u8, timeout_ms: ?u32) AcquireError!RootLock {
         _ = gpa;
         const atomic = @import("atomic.zig");
@@ -234,12 +292,12 @@ pub const RootLock = struct {
     }
 
     /// `dir/name` opened read-write through `open`; null unless the name is
-    /// absent or a regular file with one link before the open, so a FIFO,
-    /// device or symbolic link there is never opened, and the descriptor is
-    /// that file after it.
+    /// absent or a regular file of this user with one link before the open,
+    /// so a FIFO, device or symbolic link there is never opened, and the
+    /// descriptor is that file after it.
     fn openLockFile(dir: fsx.fd_t, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
         if (fsx.statAt(dir, name, false)) |st| {
-            if (!st.isReg() or st.nlink != 1) return null;
+            if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return null;
         } else |err| switch (err) {
             error.NotFound => {},
             else => |e| return e,
@@ -254,13 +312,13 @@ pub const RootLock = struct {
         return null;
     }
 
-    /// Whether `fd` is a regular file whose one link is `dir/name`. The name
-    /// is looked up as well as the descriptor: a planted hard link unlinked
-    /// while the lock is awaited leaves the descriptor on the other name's
-    /// file, with one link.
+    /// Whether `fd` is a regular file of this user whose one link is
+    /// `dir/name`. The name is looked up as well as the descriptor: a
+    /// planted hard link unlinked while the lock is awaited leaves the
+    /// descriptor on the other name's file, with one link.
     fn isSoleLink(dir: fsx.fd_t, name: []const u8, fd: fsx.fd_t) Error!bool {
         const st = try fsx.fstat(fd);
-        if (!st.isReg() or st.nlink != 1) return false;
+        if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return false;
         const at = fsx.statAt(dir, name, false) catch |err| switch (err) {
             error.NotFound => return false,
             else => |e| return e,
