@@ -21,6 +21,8 @@ breaks a tool shows before the tool moves to it.
 
 `sys.describe` prints glibc's `strerror` text, as Python's `os.strerror` does,
 for every errno the Zig standard library's `linux.E` names. An errno it does
-not name prints `[Errno N] Unknown error N`; on x86_64 that is errno 134,
-which glibc calls "Memory page has hardware error".
+not name prints `[Errno N] Unknown error N`. On x86_64, errno 133 is
+`HWPOISON`, `[Errno 133] Memory page has hardware error`, and errno 134 is
+not a named errno: both glibc and this library print `[Errno 134] Unknown
+error 134`.
 
