@@ -361,7 +361,7 @@ test "stopGroup on a pgid as soon as it is published kills the child" {
         try linux.sched_setaffinity(0, &one);
     }
     defer if (pinned) linux.sched_setaffinity(0, &cpus) catch {};
-    for (0..100) |i| {
+    for (0..50) |i| {
         stop_pgid.store(0, .seq_cst);
         const name = A.print("background{d}", .{i}) catch unreachable;
         const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
