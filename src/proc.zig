@@ -177,16 +177,12 @@ fn exitedWithin(pid: linux.pid_t, ms: ?i64) bool {
     }
 }
 
-fn reap(pid: linux.pid_t) Term {
-    while (true) {
-        var status: i32 = 0;
-        const rc = linux.wait4(pid, &status, 0, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => return decode(@bitCast(status)),
-            .INTR => continue,
-            else => return .{ .signaled = 9 },
-        }
-    }
+/// Reap the child. With SIGCHLD ignored (SIG_IGN or SA_NOCLDWAIT) the
+/// kernel has reaped it and its status is gone: `error.NoChild`.
+fn reap(pid: linux.pid_t) sys.Error!Term {
+    var status: i32 = 0;
+    _ = try sys.call(linux.wait4, .{ pid, &status, 0, null });
+    return decode(@bitCast(status));
 }
 
 /// True while a live (not zombie) process is in process group `pgid`. A
@@ -279,6 +275,8 @@ fn keep(i: usize, bytes: []const u8, out: *std.ArrayList(u8), err_buf: *std.Arra
 }
 
 /// Run `exe` (an absolute path) with `argv` (argv[0] included) and `envp`.
+/// The caller must not ignore SIGCHLD (SIG_IGN or SA_NOCLDWAIT): the kernel
+/// then reaps the child and its status is lost, which is `error.NoChild`.
 pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp, opts: Options) Error!Result {
     if (exe.len == 0 or exe[0] != '/') return error.NotAbsolute;
 
@@ -370,7 +368,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         };
         if (got == 4) {
             if (opts.pgid_out) |o| o.store(0, .seq_cst);
-            _ = reap(pid);
+            _ = reap(pid) catch null;
             _ = try sys.result(@bitCast(-@as(isize, @intCast(e))));
             return error.Unexpected;
         }
@@ -493,7 +491,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         if (opts.new_session) kill(pid, true, .KILL);
         if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
         if (opts.pgid_out) |o| o.store(0, .seq_cst);
-        _ = reap(pid);
+        _ = reap(pid) catch null;
         return err;
     }
     // Members of the child's group outliving it are not ours to keep; the
@@ -501,7 +499,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     if (opts.new_session) kill(pid, true, .KILL);
     if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
     if (opts.pgid_out) |o| o.store(0, .seq_cst);
-    const term = reap(pid);
+    const term = try reap(pid);
     const o = try out.toOwnedSlice(gpa);
     errdefer gpa.free(o);
     return .{ .term = term, .stdout = o, .stderr = try err_buf.toOwnedSlice(gpa) };
@@ -622,4 +620,13 @@ test "a closed stderr at start leaves the child's stderr on /dev/null" {
             return shPrints("readlink /proc/self/fd/2 || echo closed", null, "/dev/null\n");
         }
     }.body);
+}
+
+test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
+    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.CHLD, &ignore, &old);
+    defer _ = linux.sigaction(.CHLD, &old, null);
+    try std.testing.expectError(error.NoChild, run(std.testing.allocator, "/bin/sh", &.{ "sh", "-c", "exit 3" }, no_env, .{}));
+    try std.testing.expectEqual(linux.E.CHILD, sys.last_errno);
 }
