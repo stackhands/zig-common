@@ -1,1 +1,0 @@
-`proc.killGroup(pgid, sig)` sends a signal to the process group that `Options.pgid_out` published, or to the child itself while it has not made that group yet, as `proc.run` does. It makes only kill system calls and does not wait, so a signal handler can call it; `proc.stopGroup` also waits for the group to go.

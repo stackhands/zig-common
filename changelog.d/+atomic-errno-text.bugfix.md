@@ -1,1 +1,0 @@
-`atomic` words a failed ACL read with `sys.describeErrno`, glibc's text for every errno Linux names (`[Errno 116] Stale file handle`), instead of its own six-entry table that printed the errno's name for the rest.

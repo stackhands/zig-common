@@ -1,1 +1,0 @@
-`json.decodeCache` and `json.decodeWire` return `error.Encoding` for an escape that is cut off, unknown or a `\u` without four hex digits, where they read past the string or took `\u+123` and `\x0041`; what they allocated before the error is freed. `Value.get` does not read past a key that ends in a backslash.

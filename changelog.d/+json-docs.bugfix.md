@@ -1,1 +1,0 @@
-`json.parse` refuses arrays and objects nested more than 32 deep, now `json.max_depth`, whether or not the innermost one is empty; 33 nested empty containers used to parse. The limit is documented, and the module summary covers the parser, both codecs, `toPy` and `dumps`.

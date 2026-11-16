@@ -1,1 +1,0 @@
-The test that `proc.stopGroup` kills a child whose pgid was only just published runs 50 times instead of 100: without the kill fix it fails within its first three runs either way, and it takes half as long.
