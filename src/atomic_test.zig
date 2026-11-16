@@ -1700,3 +1700,34 @@ test "a privileged write refuses a temporary directory" {
     try testing.expect(isDir(pt[1]));
     try testing.expectEqualStrings("old", readFile(pt[0]));
 }
+
+// ---- ownership ---------------------------------------------------------------
+
+fn failFsync(_: ?*anyopaque, step: []const u8) bool {
+    return std.mem.eql(u8, step, "replace.fsync");
+}
+
+test "atomicWrite frees what it allocates but a refusal's message" {
+    begin();
+    defer end();
+    const gpa = testing.allocator;
+    for (models()) |m0| {
+        var m = m0;
+        const s = scenario(&m);
+        defer cleanup(s.dir);
+        var why: atomic.Why = .{};
+        try atomic.atomicWrite(gpa, s.path, "new", replace, &why);
+        try atomic.atomicWrite(gpa, join(s.dir, "copy.lua"), "copy", .{ .metadata_from = s.path }, &why);
+        try testing.expectEqualStrings("", why.msg);
+        try testing.expectError(error.Refused, atomic.atomicWrite(gpa, s.path, "x", .{ .step = "replace", .faults = .{ .fail_fn = failFsync } }, &why));
+        gpa.free(why.msg);
+        target = s.path;
+        hook_errno = .STALE;
+        m.hooks.get = hFail;
+        try testing.expectError(error.Refused, atomic.atomicWrite(gpa, s.path, "x", replace, &why));
+        gpa.free(why.msg);
+        reset(&m);
+        try testing.expectEqualStrings("new", readFile(s.path));
+        try expectAttrs(s.expected, m.getPath(s.path));
+    }
+}

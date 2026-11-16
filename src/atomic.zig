@@ -87,24 +87,26 @@ pub fn describe(err: Error) []const u8 {
     };
 }
 
-/// Why a replacement was refused; filled in when an error is returned.
+/// Why a replacement was refused; filled in when an error is returned. The
+/// message is allocated from the allocator given with `why` and belongs to
+/// the caller: `deinit` frees it.
 pub const Why = struct {
     msg: []const u8 = "",
+
+    pub fn deinit(why: *Why, a: Allocator) void {
+        if (why.msg.len > 0 and why.msg.ptr != unallocated_refusal.ptr) a.free(why.msg);
+        why.* = .{};
+    }
 };
 
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
-const static_refused: []const u8 = "refused";
+/// The message of a refusal that could not allocate its own.
+const unallocated_refusal: []const u8 = "refused";
 
 fn refuse(a: Allocator, why: *Why, comptime f: []const u8, args: anytype) Error {
-    why.msg = a.print(f, args) catch static_refused;
+    why.msg = a.print(f, args) catch unallocated_refusal;
     return error.Refused;
-}
-
-/// Free a message `refuse` stored, including its out-of-memory fallback.
-fn freeMsg(a: Allocator, msg: []const u8) void {
-    if (msg.len == 0 or msg.ptr == static_refused.ptr) return;
-    a.free(msg);
 }
 
 /// The value of each ACL attribute present, keyed by its name.
@@ -118,9 +120,21 @@ pub const Acls = struct {
         }
         return true;
     }
+
+    /// Free the values, allocated from `a` by the read that returned them.
+    pub fn deinit(acls: Acls, a: Allocator) void {
+        for (acls.present) |p| if (p) |v| a.free(v);
+    }
 };
 
-pub const Metadata = struct { info: fsx.Stat, acls: Acls };
+pub const Metadata = struct {
+    info: fsx.Stat,
+    acls: Acls,
+
+    pub fn deinit(m: Metadata, a: Allocator) void {
+        m.acls.deinit(a);
+    }
+};
 
 /// (dev, ino, uid, gid, mode, ctime): what a concurrent change moves.
 fn identity(s: fsx.Stat) [7]i128 {
@@ -155,10 +169,6 @@ fn listedAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error![acl_attributes.len]b
     return listed;
 }
 
-fn freeAcls(a: Allocator, acls: Acls) void {
-    for (acls.present) |p| if (p) |s| a.free(s);
-}
-
 /// One `fgetxattr`, retrying when a signal interrupts it. `op` cannot be
 /// used here: the errno itself decides whether a missing attribute is an
 /// error, and `op` collapses errnos into `sys.Error`.
@@ -172,7 +182,7 @@ fn xattrGet(fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize {
 fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
     const listed = try listedAcls(a, fd, why);
     var acls: Acls = .{};
-    errdefer freeAcls(a, acls);
+    errdefer acls.deinit(a);
     var buf: [64 * 1024]u8 = undefined;
     for (acl_attributes, 0..) |name, i| {
         const rc = xattrGet(fd, name, &buf);
@@ -196,24 +206,28 @@ fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
 }
 
 /// Every listed or virtual ACL of an open regular file, read twice; a change
-/// between the reads, or of the file's identity, is refused.
+/// between the reads, or of the file's identity, is refused. The values are
+/// allocated from `a`; `Acls.deinit` frees them.
 pub fn readAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
     const before = try fsx.fstat(fd);
     const acls = try readAllAcls(a, fd, why);
-    errdefer freeAcls(a, acls);
+    errdefer acls.deinit(a);
     const again = try readAllAcls(a, fd, why);
-    defer freeAcls(a, again);
+    defer again.deinit(a);
     if (!acls.eql(again) or !sameIdentity(try fsx.fstat(fd), before))
         return refuse(a, why, "access metadata changed during inspection", .{});
     return acls;
 }
 
+/// The stat and ACLs of the regular file at `path`; `Metadata.deinit` frees
+/// the ACLs, allocated from `a`.
 pub fn readMetadata(a: Allocator, path: []const u8, why: *Why) Error!Metadata {
     const fd = try sys.openat(fsx.cwd, path, .{ .NOFOLLOW = true, .NONBLOCK = true }, 0);
     defer sys.close(fd);
     const info = try fsx.fstat(fd);
     if (!info.isReg()) return refuse(a, why, "metadata source is not a regular file: {s}", .{path});
     const acls = try readAcls(a, fd, why);
+    errdefer acls.deinit(a);
     if (!sameIdentity(try fsx.fstat(fd), info)) return refuse(a, why, "access metadata changed during inspection", .{});
     return .{ .info = info, .acls = acls };
 }
@@ -239,7 +253,7 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
     };
     if (primary) |i| {
         const now = try readAcls(a, fd, why);
-        defer freeAcls(a, now);
+        defer now.deinit(a);
         if (!now.eql(m.acls)) {
             const v = m.acls.present[i].?;
             _ = try op(ops.fsetxattr, .{ fd, acl_attributes[i], v });
@@ -247,7 +261,7 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
     }
     for (acl_attributes) |_| {
         const present = try readAcls(a, fd, why);
-        defer freeAcls(a, present);
+        defer present.deinit(a);
         var extra: ?usize = null;
         for (present.present, m.acls.present, 0..) |p, want, i| if (p != null and want == null) {
             extra = i;
@@ -259,9 +273,9 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
     const restored = try fsx.fstat(fd);
     if (restored.uid != m.info.uid or restored.gid != m.info.gid or restored.perm() != mode)
         return refuse(a, why, "ownership or mode did not round-trip: expected {d}:{d} {o}, found {d}:{d} {o}", .{ m.info.uid, m.info.gid, mode, restored.uid, restored.gid, restored.perm() });
-    const round = try readAcls(a, fd, why);
-    defer freeAcls(a, round);
-    if (!round.eql(m.acls)) return refuse(a, why, "access-control attributes did not round-trip", .{});
+    const restored_acls = try readAcls(a, fd, why);
+    defer restored_acls.deinit(a);
+    if (!restored_acls.eql(m.acls)) return refuse(a, why, "access-control attributes did not round-trip", .{});
 }
 
 /// Called before each named step; a test hook can stop the program there.
@@ -367,7 +381,9 @@ pub const WriteOptions = struct {
 /// including the absence of one; `metadata_from` names another file whose
 /// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
 /// precede those operations, and in a replaceable build can fail them
-/// (Faults.fails); the destination is never unlinked first.
+/// (Faults.fails); the destination is never unlinked first. Everything it
+/// allocates from `a` is freed before it returns, except the message of a
+/// refusal (see `Why`).
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
@@ -377,13 +393,11 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     } else |_| {}
     const metadata_path: ?[]const u8 = opts.metadata_from orelse (if (exists(path)) path else null);
     var metadata: ?Metadata = null;
-    defer if (metadata) |m| freeAcls(a, m.acls);
+    defer if (metadata) |m| m.deinit(a);
     if (metadata_path) |mp| {
         var inner: Why = .{};
-        metadata = readMetadata(a, mp, &inner) catch |err| {
-            defer freeMsg(a, inner.msg);
-            return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
-        };
+        defer inner.deinit(a);
+        metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
     }
     const mode: u32 = opts.mode orelse (if (metadata) |m| m.info.perm() else fileMode(path));
     const tmp = try a.print("{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
@@ -416,10 +430,8 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer sys.close(fd);
         try sys.writeAll(fd, data);
         var inner: Why = .{};
-        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| {
-            defer freeMsg(a, inner.msg);
-            return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
-        };
+        defer inner.deinit(a);
+        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
         {
             const step = try a.print("{s}.fsync", .{opts.step});
             defer a.free(step);
@@ -429,11 +441,9 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     }
     if (metadata) |m| {
         var inner: Why = .{};
-        const current = readMetadata(a, metadata_path.?, &inner) catch |err| {
-            defer freeMsg(a, inner.msg);
-            return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
-        };
-        defer freeAcls(a, current.acls);
+        defer inner.deinit(a);
+        const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
+        defer current.deinit(a);
         if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
     }
     {
@@ -448,6 +458,20 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
 fn discard(tmp: []const u8, created: fsx.Stat) void {
     const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
     if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
+}
+
+test "Why.deinit frees a refusal's message only when it was allocated" {
+    const gpa = std.testing.allocator;
+    var why: Why = .{};
+    why.deinit(gpa);
+    try std.testing.expectEqual(error.Refused, refuse(gpa, &why, "cannot {s}", .{"write"}));
+    try std.testing.expectEqualStrings("cannot write", why.msg);
+    why.deinit(gpa);
+    try std.testing.expectEqualStrings("", why.msg);
+    try std.testing.expectEqual(error.Refused, refuse(std.testing.failing_allocator, &why, "cannot {s}", .{"write"}));
+    try std.testing.expectEqualStrings("refused", why.msg);
+    why.deinit(gpa);
+    try std.testing.expectEqualStrings("", why.msg);
 }
 
 test "atomicWrite keeps the mode and refuses a symlink" {
@@ -553,7 +577,7 @@ test "an interrupted ACL read is retried" {
     ops.fgetxattr = S.get;
     var why: Why = .{};
     const acls = try readAcls(gpa, fd, &why);
-    defer freeAcls(gpa, acls);
+    defer acls.deinit(gpa);
 }
 
 test "the umask is read without changing it" {
