@@ -1,10 +1,15 @@
-//! The JSON the guard reads and writes, with the two string encodings the
-//! Python guard used:
-//! - cache: json.dumps(ensure_ascii=True) of text decoded with
-//!   surrogateescape, so a byte that is not UTF-8 is a lone \udcXX;
-//! - wire: the restore helper's request and reply, one character per byte
+//! JSON as the Python tools these programs replace read and wrote it.
+//! `parse` reads one document into `Value`s, keeping strings and numbers
+//! as their JSON text until a codec or `toPy` decodes them. The two string
+//! codecs are the encodings those tools used:
+//! - cache (`decodeCache`, `writeCacheString`): json.dumps(ensure_ascii=True)
+//!   of text decoded with surrogateescape, so a byte that is not UTF-8 is a
+//!   lone \udcXX;
+//! - wire (`decodeWire`, `writeWireString`): one character per byte
 //!   (latin-1), so every byte is \u00XX or itself.
-//! Strings are kept as their raw JSON text until a codec decodes them.
+//! `toPy` turns a document into `Py` values, strings as cache text, and
+//! `dumps` writes `Py` values as json.dumps(indent=N, sort_keys=...) does,
+//! byte for byte, float repr included.
 const std = @import("std");
 const text = @import("pytext.zig");
 
@@ -79,7 +84,9 @@ fn hex4(raw: []const u8, i: usize) error{Encoding}!u16 {
 
 pub const ParseError = Allocator.Error || error{Syntax};
 
-const max_depth = 32;
+/// Arrays and objects nest at most this deep. The parser recurses once per
+/// level, so the bound keeps its stack use fixed.
+pub const max_depth = 32;
 
 const Parser = struct {
     s: []const u8,
@@ -98,8 +105,8 @@ const Parser = struct {
         return false;
     }
 
+    /// A value inside `depth` arrays and objects.
     fn value(p: *Parser, depth: usize) ParseError!Value {
-        if (depth > max_depth) return error.Syntax;
         p.ws();
         if (p.i >= p.s.len) return error.Syntax;
         switch (p.s[p.i]) {
@@ -108,6 +115,7 @@ const Parser = struct {
             'f' => return if (p.lit("false")) .{ .bool = false } else error.Syntax,
             '"' => return .{ .string = try p.string() },
             '[' => {
+                if (depth >= max_depth) return error.Syntax;
                 p.i += 1;
                 var items: std.ArrayList(Value) = .empty;
                 p.ws();
@@ -131,6 +139,7 @@ const Parser = struct {
                 }
             },
             '{' => {
+                if (depth >= max_depth) return error.Syntax;
                 p.i += 1;
                 var members: std.ArrayList(Member) = .empty;
                 p.ws();
@@ -218,7 +227,9 @@ const Parser = struct {
     }
 };
 
-/// Parse one JSON document; all memory comes from `arena`.
+/// Parse one JSON document; all memory comes from `arena`. Arrays and
+/// objects nested more than `max_depth` (32) deep are `error.Syntax`,
+/// though json.loads reads them.
 pub fn parse(arena: Allocator, s: []const u8) ParseError!Value {
     var p: Parser = .{ .s = s, .arena = arena };
     const v = try p.value(0);
