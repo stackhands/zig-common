@@ -132,6 +132,12 @@ test "a file that is not private is not read" {
 /// the gate is held, because closing any descriptor for it drops this
 /// process's record locks; it is released before the gate. Neither file is
 /// ever unlinked.
+///
+/// Others may be able to write the state root. The root is opened without
+/// following a symbolic link as its last component, both files through its
+/// descriptor without following one at their names, and each is trusted
+/// only as a regular file with one link: a FIFO planted at a name is never
+/// opened, and the file behind a planted hard link is never truncated.
 pub const RootLock = struct {
     gate: fsx.fd_t,
     posix: fsx.fd_t,
@@ -140,7 +146,17 @@ pub const RootLock = struct {
     /// parent's lock.
     owner: linux.pid_t,
 
-    pub const AcquireError = Error || error{ Busy, NotPrivate, OutOfMemory };
+    pub const AcquireError = Error || error{
+        Busy,
+        /// STATE_ROOT/.lock.posix is not a regular file with one link.
+        NotPrivate,
+        /// STATE_ROOT/.lock is not a regular file with one link.
+        GateNotPrivate,
+        OutOfMemory,
+    };
+
+    const gate_name = ".lock";
+    const sidecar_name = ".lock.posix";
 
     fn takeFlock(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
         const d = deadline_ms orelse {
@@ -187,28 +203,76 @@ pub const RootLock = struct {
 
     /// Lock STATE_ROOT/.lock and STATE_ROOT/.lock.posix, waiting up to
     /// `timeout_ms` (null: no limit). The gate then records this pid.
+    ///
+    /// STATE_ROOT is created when absent and opened O_DIRECTORY|O_NOFOLLOW;
+    /// a symbolic link there is NotDir. Each lock file is opened relative to
+    /// that descriptor with O_NOFOLLOW, created mode 0600, only when its name
+    /// is absent or a regular file with one link, and its descriptor must be
+    /// that file. The gate is checked again once both locks are held, right
+    /// before it is truncated. Allocates nothing; `gpa` stays for source
+    /// compatibility.
     pub fn acquire(gpa: Allocator, state_root: []const u8, timeout_ms: ?u32) AcquireError!RootLock {
+        _ = gpa;
         const atomic = @import("atomic.zig");
-        try atomic.makedirs(state_root);
+        const root = withoutTrailingSlashes(state_root);
+        try atomic.makedirs(root);
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
-        const gate_path = try std.fs.path.join(gpa, &.{ state_root, ".lock" });
-        defer gpa.free(gate_path);
-        const posix_path = try gpa.print("{s}.posix", .{gate_path});
-        defer gpa.free(posix_path);
-        const gate = try sys.openat(fsx.cwd, gate_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, 0o644);
+        const dir = try fsx.openDir(fsx.cwd, root, false);
+        defer sys.close(dir);
+        const gate = (try openLockFile(dir, gate_name, realOpenLock)) orelse return error.GateNotPrivate;
         errdefer sys.close(gate);
         try takeFlock(gate, deadline);
-        var zb: [sys.path_max:0]u8 = undefined;
-        const posix: fsx.fd_t = @intCast(try lockCall(lock_ops.open_sidecar, .{(try sys.z(&zb, posix_path)).ptr}));
+        const posix = (try openLockFile(dir, sidecar_name, lock_ops.open_sidecar)) orelse return error.NotPrivate;
         errdefer sys.close(posix);
-        const st = try fsx.fstat(posix);
-        if (!st.isReg() or st.nlink != 1) return error.NotPrivate;
         try takeRecord(posix, deadline);
+        if (!try isSoleLink(dir, gate_name, gate)) return error.GateNotPrivate;
         _ = try lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) });
         var buf: [24]u8 = undefined;
         const line = std.mem.print(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
         if ((try lockCall(lock_ops.write, .{ gate, line })) != line.len) return error.NoSpace;
         return .{ .gate = gate, .posix = posix, .owner = linux.getpid() };
+    }
+
+    /// `dir/name` opened read-write through `open`; null unless the name is
+    /// absent or a regular file with one link before the open, so a FIFO,
+    /// device or symbolic link there is never opened, and the descriptor is
+    /// that file after it.
+    fn openLockFile(dir: fsx.fd_t, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
+        if (fsx.statAt(dir, name, false)) |st| {
+            if (!st.isReg() or st.nlink != 1) return null;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => |e| return e,
+        }
+        const fd: fsx.fd_t = @intCast(lockCall(open, .{ dir, name.ptr }) catch |err| switch (err) {
+            error.SymLink, error.IsDir => return null,
+            else => |e| return e,
+        });
+        errdefer sys.close(fd);
+        if (try isSoleLink(dir, name, fd)) return fd;
+        sys.close(fd);
+        return null;
+    }
+
+    /// Whether `fd` is a regular file whose one link is `dir/name`. The name
+    /// is looked up as well as the descriptor: a planted hard link unlinked
+    /// while the lock is awaited leaves the descriptor on the other name's
+    /// file, with one link.
+    fn isSoleLink(dir: fsx.fd_t, name: []const u8, fd: fsx.fd_t) Error!bool {
+        const st = try fsx.fstat(fd);
+        if (!st.isReg() or st.nlink != 1) return false;
+        const at = fsx.statAt(dir, name, false) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => |e| return e,
+        };
+        return at.dev == st.dev and at.ino == st.ino and at.nlink == 1;
+    }
+
+    /// A trailing slash makes the kernel follow a final symbolic link even
+    /// under O_NOFOLLOW. "/" stays "/".
+    fn withoutTrailingSlashes(path: []const u8) []const u8 {
+        const trimmed = std.mem.trimEnd(u8, path, "/");
+        return if (trimmed.len == 0 and path.len != 0) "/" else trimmed;
     }
 
     /// Unlock the record lock, close its descriptor, then unlock and close
@@ -234,7 +298,7 @@ pub const LockOps = struct {
     fcntl: *const fn (fd: fsx.fd_t, cmd: i32, arg: usize) usize = realFcntl,
     ftruncate: *const fn (fd: fsx.fd_t, len: i64) usize = realFtruncate,
     write: *const fn (fd: fsx.fd_t, bytes: []const u8) usize = realWrite,
-    open_sidecar: *const fn (path: [*:0]const u8) usize = realOpenSidecar,
+    open_sidecar: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize = realOpenLock,
 };
 
 var test_lock_ops: LockOps = .{};
@@ -253,8 +317,8 @@ fn realFtruncate(fd: fsx.fd_t, len: i64) usize {
 fn realWrite(fd: fsx.fd_t, bytes: []const u8) usize {
     return linux.write(fd, bytes.ptr, bytes.len);
 }
-fn realOpenSidecar(path: [*:0]const u8) usize {
-    return linux.openat(fsx.cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
+fn realOpenLock(dir: fsx.fd_t, name: [*:0]const u8) usize {
+    return linux.openat(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
 }
 
 /// One of `lock_ops`, retrying on EINTR.
