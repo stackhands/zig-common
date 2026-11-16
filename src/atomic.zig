@@ -16,10 +16,11 @@ pub const acl_attributes = fsx.acl_attributes;
 const posix_access = "system.posix_acl_access";
 
 /// The calls atomicWrite makes on a file descriptor, as raw system-call
-/// results. Programs leave them alone; tests replace them, under
-/// builtin.is_test only, to emulate a filesystem's ACL model or a failing
-/// call. `created` runs on the temporary file right after its O_EXCL
-/// creation, where a filesystem applies an inherited ACL.
+/// results. Programs leave them alone; tests replace them to emulate a
+/// filesystem's ACL model or a failing call, in a `replaceable` build only
+/// (this library's tests, a tool's -Dtest-ops artifact). `created` runs on
+/// the temporary file right after its O_EXCL creation, where a filesystem
+/// applies an inherited ACL.
 pub const Ops = struct {
     flistxattr: *const fn (fd: sys.fd_t, buf: []u8) usize = realList,
     fgetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize = realGet,
