@@ -1,0 +1,15 @@
+#+TITLE: Tutorials
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Tutorials
+
+A tutorial is a lesson: follow it from the top on a machine like the one it names and it ends with something working.
+It explains only what the next step needs; [[file:../explanation/index.org][Explanation]] has the reasons.
+
+#+begin_export rst
+.. toctree::
+   :maxdepth: 1
+
+   first-tool
+#+end_export

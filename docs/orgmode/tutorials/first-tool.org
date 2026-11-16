@@ -1,0 +1,109 @@
+#+TITLE: Write a small tool on zig-common
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Write a small tool on zig-common
+
+By the end of this tutorial you will have =kernel=, a program that finds =uname= in =PATH=, runs it with a deadline and an empty environment, and prints what it said.
+It takes five commands on any Linux machine with Zig 0.17.1.
+
+** What you will need
+
+- Linux, x86_64 or aarch64.
+  zig-common uses Linux system calls directly and builds nowhere else.
+- Zig 0.17.1:
+
+  #+begin_src bash
+  zig version
+  #+end_src
+
+  #+begin_example
+  0.17.1
+  #+end_example
+
+- Network access to github.com, to download zig-common.
+
+** Create the project
+
+Make a directory and let Zig write a project skeleton into it:
+
+#+begin_src bash
+mkdir kernel && cd kernel
+zig init
+#+end_src
+
+#+begin_example
+info: created build.zig
+info: created build.zig.zon
+info: created src/main.zig
+info: created src/root.zig
+info: see `zig build --help` for a menu of options
+#+end_example
+
+** Add zig-common as a dependency
+
+=zig fetch= downloads a tagged release, checks it, and records it with its hash in =build.zig.zon=:
+
+#+begin_src bash
+zig fetch --save git+https://github.com/stackhands/zig-common#v0.9.0
+#+end_src
+
+#+begin_example
+info: resolved ref "v0.9.0" to commit 82b1fbd43f2497a8e5e434e7e60a7487d1c5122c
+#+end_example
+
+=build.zig.zon= now names it under =.dependencies=:
+
+#+begin_src zig
+.zig_common = .{
+    .url = "git+https://github.com/stackhands/zig-common?ref=v0.9.0#82b1fbd43f2497a8e5e434e7e60a7487d1c5122c",
+    .hash = "zig_common-0.9.0-kBaPeTD7AwAbkwHxmKWBkkYReiqxirdKRJq9VSO4dPvU",
+},
+#+end_src
+
+** Make the module importable
+
+Open =build.zig=.
+Add the first line below directly above =const exe = b.addExecutable(.{=, and the second to the =.imports= list inside it:
+
+#+begin_src zig
+const common = b.dependency("zig_common", .{ .target = target, .optimize = optimize });
+#+end_src
+
+#+begin_src zig
+.{ .name = "zig_common", .module = common.module("zig_common") },
+#+end_src
+
+** Write the program
+
+Replace =src/main.zig= with:
+
+#+INCLUDE: "first-tool/main.zig" src zig
+
+** Run it
+
+#+begin_src bash
+zig build run
+#+end_src
+
+#+begin_example
+kernel 6.12.113+
+#+end_example
+
+The number is your machine's kernel release.
+
+** What just happened
+
+1. [[zig:zig_common.proc.which]] looked =uname= up in the =PATH= you passed it, and returned an absolute path.
+   [[zig:zig_common.proc.run]] takes nothing else: a child is never looked up in a =PATH= its own environment sets.
+2. =run= started the child with an empty environment, an empty signal mask and no descriptors above 2, in a session of its own.
+3. It read the child's output while waiting, and would have killed the child's whole process group after =timeout_ms=.
+4. [[zig:zig_common.proc.Term.code]] turned the exit status into the number a shell would show, which became the program's own exit status.
+
+** Next steps
+
+- [[file:../howto/stop-a-slow-child.org][Stop a child program that runs too long]]
+- [[file:../explanation/descriptor-checks.org][Checks on the descriptor, not the path]]
+- [[file:../reference/api/zig/zig_common.proc.md][The proc module's API]]
+
+Checked with Zig 0.17.1 and zig-common 0.9.0 on 2026-11-16.

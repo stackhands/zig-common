@@ -1,0 +1,15 @@
+#+TITLE: Explanation
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Explanation
+
+These pages say why zig-common works the way it does: the model behind it, the choices made and the ones turned down.
+Nothing here is a step to follow.
+
+#+begin_export rst
+.. toctree::
+   :maxdepth: 1
+
+   descriptor-checks
+#+end_export

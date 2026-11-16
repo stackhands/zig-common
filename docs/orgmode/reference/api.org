@@ -1,0 +1,18 @@
+#+TITLE: API
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* API
+
+The API pages are generated from the code on every build, so they match the commit the site was built from.
+A declaration's doc comment is its description.
+
+- [[file:api/zig/index.md][Zig API]]: every =pub= declaration, one page per source file, read with the compiler's own parser by =docs/tools/zig_api.zig=, each linked to its source line at that commit.
+- [[autodoc:/][Zig autodoc]]: the same declarations in the browser =zig build docs= makes, with search and source views.
+
+#+begin_export rst
+.. toctree::
+   :hidden:
+
+   api/zig/index
+#+end_export

@@ -1,0 +1,16 @@
+#+TITLE: Reference
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Reference
+
+Descriptions of what there is: commands, options, files, environment variables, exit codes and the API.
+Each page states facts in the order the thing itself has them.
+
+#+begin_export rst
+.. toctree::
+   :maxdepth: 1
+
+   compatibility
+   api
+#+end_export

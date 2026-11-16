@@ -1,0 +1,23 @@
+/* Zig API pages: keep long signatures readable and the links to source
+   and autodoc out of the way. */
+dl.zig > dt.sig {
+  flex-wrap: wrap;
+  row-gap: 0.25rem;
+}
+
+dl.zig > dt.sig .zig-sig-rest {
+  white-space: pre-wrap;
+}
+
+dl.zig > dt.sig .zig-source-link,
+dl.zig > dt.sig .zig-autodoc-link {
+  margin-left: 0.75rem;
+  font-family: var(--sy-f-text, inherit);
+  font-size: 0.8em;
+  font-weight: normal;
+}
+
+dl.zig.field > dt.sig,
+dl.zig.error > dt.sig {
+  font-size: 0.95em;
+}
