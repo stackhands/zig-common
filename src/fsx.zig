@@ -489,3 +489,32 @@ test "appendLine does not leave a partial line when the write cannot finish" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings("hi\n", text);
 }
+
+test "copyTo copies the whole source and leaves its offset" {
+    const gpa = std.testing.allocator;
+    var tmp_path_buf: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&tmp_path_buf, "{s}/.zig-cache/zig-common-copy-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const f = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    try sys.writeAll(f, "header\nbody\n");
+    sys.close(f);
+    const src = try openRegular(d, "src", false);
+    defer sys.close(src.fd);
+    var head: [7]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 7), try sys.read(src.fd, &head));
+    sys.close(try copyTo(src.fd, src.stat, d, "dst"));
+    const dst = try openRegular(d, "dst", false);
+    defer sys.close(dst.fd);
+    const got = try readAll(gpa, dst.fd, 100);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("header\nbody\n", got);
+    try std.testing.expectEqual(@as(u64, 7), linux.lseek(src.fd, 0, linux.SEEK.CUR));
+}
