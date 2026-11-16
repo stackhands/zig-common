@@ -230,16 +230,27 @@ pub fn readAll(gpa: Allocator, fd: fd_t, limit: usize) (Error || Allocator.Error
 
 const acl_names = [_][:0]const u8{ "system.posix_acl_access", "system.nfs4_acl" };
 
+/// The xattr calls copyAcls makes, as raw system-call results; a test
+/// emulates a filesystem's ACL model with its own.
+const Xattrs = struct {
+    fn get(fd: fd_t, name: [:0]const u8, buf: []u8) usize {
+        return linux.fgetxattr(fd, name.ptr, buf.ptr, buf.len);
+    }
+    fn set(fd: fd_t, name: [:0]const u8, value: []const u8) usize {
+        return linux.fsetxattr(fd, name.ptr, value.ptr, value.len, 0);
+    }
+};
+
 /// Copy the access ACL xattrs of `from` onto `to`. An ACL that exists on
 /// `from` and cannot be set on `to` is an error.
-fn copyAcls(from: fd_t, to: fd_t) Error!void {
+fn copyAcls(comptime X: type, from: fd_t, to: fd_t) Error!void {
     var buf: [64 * 1024]u8 = undefined;
     for (acl_names) |name| {
-        const n = sys.call(linux.fgetxattr, .{ from, name.ptr, &buf, buf.len }) catch |err| switch (err) {
+        const n = sys.call(X.get, .{ from, name, &buf }) catch |err| switch (err) {
             error.NoData, error.Unsupported => continue,
             else => return err,
         };
-        _ = try sys.call(linux.fsetxattr, .{ to, name.ptr, &buf, n, 0 });
+        _ = try sys.call(X.set, .{ to, name, buf[0..n] });
     }
 }
 
@@ -272,7 +283,7 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
         };
     }
     try sys.fchmod(fd, @intCast(old.stat.perm()));
-    try copyAcls(old.fd, fd);
+    try copyAcls(Xattrs, old.fd, fd);
     try sys.fsync(fd);
     try sys.renameat(dir, tmp, dir, name);
     done = true;
@@ -520,4 +531,73 @@ test "copyTo copies the whole source and leaves its offset" {
     defer gpa.free(got);
     try std.testing.expectEqualStrings("header\nbody\n", got);
     try std.testing.expectEqual(@as(u64, 7), linux.lseek(src.fd, 0, linux.SEEK.CUR));
+}
+
+/// A filesystem's answer to each ACL form, GPFS native, generic NFSv4 and
+/// POSIX access: the bytes of a form it shows, or its errno. Any other name
+/// is unsupported. Records what copyAcls sets.
+const FakeAcls = struct {
+    const Answer = union(enum) { bytes: []const u8, errno: linux.E };
+    const forms = [_][]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
+    var answers: [3]Answer = undefined;
+    var sets: usize = 0;
+    var set_name: []const u8 = "";
+    var set_buf: [32]u8 = undefined;
+    var set_len: usize = 0;
+
+    fn reset(a: [3]Answer) void {
+        answers = a;
+        sets = 0;
+        set_name = "";
+        set_len = 0;
+    }
+    fn rc(e: linux.E) usize {
+        return @bitCast(-@as(isize, @backingInt(e)));
+    }
+    fn get(_: fd_t, name: [:0]const u8, buf: []u8) usize {
+        for (forms, answers) |form, answer| if (std.mem.eql(u8, form, name)) return switch (answer) {
+            .bytes => |b| blk: {
+                @memcpy(buf[0..b.len], b);
+                break :blk b.len;
+            },
+            .errno => |e| rc(e),
+        };
+        return rc(.OPNOTSUPP);
+    }
+    fn set(_: fd_t, name: [:0]const u8, value: []const u8) usize {
+        sets += 1;
+        set_name = name;
+        @memcpy(set_buf[0..value.len], value);
+        set_len = value.len;
+        return 0;
+    }
+};
+
+test "replaceContents copies the most native ACL form, GPFS's included" {
+    const F = FakeAcls;
+    const unsupported: F.Answer = .{ .errno = .OPNOTSUPP };
+    const cases = [_]struct { answers: [3]F.Answer, name: []const u8, bytes: []const u8 }{
+        // GPFS: its native NFSv4 ACL alone.
+        .{ .answers = .{ .{ .bytes = "gpfs" }, unsupported, unsupported }, .name = "system.gpfs_nfs4_acl", .bytes = "gpfs" },
+        // GPFS showing the same ACL through the generic and POSIX forms too.
+        .{ .answers = .{ .{ .bytes = "gpfs" }, .{ .bytes = "generic" }, .{ .bytes = "posix" } }, .name = "system.gpfs_nfs4_acl", .bytes = "gpfs" },
+        // An NFSv4 mount.
+        .{ .answers = .{ unsupported, .{ .bytes = "nfs4" }, unsupported }, .name = "system.nfs4_acl", .bytes = "nfs4" },
+        // A POSIX ACL on GPFS, which answers EINVAL for the NFSv4 forms.
+        .{ .answers = .{ .{ .errno = .INVAL }, .{ .errno = .INVAL }, .{ .bytes = "posix" } }, .name = "system.posix_acl_access", .bytes = "posix" },
+    };
+    for (cases) |c| {
+        F.reset(c.answers);
+        try copyAcls(F, 0, 1);
+        try std.testing.expectEqual(@as(usize, 1), F.sets);
+        try std.testing.expectEqualStrings(c.name, F.set_name);
+        try std.testing.expectEqualStrings(c.bytes, F.set_buf[0..F.set_len]);
+    }
+    // No ACL at all.
+    F.reset(.{ unsupported, unsupported, .{ .errno = .NODATA } });
+    try copyAcls(F, 0, 1);
+    try std.testing.expectEqual(@as(usize, 0), F.sets);
+    // A form that could not be read and no other: refused, not dropped.
+    F.reset(.{ .{ .errno = .INVAL }, unsupported, .{ .errno = .NODATA } });
+    try std.testing.expectError(error.InvalidArgument, copyAcls(F, 0, 1));
 }
