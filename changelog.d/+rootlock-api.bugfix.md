@@ -1,1 +1,0 @@
-A refused gate is the new `RootLock.AcquireError.GateNotPrivate` (`NotPrivate` stays the sidecar's), a symbolic link as the state root is `NotDir`, and `LockOps.open_sidecar` takes the state root's descriptor and a name.
