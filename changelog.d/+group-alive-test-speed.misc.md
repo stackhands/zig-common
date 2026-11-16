@@ -1,0 +1,1 @@
+The test that `proc.groupAlive` stays true while signals arrive sends one signal a millisecond, as the `state.lockExclusive` one does, instead of back to back, which made it take a minute or more on several CPUs and minutes under QEMU. It runs until ten of its checks have caught a signal, so it fails rather than passes when none lands.
