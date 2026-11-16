@@ -378,6 +378,16 @@ test "wire strings are one byte per code point" {
     try std.testing.expectError(error.Encoding, decodeWire(a, "\\u0100"));
 }
 
+test "a truncated or malformed escape is an encoding error" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "abc\\", "\\u12", "\\ud83d\\ude0", "\\u+123", "\\x0041" }) |raw| {
+        try std.testing.expectError(error.Encoding, decodeCache(gpa, raw));
+        try std.testing.expectError(error.Encoding, decodeWire(gpa, raw));
+    }
+    const obj: Value = .{ .object = &.{.{ .key = "a\\", .value = .null }} };
+    try std.testing.expect(obj.get("a") == null);
+}
+
 test "parse objects, duplicates and nesting" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
