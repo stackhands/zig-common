@@ -436,12 +436,24 @@ pub const Py = union(enum) {
     }
 };
 
-/// The parsed document as Python values, strings decoded as cache text.
+/// A number as json.loads reads it: an int when the text has no fraction or
+/// exponent, a float otherwise. An int that does not fit an i64, which
+/// Python keeps exact, cannot be represented and is an error, not a
+/// rounded float.
+fn pyNumber(n: []const u8) error{Encoding}!Py {
+    if (std.mem.findAny(u8, n, ".eE") != null) {
+        return .{ .float = std.fmt.parseFloat(f64, n) catch return error.Encoding };
+    }
+    return .{ .int = std.fmt.parseInt(i64, n, 10) catch return error.Encoding };
+}
+
+/// The parsed document as Python values, strings decoded as cache text; an
+/// integer past i64 is `error.Encoding`.
 pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
     return switch (v) {
         .null => .null,
         .bool => |b| .{ .bool = b },
-        .number => |n| if (std.fmt.parseInt(i64, n, 10)) |i| .{ .int = i } else |_| .{ .float = std.fmt.parseFloat(f64, n) catch return error.Encoding },
+        .number => |n| try pyNumber(n),
         .string => |raw| .{ .str = try decodeCache(arena, raw) },
         .array => |items| blk: {
             const out = try arena.alloc(Py, items.len);
@@ -620,4 +632,15 @@ test "dumps matches json.dumps(indent=2, sort_keys=True)" {
     );
     const parsed = try toPy(a, try parse(a, s));
     try std.testing.expectEqualStrings(s, try dumps(a, parsed, 2, true));
+}
+
+test "an integer past i64 is an error, not a rounded float" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectError(error.Encoding, toPy(a, try parse(a, "18446744073709551616")));
+    try std.testing.expectError(error.Encoding, toPy(a, try parse(a, "[-9223372036854775809]")));
+    try std.testing.expectEqual(Py{ .int = std.math.minInt(i64) }, try toPy(a, try parse(a, "-9223372036854775808")));
+    try std.testing.expectEqual(Py{ .float = 1e19 }, try toPy(a, try parse(a, "1e19")));
+    try std.testing.expectEqual(Py{ .float = 3.0 }, try toPy(a, try parse(a, "3.0")));
 }
