@@ -189,6 +189,9 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
     var dents: [16 * 1024]u8 align(8) = undefined;
     while (true) {
         const n = linux.getdents64(dir, &dents, dents.len);
+        // EINTR is not a failed scan. Treating it as "nobody is alive"
+        // would let waitGroupGone return while the group is still running.
+        if (linux.errno(n) == .INTR) continue;
         if (linux.errno(n) != .SUCCESS or n == 0) return false;
         var pos: usize = 0;
         while (pos < n) {
@@ -530,6 +533,32 @@ test "a set cancel flag kills the child" {
     const gpa = std.testing.allocator;
     var flag = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
+}
+
+fn onUsr1Proc(_: linux.SIG) callconv(.c) void {}
+
+test "groupAlive stays true for a live group while signals arrive" {
+    const handler: linux.Sigaction = .{ .handler = .{ .handler = &onUsr1Proc }, .mask = linux.sigemptyset(), .flags = 0 };
+    var prev: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &handler, &prev);
+    defer _ = linux.sigaction(.USR1, &prev, null);
+    const Stop = struct {
+        var go = std.atomic.Value(bool).init(true);
+        fn buzz() void {
+            var blocked = linux.sigemptyset();
+            linux.sigaddset(&blocked, .USR1);
+            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
+            while (go.load(.acquire)) _ = linux.kill(linux.getpid(), .USR1);
+        }
+    };
+    Stop.go.store(true, .release);
+    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
+    defer {
+        Stop.go.store(false, .release);
+        buzz.join();
+    }
+    const pgid: linux.pid_t = @intCast(linux.getpgid(0));
+    for (0..50) |_| try std.testing.expect(groupAlive(pgid));
 }
 
 test "run refuses a relative program" {
