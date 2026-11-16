@@ -1,0 +1,52 @@
+#+TITLE: zig-common
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* zig-common
+
+The pieces the stackhands Zig tools share: Linux system calls with named errors, file handling checked on the open descriptor, running a child program, gzip in place and the =.licensed-logs= list, and command-line plumbing.
+It holds only what at least two tools need, or what one tool needs in a form the next port will reuse.
+It is Linux only and needs Zig 0.17.1.
+
+New here?
+[[file:tutorials/first-tool.org][Write a small tool on zig-common]] ends with =kernel=, a program that runs =uname= with a deadline and an empty environment and prints the kernel release.
+
+| You want to                                      | Read                                        |
+|--------------------------------------------------+---------------------------------------------|
+| learn by doing, start to finish                  | [[file:tutorials/index.org][Tutorials]]     |
+| get one task done                                | [[file:howto/index.org][How-to guides]]     |
+| understand why it works this way                 | [[file:explanation/index.org][Explanation]] |
+| look up a declaration, a convention or a version | [[file:reference/index.org][Reference]]     |
+
+#+begin_export rst
+.. toctree::
+   :hidden:
+   :caption: Tutorials
+
+   tutorials/index
+
+.. toctree::
+   :hidden:
+   :caption: How-to guides
+
+   howto/index
+
+.. toctree::
+   :hidden:
+   :caption: Explanation
+
+   explanation/index
+
+.. toctree::
+   :hidden:
+   :caption: Reference
+
+   reference/index
+
+.. toctree::
+   :hidden:
+   :caption: Project
+
+   contributing
+   changelog
+#+end_export

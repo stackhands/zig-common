@@ -4,3 +4,16 @@
 .zig-cache/
 zig-out/
 *.o
+
+# Documentation build (docs-plan template): generated, never committed.
+/docs/build/
+/docs/source/**/*.rst
+/docs/source/reference/api/
+/docs/source/**/*.png
+/docs/source/**/*.svg
+/docs/source/**/*.jpg
+/docs/source/**/*.webp
+!/docs/source/_static/**
+/docs/**/__pycache__/
+/.pixi/
+/.lycheecache

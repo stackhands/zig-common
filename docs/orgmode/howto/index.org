@@ -1,0 +1,20 @@
+#+TITLE: How-to guides
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* How-to guides
+
+Each guide gets one task done for a reader who already knows what they want.
+The title names the task.
+
+#+begin_export rst
+.. toctree::
+   :maxdepth: 1
+
+   stop-a-slow-child
+   replace-a-file-keeping-its-acls
+   keep-private-state-in-tmp
+   compress-and-mark-logs
+   match-python-output
+   upgrade-zig-common
+#+end_export

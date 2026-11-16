@@ -1,0 +1,10 @@
+#+TITLE: Changelog
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+
+# CHANGELOG.md at the top of the repository is the one changelog; this page
+# shows it.
+
+#+begin_export rst
+.. include:: ../../CHANGELOG.md
+   :parser: myst_parser.sphinx_
+#+end_export

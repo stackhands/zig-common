@@ -1,0 +1,97 @@
+#+TITLE: Replace a file and keep its access control lists
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Replace a file and keep its access control lists
+
+Use this when a tool rewrites a file whose owner, group, mode or access control lists (ACLs) decide who may read it, such as a module file under =/project/climate= that the project's members read through an ACL.
+[[zig:zig_common.atomic.atomicWrite]] writes the new bytes to a temporary file beside the old one, gives it the old file's owner, group, mode and ACLs, reads them back, and only then renames it over the old file.
+A reader sees the old file or the new one, never a part of either, and never the new bytes with other permissions.
+[[file:../explanation/descriptor-checks.org][Checks on the descriptor, not the path]] says why each check is made on an open file.
+
+** Before you start
+
+- The tool depends on zig-common; [[file:../tutorials/first-tool.org][the tutorial]] sets that up.
+- The tool may create files in the directory that holds the file: the temporary file, =.NAME.new=, is made there.
+- The tool runs as the file's owner, or as root to replace another user's file: only root may give the new file that owner.
+
+** Steps
+
+1. Choose the call by what must survive the replacement:
+
+   | Call                                   | Keeps                                                                  | For                                                     |
+   |----------------------------------------+------------------------------------------------------------------------+---------------------------------------------------------|
+   | [[zig:zig_common.atomic.atomicWrite]]  | owner, group, mode and every ACL form, read back before the rename     | a file whose access must not change, or not be replaced |
+   | [[zig:zig_common.fsx.replaceContents]] | mode, the most native ACL form, and the owner when the tool may set it | a file in a directory the tool holds open               |
+
+   The steps that follow use =atomicWrite=.
+
+2. Call it with a [[zig:zig_common.atomic.Why]], which receives the reason for a refusal, and free that with =deinit=:
+
+   #+begin_src zig
+   var why: common.atomic.Why = .{};
+   defer why.deinit(gpa);
+   common.atomic.atomicWrite(gpa, path, bytes, .{}, &why) catch |err| switch (err) {
+       error.Refused => {
+           common.cli.err("tool: {s}\n", .{why.msg});
+           return 1;
+       },
+       else => |e| {
+           common.cli.err("tool: {s}: {s}\n", .{ path, common.atomic.describe(e) });
+           return 1;
+       },
+   };
+   #+end_src
+
+   [[zig:zig_common.atomic.describe]] words any other error as Python's =OSError= does, such as =[Errno 28] No space left on device=.
+
+3. To give the new file the access of another file, such as a file prepared beside the live one it is to replace, name that file in [[zig:zig_common.atomic.WriteOptions]]:
+
+   #+begin_src zig
+   const opts: common.atomic.WriteOptions = .{
+       .metadata_from = "/project/climate/modules/Example/1.0-GCCcore-15.2.0.lua",
+   };
+   #+end_src
+
+   =.mode= sets the permission bits in place of the old file's.
+   A new file with neither gets mode 0644 less the umask.
+
+** Check that it worked
+
+Save the file's ACL with =getfacl=, from the =acl= package:
+
+#+begin_src bash
+getfacl -p /project/climate/modules/Example/1.0-GCCcore-15.2.0.lua > before.txt
+#+end_src
+
+Run the tool, then compare:
+
+#+begin_src bash
+getfacl -p /project/climate/modules/Example/1.0-GCCcore-15.2.0.lua | diff before.txt - && echo "ACL kept"
+#+end_src
+
+#+begin_example
+ACL kept
+#+end_example
+
+=ls -li= shows a new inode number and the same =-rw-r-----+=: the file was replaced, not written in place, and the =+= is its ACL.
+No =.1.0-GCCcore-15.2.0.lua.new= is left beside it.
+
+** If it fails
+
+The messages are the text of =why.msg=, after the tool's own =tool: =.
+
+| Message                                                                       | Cause                                                                                            | What to do                                                |
+|-------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------+-----------------------------------------------------------|
+| =refusing to replace a symlink: PATH=                                         | the path is a symbolic link                                                                      | give the tool the path of the file itself                 |
+| =cannot read access metadata for PATH: [Errno 13] Permission denied=          | the tool may not open the file                                                                   | run the tool as the file's owner, or as root              |
+| =cannot preserve access metadata for PATH: [Errno 1] Operation not permitted= | another user owns the file, and only root may give the new file that owner                       | run the tool as the file's owner, or as root              |
+| =temporary file must be an owned regular file with one link: DIR/.NAME.new=   | another user's file, a link or a directory has the temporary name; the tool removes only its own | look at it with =ls -l=, then have its owner remove it    |
+| =access metadata of PATH changed before PATH was replaced=                    | the owner, mode or an ACL changed while the tool wrote                                           | run the tool again; the file is as it was                 |
+| =unsupported access-control attribute NAME=                                   | the file has a =system.= attribute that is not one of the three ACL forms zig-common keeps       | replace the file with a program that keeps that attribute |
+
+** Related
+
+- [[zig:zig_common.atomic.WriteOptions]]: every option, with its default.
+- [[zig:zig_common.atomic.acl_attributes]]: the ACL forms kept, most native first.
+- [[man:acl(5)]] and [[man:rename(2)]], for the Portable Operating System Interface (POSIX) ACL and the replacement.

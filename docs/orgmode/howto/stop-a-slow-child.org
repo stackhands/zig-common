@@ -1,0 +1,60 @@
+#+TITLE: Stop a child program that runs too long
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Stop a child program that runs too long
+
+Use this when a tool runs a program that can hang, such as a module command on a stalled file system, and the tool must go on.
+The deadline applies to the child's whole process group, so a grandchild that inherited the pipes is stopped too.
+
+** Before you start
+
+- The tool depends on zig-common; [[file:../tutorials/first-tool.org][the tutorial]] sets that up.
+- The program is named by an absolute path.
+  Find it with [[zig:zig_common.proc.which]] first.
+
+** Steps
+
+1. Set the deadline and the grace period in [[zig:zig_common.proc.Options]]:
+
+   #+begin_src zig
+   const opts: common.proc.Options = .{
+       .timeout_ms = 30_000, // SIGTERM to the group after 30 s
+       .grace_ms = 2_000, // then SIGKILL, 2 s later
+   };
+   #+end_src
+
+   Keep =new_session= at its default, =true=: the deadline kills the group the child leads.
+
+2. Run the program and handle the timeout apart from other failures:
+
+   #+begin_src zig
+   const result = common.proc.run(gpa, exe, argv, envp, opts) catch |err| switch (err) {
+       error.TimedOut => {
+           common.cli.err("tool: {s} took longer than 30 s and was stopped\n", .{exe});
+           return 1;
+       },
+       else => |e| return e,
+   };
+   defer result.deinit(gpa);
+   #+end_src
+
+3. To stop the child early from a signal handler, give =run= a flag to watch in =cancel=, and set it in the handler.
+   =run= then kills the group and returns =error.Canceled=.
+   A handler that must kill the group itself calls [[zig:zig_common.proc.killGroup]] with the group =pgid_out= published; it makes only =kill= system calls, so a handler may call it.
+
+** Check that it worked
+
+Run the tool against a program that sleeps past the deadline, such as =/bin/sleep 60= with =timeout_ms = 1_000=.
+The call returns =error.TimedOut= after about one second, as =sleep= exits on SIGTERM; a child that ignores SIGTERM is killed =grace_ms= later.
+No =sleep= process is left:
+
+#+begin_src bash
+pgrep -x sleep || echo "none left"
+#+end_src
+
+** Related
+
+- [[zig:zig_common.proc.Options]]: every option, with its default.
+- [[zig:zig_common.proc.Error]]: the errors =run= returns.
+- [[man:setsid(2)]] and [[man:kill(2)]], for how a process group is made and signalled.

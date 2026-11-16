@@ -10,9 +10,11 @@ fn isAlnumU(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// One character of a byte string, as `nextChar` reads it.
 pub const Char = struct {
     /// The code point, or null for a byte that is not part of valid UTF-8.
     cp: ?u21,
+    /// Its length in bytes: 1 to 4, and 1 when `cp` is null.
     len: u3,
 };
 

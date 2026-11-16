@@ -1,0 +1,9 @@
+#+TITLE: Compatibility
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+
+# COMPAT.md at the top of the repository is the one record; this page shows it.
+
+#+begin_export rst
+.. include:: ../../../COMPAT.md
+   :parser: myst_parser.sphinx_
+#+end_export

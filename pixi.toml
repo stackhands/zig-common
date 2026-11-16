@@ -1,0 +1,42 @@
+# The documentation toolchain, pinned by pixi.lock. `pixi run -e docs docbld`
+# builds docs/build/html the way CI does; docs/orgmode/contributing.org has
+# the steps. In a repository that already has a pixi.toml, copy the
+# [feature.docs.*] tables and the docs environment into it.
+[workspace]
+name = "zig-common"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[feature.docs.dependencies]
+python = "3.13.*"
+emacs = "30.*"
+curl = "*"
+lychee = "*"
+zig = "0.17.1.*"
+sphinx = "9.*"
+myst-parser = "*"
+shibuya = "*"
+sphinx-copybutton = "*"
+sphinx-design = "*"
+sphinx-sitemap = "*"
+sphinx-autoapi = "*"
+
+[feature.docs.tasks]
+# Org pages to reStructuredText, docs/orgmode -> docs/source.
+mkrst = { cmd = "emacs -Q --batch --load export.el", cwd = "docs" }
+# API pages from the code, into docs/source/reference/api/.
+mkapi = { cmd = "zig run docs/tools/zig_api.zig -- --module zig_common --root src/root.zig --out docs/source/reference/api/zig --source-url 'https://github.com/stackhands/zig-common/blob/{ref}/' --title 'Zig API'" }
+sphinxbld = { cmd = "sphinx-build -W -n --keep-going -d docs/build/doctrees -b html docs/source docs/build/html", depends-on = ["mkrst", "mkapi"] }
+# The Zig autodoc site, served beside the Sphinx pages at api/.
+autodoc = { cmd = "zig build docs --prefix docs/build/autodoc && rm -rf docs/build/html/api && cp -r docs/build/autodoc/docs docs/build/html/api", depends-on = ["sphinxbld"] }
+# Every internal link and anchor resolves, and no page names a site. The
+# changelog may name what a release removed; its links are still checked.
+doccheck = { cmd = "python docs/tools/check_site.py docs/build/html --sources docs/orgmode --exempt changelog.html", depends-on = ["autodoc"] }
+docbld = { depends-on = ["doccheck"] }
+# External links; needs the network, so CI runs it as its own step.
+linkcheck = { cmd = "lychee --config lychee.toml --no-progress 'docs/build/html/**/*.html'" }
+# Generated files are the ignored ones under docs/source (see .gitignore).
+docdel = { cmd = "rm -rf docs/build && git clean -fdX docs/source" }
+
+[environments]
+docs = { features = ["docs"], no-default-feature = true }

@@ -11,10 +11,15 @@ const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
+/// The child's environment block, as execve(2) takes it; `env.Builder.envp`
+/// makes one.
 pub const Envp = [*:null]const ?[*:0]const u8;
 
+/// How the child ended.
 pub const Term = union(enum) {
+    /// Its exit status, 0 to 255.
     exited: u8,
+    /// The number of the signal that killed it.
     signaled: u32,
 
     /// The shell's view of the status: the exit code, or 128 + signal.
@@ -26,6 +31,9 @@ pub const Term = union(enum) {
     }
 };
 
+/// How `run` starts the child and waits for it. By default stdout may be
+/// up to 1 MiB, stderr goes to /dev/null, and the child's process group is
+/// killed 300 000 ms after the start.
 pub const Options = struct {
     /// Bytes written to the child's stdin, which is then closed; null means
     /// stdin is /dev/null.
@@ -71,17 +79,39 @@ pub const Options = struct {
     exec_error: bool = false,
 };
 
+/// What `run` returns once the child has ended: how, and what it wrote.
+/// The two outputs are allocated from the allocator given to `run`;
+/// `deinit` frees them.
 pub const Result = struct {
     term: Term,
+    /// What the child wrote to stdout, at most `Options.stdout_limit`
+    /// bytes.
     stdout: []u8,
+    /// What the child wrote to stderr, at most `Options.stderr_limit`
+    /// bytes; empty when that is 0.
     stderr: []u8,
 
+    /// Free `stdout` and `stderr`, with the allocator `run` was given.
     pub fn deinit(r: Result, gpa: Allocator) void {
         gpa.free(r.stdout);
         gpa.free(r.stderr);
     }
 };
 
+/// The errors of `run`. Each of the first three kills the child's process
+/// group, or with `new_session` false the child, before it is returned:
+///
+/// - `error.TimedOut`: the child was still running at `Options.timeout_ms`
+/// - `error.Canceled`: `Options.cancel` was set
+/// - `error.StreamTooLong`: stdout passed `Options.stdout_limit`, with
+///   `stdout_overflow` at `.fail`
+/// - `error.NotAbsolute`: `exe` does not start with `/`
+/// - `error.InvalidArgument`: `exe` or an argument has a NUL byte
+/// - `error.NoChild`: the caller ignores SIGCHLD, so the status is lost
+///
+/// With `Options.exec_error`, a failed exec is its errno's `sys.Error`,
+/// such as `error.NotFound` for ENOENT. Otherwise it is a child that
+/// exits 127.
 pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut, Canceled, NotAbsolute };
 
 /// Search `path_env` (colon-separated, an empty entry meaning the current
