@@ -48,7 +48,9 @@ pub const Options = struct {
     /// when true, the child's group is killed and `error.Canceled` returned.
     cancel: ?*const std.atomic.Value(bool) = null,
     /// Set to the child's process group id while it runs, 0 otherwise, so a
-    /// signal handler can kill it. Only with `new_session`.
+    /// signal handler can kill it with `stopGroup`. It is set before the
+    /// child has made the group, which a kill of the group alone then
+    /// misses. Only with `new_session`.
     pgid_out: ?*std.atomic.Value(i32) = null,
     /// `truncate`: stdout past `stdout_limit` is read and dropped, and the
     /// call goes on; `fail`: it is an error and the child is killed.
@@ -221,7 +223,8 @@ pub fn groupAlive(pgid: linux.pid_t) bool {
     }
 }
 
-/// SIGKILL the group `pgid` and wait (up to 10 s) until no member of it is
+/// SIGKILL the group `pgid`, or process `pgid` itself while it has not made
+/// that group yet, and wait (up to 10 s) until no member of the group is
 /// alive. Only system calls and stack buffers, so a signal handler may call
 /// it, with the pgid that `Options.pgid_out` published.
 pub fn stopGroup(pgid: linux.pid_t) void {
@@ -241,8 +244,14 @@ fn waitGroupGone(pgid: linux.pid_t) void {
     }
 }
 
+/// Signal the child `pid`, or with `group` its process group. The child
+/// makes that group with setsid after the fork, so until then there is no
+/// such group: the child itself is signalled, as it has started nothing
+/// before it execs, and then the group again in case it was made meanwhile.
 fn kill(pid: linux.pid_t, group: bool, sig: linux.SIG) void {
-    _ = linux.kill(if (group) -pid else pid, sig);
+    if (group and linux.errno(linux.kill(-pid, sig)) != .SRCH) return;
+    _ = linux.kill(pid, sig);
+    if (group) _ = linux.kill(-pid, sig);
 }
 
 const Pipe = struct { r: sys.fd_t, w: sys.fd_t };
