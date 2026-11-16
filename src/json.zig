@@ -44,8 +44,7 @@ fn keyEql(raw: []const u8, want: []const u8) bool {
             if (i + 1 >= raw.len) return false;
             const e = raw[i + 1];
             if (e == 'u') {
-                if (i + 6 > raw.len) return false;
-                c = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return false;
+                c = hex4(raw, i + 2) catch return false;
                 i += 6;
             } else {
                 c = switch (e) {
@@ -69,6 +68,13 @@ fn isHex(s: []const u8) bool {
     if (s.len != 4) return false;
     for (s) |c| if (!std.ascii.isHex(c)) return false;
     return true;
+}
+
+/// The four hex digits of a \u escape at `raw[i..]`; parseInt alone would
+/// also take a sign.
+fn hex4(raw: []const u8, i: usize) error{Encoding}!u16 {
+    if (i + 4 > raw.len or !isHex(raw[i .. i + 4])) return error.Encoding;
+    return std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch unreachable;
 }
 
 pub const ParseError = Allocator.Error || error{Syntax};
@@ -224,7 +230,8 @@ pub fn parse(arena: Allocator, s: []const u8) ParseError!Value {
 pub const DecodeError = Allocator.Error || error{Encoding};
 
 /// Code points of a raw JSON string, surrogate pairs joined; a lone
-/// surrogate is returned as itself.
+/// surrogate is returned as itself. An escape json.loads refuses (cut off,
+/// unknown, or \u without four hex digits) is an error.
 fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
     var out: std.ArrayList(u21) = .empty;
     errdefer out.deinit(arena);
@@ -257,11 +264,10 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
             try out.append(arena, s);
             continue;
         }
-        if (i + 4 > raw.len) return error.Encoding;
-        var cp: u21 = std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch return error.Encoding;
+        var cp: u21 = try hex4(raw, i);
         i += 4;
         if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= raw.len and raw[i] == '\\' and raw[i + 1] == 'u') {
-            const lo = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return error.Encoding;
+            const lo = try hex4(raw, i + 2);
             if (lo >= 0xDC00 and lo <= 0xDFFF) {
                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                 i += 6;
@@ -269,7 +275,7 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
         }
         try out.append(arena, cp);
     }
-    return out.items;
+    return out.toOwnedSlice(arena);
 }
 
 /// Cache text: code points as UTF-8, a lone surrogate U+DC80..U+DCFF as the
@@ -277,6 +283,7 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
 /// environment and is an error.
 pub fn decodeCache(arena: Allocator, raw: []const u8) DecodeError![]u8 {
     const cps = try codePoints(arena, raw);
+    defer arena.free(cps);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
     for (cps) |cp| {
@@ -290,13 +297,15 @@ pub fn decodeCache(arena: Allocator, raw: []const u8) DecodeError![]u8 {
             try out.appendSlice(arena, b[0..n]);
         }
     }
-    return out.items;
+    return out.toOwnedSlice(arena);
 }
 
 /// Wire text: every code point must be at most U+00FF and is one byte.
 pub fn decodeWire(arena: Allocator, raw: []const u8) DecodeError![]u8 {
     const cps = try codePoints(arena, raw);
+    defer arena.free(cps);
     const out = try arena.alloc(u8, cps.len);
+    errdefer arena.free(out);
     for (cps, 0..) |cp, i| {
         if (cp > 0xFF) return error.Encoding;
         out[i] = @intCast(cp);
