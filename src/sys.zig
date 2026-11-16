@@ -363,4 +363,18 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     // An error that the last errno does not map to gets its usual errno.
     try std.testing.expectEqualStrings("[Errno 2] No such file or directory", describe(error.NotFound));
     try std.testing.expectEqual(@as(?Error, null), asError(error.OutOfMemory));
+    try std.testing.expectEqualStrings("[Errno 133] Memory page has hardware error", describeErrno(.HWPOISON));
+    try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
+    const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
+    defer close(compat_fd);
+    var compat: std.ArrayList(u8) = .empty;
+    defer compat.deinit(std.testing.allocator);
+    var chunk: [512]u8 = undefined;
+    while (true) {
+        const n = try read(compat_fd, &chunk);
+        if (n == 0) break;
+        try compat.appendSlice(std.testing.allocator, chunk[0..n]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
 }

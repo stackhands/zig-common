@@ -94,9 +94,17 @@ pub const Why = struct {
 
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
+const static_refused: []const u8 = "refused";
+
 fn refuse(a: Allocator, why: *Why, comptime f: []const u8, args: anytype) Error {
-    why.msg = a.print(f, args) catch "refused";
+    why.msg = a.print(f, args) catch static_refused;
     return error.Refused;
+}
+
+/// Free a message `refuse` stored, including its out-of-memory fallback.
+fn freeMsg(a: Allocator, msg: []const u8) void {
+    if (msg.len == 0 or msg.ptr == static_refused.ptr) return;
+    a.free(msg);
 }
 
 /// The value of each ACL attribute present, keyed by its name.
@@ -159,12 +167,27 @@ fn errnoText(e: linux.E) []const u8 {
     };
 }
 
+fn freeAcls(a: Allocator, acls: Acls) void {
+    for (acls.present) |p| if (p) |s| a.free(s);
+}
+
+/// One `fgetxattr`, retrying when a signal interrupts it. `op` cannot be
+/// used here: the errno itself decides whether a missing attribute is an
+/// error, and `op` collapses errnos into `sys.Error`.
+fn xattrGet(fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize {
+    while (true) {
+        const rc = ops.fgetxattr(fd, name, buf);
+        if (linux.errno(rc) != .INTR) return rc;
+    }
+}
+
 fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
     const listed = try listedAcls(a, fd, why);
     var acls: Acls = .{};
+    errdefer freeAcls(a, acls);
     var buf: [64 * 1024]u8 = undefined;
     for (acl_attributes, 0..) |name, i| {
-        const rc = ops.fgetxattr(fd, name, &buf);
+        const rc = xattrGet(fd, name, &buf);
         const e = linux.errno(rc);
         if (e == .SUCCESS) {
             acls.present[i] = try a.dupe(u8, buf[0..rc]);
@@ -189,7 +212,9 @@ fn readAllAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
 pub fn readAcls(a: Allocator, fd: sys.fd_t, why: *Why) Error!Acls {
     const before = try fsx.fstat(fd);
     const acls = try readAllAcls(a, fd, why);
+    errdefer freeAcls(a, acls);
     const again = try readAllAcls(a, fd, why);
+    defer freeAcls(a, again);
     if (!acls.eql(again) or !sameIdentity(try fsx.fstat(fd), before))
         return refuse(a, why, "access metadata changed during inspection", .{});
     return acls;
@@ -225,13 +250,16 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
         break;
     };
     if (primary) |i| {
-        if (!(try readAcls(a, fd, why)).eql(m.acls)) {
+        const now = try readAcls(a, fd, why);
+        defer freeAcls(a, now);
+        if (!now.eql(m.acls)) {
             const v = m.acls.present[i].?;
             _ = try op(ops.fsetxattr, .{ fd, acl_attributes[i], v });
         }
     }
     for (acl_attributes) |_| {
         const present = try readAcls(a, fd, why);
+        defer freeAcls(a, present);
         var extra: ?usize = null;
         for (present.present, m.acls.present, 0..) |p, want, i| if (p != null and want == null) {
             extra = i;
@@ -243,7 +271,9 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
     const restored = try fsx.fstat(fd);
     if (restored.uid != m.info.uid or restored.gid != m.info.gid or restored.perm() != mode)
         return refuse(a, why, "ownership or mode did not round-trip: expected {d}:{d} {o}, found {d}:{d} {o}", .{ m.info.uid, m.info.gid, mode, restored.uid, restored.gid, restored.perm() });
-    if (!(try readAcls(a, fd, why)).eql(m.acls)) return refuse(a, why, "access-control attributes did not round-trip", .{});
+    const round = try readAcls(a, fd, why);
+    defer freeAcls(a, round);
+    if (!round.eql(m.acls)) return refuse(a, why, "access-control attributes did not round-trip", .{});
 }
 
 /// Called before each named step; a test hook can stop the program there.
@@ -359,12 +389,17 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     } else |_| {}
     const metadata_path: ?[]const u8 = opts.metadata_from orelse (if (exists(path)) path else null);
     var metadata: ?Metadata = null;
+    defer if (metadata) |m| freeAcls(a, m.acls);
     if (metadata_path) |mp| {
         var inner: Why = .{};
-        metadata = readMetadata(a, mp, &inner) catch |err| return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
+        metadata = readMetadata(a, mp, &inner) catch |err| {
+            defer freeMsg(a, inner.msg);
+            return refuse(a, why, "cannot read access metadata for {s}: {s}", .{ mp, if (err == error.Refused) inner.msg else describe(err) });
+        };
     }
     const mode: u32 = opts.mode orelse (if (metadata) |m| m.info.perm() else fileMode(path));
     const tmp = try a.print("{s}/.{s}.new", .{ parent, std.fs.path.basename(path) });
+    defer a.free(tmp);
     if (fsx.statAt(fsx.cwd, tmp, false)) |stale| {
         // A privileged writer hands its temporary file to the metadata owner
         // before a crash can interrupt it.
@@ -377,6 +412,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
 
     {
         const step = try a.print("{s}.write", .{opts.step});
+        defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
     const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
@@ -392,20 +428,29 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer sys.close(fd);
         try sys.writeAll(fd, data);
         var inner: Why = .{};
-        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
+        restoreMetadata(a, fd, metadata, mode, &inner) catch |err| {
+            defer freeMsg(a, inner.msg);
+            return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
+        };
         {
             const step = try a.print("{s}.fsync", .{opts.step});
+            defer a.free(step);
             if (opts.faults.fails(step)) return injected(a, why, step);
         }
         _ = try op(ops.fsync, .{fd});
     }
     if (metadata) |m| {
         var inner: Why = .{};
-        const current = readMetadata(a, metadata_path.?, &inner) catch |err| return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
+        const current = readMetadata(a, metadata_path.?, &inner) catch |err| {
+            defer freeMsg(a, inner.msg);
+            return refuse(a, why, "cannot recheck access metadata for {s}: {s}", .{ metadata_path.?, if (err == error.Refused) inner.msg else describe(err) });
+        };
+        defer freeAcls(a, current.acls);
         if (!sameMetadata(current, m)) return refuse(a, why, "access metadata of {s} changed before {s} was replaced", .{ metadata_path.?, path });
     }
     {
         const step = try a.print("{s}.rename", .{opts.step});
+        defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
     try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
@@ -472,6 +517,55 @@ test "a step a test makes fail leaves the destination and no temporary file" {
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
         try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try a.print("{s}/.f.new", .{dir}), false));
     }
+}
+
+test "atomicWrite frees what it allocates" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/atomic-noleak-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(dir);
+    try makedirs(dir);
+    defer fsx.deleteTree(gpa, fsx.cwd, dir) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/j.json", .{dir});
+    defer gpa.free(path);
+    var why: Why = .{};
+    try atomicWrite(gpa, path, "one\n", .{}, &why);
+    try atomicWrite(gpa, path, "two\n", .{}, &why);
+    try std.testing.expectEqual(@as(usize, 0), why.msg.len);
+}
+
+test "an interrupted ACL read is retried" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/atomic-eintr-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(dir);
+    try makedirs(dir);
+    defer fsx.deleteTree(gpa, fsx.cwd, dir) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/f", .{dir});
+    defer gpa.free(path);
+    const created = try sys.openat(fsx.cwd, path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    sys.close(created);
+    const fd = try sys.openat(fsx.cwd, path, .{}, 0);
+    defer sys.close(fd);
+    const old = ops.*;
+    defer ops.* = old;
+    const S = struct {
+        var left: u8 = 0;
+        fn get(fd_: sys.fd_t, name: [:0]const u8, buf: []u8) usize {
+            if (left > 0) {
+                left -= 1;
+                return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+            }
+            return linux.fgetxattr(fd_, name.ptr, buf.ptr, buf.len);
+        }
+    };
+    S.left = 2;
+    ops.fgetxattr = S.get;
+    var why: Why = .{};
+    const acls = try readAcls(gpa, fd, &why);
+    defer freeAcls(gpa, acls);
 }
 
 test "the umask is read without changing it" {

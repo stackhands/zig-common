@@ -118,6 +118,7 @@ pub fn pyStrip(s: []const u8) []const u8 {
 /// str.split() with no separator: the runs between Unicode whitespace.
 pub fn pySplit(arena: Allocator, s: []const u8) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(arena);
     var i: usize = 0;
     var start: ?usize = null;
     while (i < s.len) {
@@ -130,7 +131,7 @@ pub fn pySplit(arena: Allocator, s: []const u8) Allocator.Error![]const []const 
         i += ch.len;
     }
     if (start) |st| try out.append(arena, s[st..]);
-    return out.items;
+    return try out.toOwnedSlice(arena);
 }
 
 /// shlex.quote: unchanged when every byte is in [A-Za-z0-9_@%+=:,./-] and
@@ -165,6 +166,16 @@ test "pyStrip and pySplit use Unicode whitespace" {
     const parts = try pySplit(arena_state.allocator(), "avx\u{a0}waitpkg  x\xff");
     try std.testing.expectEqual(@as(usize, 3), parts.len);
     try std.testing.expectEqualStrings("waitpkg", parts[1]);
+}
+
+fn splitOwned(a: std.mem.Allocator) !void {
+    const parts = try pySplit(a, "a b c");
+    defer a.free(parts);
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+}
+
+test "pySplit frees its list when an allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, splitOwned, .{});
 }
 
 test "shellQuote" {

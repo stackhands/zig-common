@@ -41,8 +41,10 @@ fn keyEql(raw: []const u8, want: []const u8) bool {
     while (i < raw.len) {
         var c: u21 = raw[i];
         if (c == '\\') {
+            if (i + 1 >= raw.len) return false;
             const e = raw[i + 1];
             if (e == 'u') {
+                if (i + 6 > raw.len) return false;
                 c = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return false;
                 i += 6;
             } else {
@@ -225,6 +227,7 @@ pub const DecodeError = Allocator.Error || error{Encoding};
 /// surrogate is returned as itself.
 fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
     var out: std.ArrayList(u21) = .empty;
+    errdefer out.deinit(arena);
     var i: usize = 0;
     while (i < raw.len) {
         const c = raw[i];
@@ -235,6 +238,7 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
             i += ch.len;
             continue;
         }
+        if (i + 1 >= raw.len) return error.Encoding;
         const e = raw[i + 1];
         i += 2;
         const simple: ?u21 = switch (e) {
@@ -246,12 +250,14 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
             'n' => '\n',
             'r' => '\r',
             't' => '\t',
-            else => null,
+            'u' => null,
+            else => return error.Encoding,
         };
         if (simple) |s| {
             try out.append(arena, s);
             continue;
         }
+        if (i + 4 > raw.len) return error.Encoding;
         var cp: u21 = std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch return error.Encoding;
         i += 4;
         if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= raw.len and raw[i] == '\\' and raw[i + 1] == 'u') {
@@ -272,6 +278,7 @@ fn codePoints(arena: Allocator, raw: []const u8) DecodeError![]u21 {
 pub fn decodeCache(arena: Allocator, raw: []const u8) DecodeError![]u8 {
     const cps = try codePoints(arena, raw);
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
     for (cps) |cp| {
         if (cp >= 0xDC80 and cp <= 0xDCFF) {
             try out.append(arena, @intCast(cp - 0xDC00));
@@ -350,6 +357,13 @@ test "cache strings round-trip bytes that are not UTF-8" {
     const v = try parse(a, out.items);
     try std.testing.expectEqualStrings("a\"\xff\u{e9}\u{1F600}\n\x7f", try decodeCache(a, v.string));
     try std.testing.expectError(error.Encoding, decodeCache(a, "\\ud800"));
+    // A truncated escape is an encoding error. It must not panic, and the
+    // bytes allocated before the error are freed when the caller did not
+    // pass an arena.
+    try std.testing.expectError(error.Encoding, decodeCache(std.testing.allocator, "a\\"));
+    try std.testing.expectError(error.Encoding, decodeCache(std.testing.allocator, "\\u12"));
+    const broken: Value = .{ .object = &.{.{ .key = "\\", .value = .null }} };
+    try std.testing.expect(broken.get("x") == null);
 }
 
 test "wire strings are one byte per code point" {

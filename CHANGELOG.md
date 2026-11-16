@@ -1,18 +1,6 @@
 # Changelog
 
-## Unreleased
-
-* `state.RootLock.acquire` no longer truncates the file behind a hard link
-  planted at `.lock`. It opens the state root `O_DIRECTORY|O_NOFOLLOW` and
-  both lock files relative to it with `O_NOFOLLOW`, creating them mode
-  0600; a lock file name that is not a regular file with one link is
-  refused before it is opened, so a FIFO or symbolic link there is never
-  followed; and once both locks are held, the gate must still be a regular
-  file whose one link is `.lock` before it is truncated.
-* A refused gate is the new `RootLock.AcquireError.GateNotPrivate`
-  (`NotPrivate` stays the sidecar's), a symbolic link as the state root is
-  `NotDir`, and `LockOps.open_sidecar` takes the state root's descriptor
-  and a name.
+<!-- towncrier release notes start -->
 
 ## 0.8.1
 

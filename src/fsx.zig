@@ -128,22 +128,55 @@ fn copyFd(src: fd_t, dst: fd_t) Error!void {
     }
 }
 
-/// Copy an open regular file to `dir/name`, as cp(1) without options does:
-/// an existing destination is truncated and keeps its mode, a new one gets
-/// the source's permission bits less the umask. A destination that is a
-/// symbolic link or not a regular file is refused. Returns the open
-/// destination, which the caller closes.
+/// Copy an open regular file to `dir/name`. The bytes are written to a
+/// temporary file in `dir`, synced, and renamed over `name`, so a short
+/// write (a full disk, a file-size limit) leaves an existing destination
+/// as it was and does not publish a partial file under `name`. An existing
+/// regular file keeps its owner, when this process may set it, and its
+/// mode; a new file gets the source's permission bits less the umask. A
+/// destination that is a symbolic link or not a regular file is refused.
+/// A destination with other hard links keeps those links on the previous
+/// inode; `name` is the new inode. Returns the open destination, which the
+/// caller closes.
 pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t {
-    const fd = try sys.openat(dir, name, .{
+    const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
+        error.NotFound => null,
+        else => |e| return e,
+    };
+    if (existing) |st| {
+        if (st.isLink()) return error.SymLink;
+        if (st.isDir()) return error.IsDir;
+        if (!st.isReg()) return error.InvalidArgument;
+    }
+    var rnd: [4]u8 = undefined;
+    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    var tmp_buf: [sys.path_max]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, ".{s}.{d}.{x:0>8}.tmp", .{ std.fs.path.basename(name), linux.getpid(), std.mem.readInt(u32, &rnd, .little) }) catch return error.NameTooLong;
+    const fd = try sys.openat(dir, tmp, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
+        .EXCL = true,
         .NOFOLLOW = true,
-        .NONBLOCK = true,
-    }, @intCast(src_stat.mode & 0o777));
-    errdefer sys.close(fd);
-    if (!(try fstat(fd)).isReg()) return error.InvalidArgument;
-    _ = try sys.call(linux.ftruncate, .{ fd, 0 });
+    }, if (existing != null) 0o600 else @intCast(src_stat.mode & 0o777));
+    var done = false;
+    errdefer {
+        sys.close(fd);
+        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+    }
     try copyFd(src, fd);
+    if (existing) |st| {
+        if ((try fstat(fd)).uid != st.uid or (try fstat(fd)).gid != st.gid) {
+            sys.fchown(fd, st.uid, st.gid) catch |err| switch (err) {
+                error.AccessDenied => {},
+                else => |e| return e,
+            };
+        }
+        try sys.fchmod(fd, @intCast(st.perm()));
+    }
+    try sys.fsync(fd);
+    try sys.renameat(dir, tmp, dir, name);
+    done = true;
+    try sys.fsync(dir);
     return fd;
 }
 
@@ -159,10 +192,22 @@ pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8)
         .NONBLOCK = true,
     }, 0o666);
     defer sys.close(fd);
-    if (!(try fstat(fd)).isReg()) return error.InvalidArgument;
+    const st = try fstat(fd);
+    if (!st.isReg()) return error.InvalidArgument;
     const bytes = try std.mem.concat(gpa, u8, &.{ line, "\n" });
     defer gpa.free(bytes);
-    try sys.writeAll(fd, bytes);
+    // One write is atomic on Linux only when it completes. A short write
+    // (ENOSPC part way through) is rolled back to the size before it, so
+    // the list does not gain a partial line. Safe while this process is
+    // the only writer; a concurrent append in that window can be shortened.
+    sys.writeAll(fd, bytes) catch |err| {
+        if (fstat(fd)) |now| {
+            if (now.size > st.size and now.size - st.size < bytes.len) {
+                _ = linux.ftruncate(fd, @intCast(st.size));
+            }
+        } else |_| {}
+        return err;
+    };
 }
 
 /// Read a whole regular file opened by the caller; more than `limit` bytes
@@ -354,4 +399,93 @@ test "replaceContents keeps the mode" {
     const got = try readAll(gpa, r.fd, 100);
     defer gpa.free(got);
     try std.testing.expectEqualStrings("b\n", got);
+}
+
+fn withFileLimit(bytes: u64, body: *const fn () anyerror!void) anyerror!void {
+    var old: linux.rlimit = undefined;
+    if (linux.errno(linux.prlimit(0, .FSIZE, null, &old)) != .SUCCESS) return error.Unexpected;
+    const lim: linux.rlimit = .{ .cur = @intCast(bytes), .max = old.max };
+    if (linux.errno(linux.prlimit(0, .FSIZE, &lim, null)) != .SUCCESS) return error.Unexpected;
+    const ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    var prev: linux.Sigaction = undefined;
+    _ = linux.sigaction(.XFSZ, &ign, &prev);
+    defer {
+        _ = linux.sigaction(.XFSZ, &prev, null);
+        _ = linux.prlimit(0, .FSIZE, &old, null);
+    }
+    try body();
+}
+
+test "copyTo leaves an existing file unchanged when the write cannot finish" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-copy-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const dst = try sys.openat(d, "dest", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o640);
+    try sys.writeAll(dst, "OLDDATA\n");
+    sys.close(dst);
+    const srcfd = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(srcfd, "NEWDATA-IS-LONGER-THAN-THE-LIMIT\n");
+    sys.close(srcfd);
+    const opened = try openRegular(d, "src", false);
+    defer sys.close(opened.fd);
+
+    const Hold = struct {
+        var dir: fd_t = -1;
+        var src: fd_t = -1;
+        var st: Stat = undefined;
+        fn go() Error!void {
+            if (copyTo(src, st, dir, "dest")) |fd| sys.close(fd) else |_| {}
+        }
+    };
+    Hold.dir = d;
+    Hold.src = opened.fd;
+    Hold.st = opened.stat;
+    try withFileLimit(8, Hold.go);
+
+    const got = try openRegular(d, "dest", false);
+    defer sys.close(got.fd);
+    const text = try readAll(gpa, got.fd, 100);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("OLDDATA\n", text);
+    try std.testing.expectEqual(@as(u32, 0o640), got.stat.perm());
+}
+
+test "appendLine does not leave a partial line when the write cannot finish" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-append-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const f = try sys.openat(d, "list", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(f, "hi\n");
+    sys.close(f);
+    const Hold = struct {
+        var dir: fd_t = -1;
+        fn go() Error!void {
+            appendLine(std.testing.allocator, dir, "list", "this line is far longer than the file size limit") catch {};
+        }
+    };
+    Hold.dir = d;
+    try withFileLimit(8, Hold.go);
+    const got = try openRegular(d, "list", false);
+    defer sys.close(got.fd);
+    const text = try readAll(gpa, got.fd, 200);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("hi\n", text);
 }
