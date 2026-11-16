@@ -621,3 +621,14 @@ test "dumps matches json.dumps(indent=2, sort_keys=True)" {
     const parsed = try toPy(a, try parse(a, s));
     try std.testing.expectEqualStrings(s, try dumps(a, parsed, 2, true));
 }
+
+test "an integer past i64 is an error, not a rounded float" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectError(error.Encoding, toPy(a, try parse(a, "18446744073709551616")));
+    try std.testing.expectError(error.Encoding, toPy(a, try parse(a, "[-9223372036854775809]")));
+    try std.testing.expectEqual(Py{ .int = std.math.minInt(i64) }, try toPy(a, try parse(a, "-9223372036854775808")));
+    try std.testing.expectEqual(Py{ .float = 1e19 }, try toPy(a, try parse(a, "1e19")));
+    try std.testing.expectEqual(Py{ .float = 3.0 }, try toPy(a, try parse(a, "3.0")));
+}
