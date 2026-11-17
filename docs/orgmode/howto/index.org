@@ -13,6 +13,7 @@ The title names the task.
 
    stop-a-slow-child
    replace-a-file-keeping-its-acls
+   move-a-path-across-file-systems
    keep-private-state-in-tmp
    compress-and-mark-logs
    match-python-output

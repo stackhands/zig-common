@@ -257,6 +257,21 @@ pub fn readAll(gpa: Allocator, fd: fd_t, limit: usize) (Error || Allocator.Error
 pub const acl_attributes = [_][:0]const u8{ "system.gpfs_nfs4_acl", "system.nfs4_acl", "system.posix_acl_access" };
 const posix_access = acl_attributes[2];
 
+/// How access metadata is preserved when copying across file systems.
+pub const MoveAcrossPolicy = enum {
+    /// Refuse when an ACL form cannot be read or set.
+    strict,
+    /// Keep bytes and ownership, but allow ACL downgrade when the destination
+    /// does not represent the source form.
+    portable,
+};
+
+/// Options for `moveAcross`.
+pub const MoveAcrossOptions = struct {
+    /// Access metadata policy for an EXDEV fallback.
+    policy: MoveAcrossPolicy = .strict,
+};
+
 /// The xattr calls copyAcls makes, as raw system-call results; a test
 /// emulates a filesystem's ACL model with its own.
 const Xattrs = struct {
@@ -273,6 +288,10 @@ const Xattrs = struct {
 /// ACL that cannot be set on `to` is an error, and so is a form that cannot
 /// be read when no other can be copied.
 fn copyAcls(comptime X: type, from: fd_t, to: fd_t) Error!void {
+    return copyAclsWithPolicy(X, from, to, .strict);
+}
+
+fn copyAclsWithPolicy(comptime X: type, from: fd_t, to: fd_t, policy: MoveAcrossPolicy) Error!void {
     var buf: [64 * 1024]u8 = undefined;
     var unreadable = false;
     for (acl_attributes) |name| {
@@ -280,16 +299,177 @@ fn copyAcls(comptime X: type, from: fd_t, to: fd_t) Error!void {
             error.NoData, error.Unsupported => continue,
             // GPFS answers EINVAL for an NFSv4 form of a file whose ACL is
             // POSIX, which the last form reads.
-            error.InvalidArgument => if (std.mem.eql(u8, name, posix_access)) return err else {
+            error.InvalidArgument => if (policy == .portable) continue else if (std.mem.eql(u8, name, posix_access)) return err else {
                 unreadable = true;
                 continue;
             },
             else => return err,
         };
-        _ = try sys.call(X.set, .{ to, name, buf[0..n] });
+        _ = sys.call(X.set, .{ to, name, buf[0..n] }) catch |err| switch (err) {
+            error.Unsupported, error.InvalidArgument => if (policy == .portable) return else return err,
+            else => return err,
+        };
         return;
     }
-    if (unreadable) return error.InvalidArgument;
+    if (unreadable and policy == .strict) return error.InvalidArgument;
+}
+
+const MoveFaults = struct {
+    force_cross_device_rename: bool = false,
+    reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
+    fail_fn: ?*const fn (?*anyopaque, []const u8) ?Error = null,
+    ctx: ?*anyopaque = null,
+};
+
+fn moveFaultsStep(faults: MoveFaults, step: []const u8) Error!void {
+    if (faults.reach_fn) |f| f(faults.ctx, step);
+    if (faults.fail_fn) |f| if (f(faults.ctx, step)) |err| return err;
+}
+
+fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
+    var rnd: [4]u8 = undefined;
+    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    return std.fmt.bufPrint(out, ".{s}.{d}.{x:0>8}.tmp", .{
+        std.fs.path.basename(base),
+        linux.getpid(),
+        std.mem.readInt(u32, &rnd, .little),
+    }) catch error.NameTooLong;
+}
+
+fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossPolicy) Error!void {
+    if ((try fstat(dst_fd)).uid != src.uid or (try fstat(dst_fd)).gid != src.gid) {
+        sys.fchown(dst_fd, src.uid, src.gid) catch |err| switch (err) {
+            error.AccessDenied => {},
+            else => return err,
+        };
+    }
+    try sys.fchmod(dst_fd, @intCast(src.perm()));
+    try copyAclsWithPolicy(Xattrs, src_fd, dst_fd, policy);
+}
+
+fn copyRegularInto(src_fd: fd_t, src: Stat, dst_dir: fd_t, name: []const u8, policy: MoveAcrossPolicy) Error!fd_t {
+    const fd = try sys.openat(dst_dir, name, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+    }, 0o600);
+    errdefer {
+        sys.close(fd);
+        sys.unlinkat(dst_dir, name, 0) catch {};
+    }
+    try copyFd(src_fd, fd);
+    try setModeOwnerAndAcl(src_fd, src, fd, policy);
+    try sys.fsync(fd);
+    return fd;
+}
+
+fn copyLinkAt(src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8) Error!void {
+    var in: [sys.path_max:0]u8 = undefined;
+    var out: [sys.path_max:0]u8 = undefined;
+    const n = try sys.call(linux.readlinkat, .{ src_dir, (try sys.z(&in, src_name)).ptr, &out, sys.path_max - 1 });
+    out[n] = 0;
+    _ = try sys.call(linux.symlinkat, .{ (&out).ptr, dst_dir, (try sys.z(&in, dst_name)).ptr });
+}
+
+fn copyTreeContents(gpa: Allocator, src_fd: fd_t, dst_fd: fd_t, policy: MoveAcrossPolicy) (Error || Allocator.Error)!void {
+    var it = try DirIter.init(gpa, src_fd);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| {
+        const t = try entryType(src_fd, e);
+        switch (t) {
+            DT.REG => {
+                const opened = try openRegular(src_fd, e.name, false);
+                defer sys.close(opened.fd);
+                const out = try copyRegularInto(opened.fd, opened.stat, dst_fd, e.name, policy);
+                sys.close(out);
+            },
+            DT.DIR => {
+                var zbuf: [sys.path_max:0]u8 = undefined;
+                _ = try sys.call(linux.mkdirat, .{ dst_fd, (try sys.z(&zbuf, e.name)).ptr, @as(linux.mode_t, 0o700) });
+                const sdir = try openDir(src_fd, e.name, false);
+                defer sys.close(sdir);
+                const ddir = try openDir(dst_fd, e.name, false);
+                defer sys.close(ddir);
+                try copyTreeContents(gpa, sdir, ddir, policy);
+                const st = try fstat(sdir);
+                try setModeOwnerAndAcl(sdir, st, ddir, policy);
+                try sys.fsync(ddir);
+            },
+            DT.LNK => try copyLinkAt(src_fd, e.name, dst_fd, e.name),
+            else => return error.InvalidArgument,
+        }
+    }
+    try sys.fsync(dst_fd);
+}
+
+fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
+    const src = try statAt(src_dir, src_name, false);
+    var tmp_buf: [sys.path_max]u8 = undefined;
+    const tmp = try tmpName(dst_name, &tmp_buf);
+    var published = false;
+    errdefer if (!published) {
+        if (src.isDir()) {
+            deleteTree(gpa, dst_dir, tmp) catch {};
+        } else {
+            sys.unlinkat(dst_dir, tmp, 0) catch {};
+        }
+    };
+
+    if (src.isReg()) {
+        const opened = try openRegular(src_dir, src_name, false);
+        defer sys.close(opened.fd);
+        const out = try copyRegularInto(opened.fd, opened.stat, dst_dir, tmp, opts.policy);
+        sys.close(out);
+    } else if (src.isDir()) {
+        var zbuf: [sys.path_max:0]u8 = undefined;
+        _ = try sys.call(linux.mkdirat, .{ dst_dir, (try sys.z(&zbuf, tmp)).ptr, @as(linux.mode_t, 0o700) });
+        const sdir = try openDir(src_dir, src_name, false);
+        defer sys.close(sdir);
+        const ddir = try openDir(dst_dir, tmp, false);
+        defer sys.close(ddir);
+        try copyTreeContents(gpa, sdir, ddir, opts.policy);
+        try setModeOwnerAndAcl(sdir, src, ddir, opts.policy);
+        try sys.fsync(ddir);
+    } else if (src.isLink()) {
+        try copyLinkAt(src_dir, src_name, dst_dir, tmp);
+    } else {
+        return error.InvalidArgument;
+    }
+
+    try moveFaultsStep(faults, "move.publish");
+    try sys.renameat(dst_dir, tmp, dst_dir, dst_name);
+    published = true;
+    try sys.fsync(dst_dir);
+    try moveFaultsStep(faults, "move.remove-source");
+    if (src.isDir()) {
+        try deleteTree(gpa, src_dir, src_name);
+    } else {
+        try sys.unlinkat(src_dir, src_name, 0);
+    }
+    try sys.fsync(src_dir);
+}
+
+fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
+    try moveFaultsStep(faults, "move.rename");
+    if (!faults.force_cross_device_rename) {
+        if (sys.renameat(src_dir, src_name, dst_dir, dst_name)) |_| {
+            try sys.fsync(dst_dir);
+            if (src_dir != dst_dir) try sys.fsync(src_dir);
+            return;
+        } else |err| switch (err) {
+            error.CrossDevice => {},
+            else => return err,
+        }
+    }
+    try moveAcrossCopy(gpa, src_dir, src_name, dst_dir, dst_name, opts, faults);
+}
+
+/// Move `src_dir/src_name` to `dst_dir/dst_name`. On one file system this is
+/// a rename; on `error.CrossDevice` it copies to a destination-side temporary
+/// path, syncs, atomically publishes with rename, then removes the source.
+pub fn moveAcross(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions) (Error || Allocator.Error)!void {
+    return moveAcrossInternal(gpa, src_dir, src_name, dst_dir, dst_name, opts, .{});
 }
 
 /// Replace the contents of the regular file `dir/name` atomically. The new
@@ -648,4 +828,113 @@ test "replaceContents copies the most native ACL form, GPFS's included" {
     // A form that could not be read and no other: refused, not dropped.
     F.reset(.{ .{ .errno = .INVAL }, unsupported, .{ .errno = .NODATA } });
     try std.testing.expectError(error.InvalidArgument, copyAcls(F, 0, 1));
+}
+
+test "copyAcls portable mode allows an unsupported destination ACL form" {
+    const F = FakeAcls;
+    const unsupported: F.Answer = .{ .errno = .OPNOTSUPP };
+    F.reset(.{ .{ .bytes = "gpfs" }, unsupported, unsupported });
+    const Portable = struct {
+        fn get(fd: fd_t, name: [:0]const u8, buf: []u8) usize {
+            return F.get(fd, name, buf);
+        }
+        fn set(_: fd_t, _: [:0]const u8, _: []const u8) usize {
+            return @bitCast(-@as(isize, @backingInt(linux.E.OPNOTSUPP)));
+        }
+    };
+    try copyAclsWithPolicy(Portable, 0, 1, .portable);
+    try std.testing.expectError(error.Unsupported, copyAclsWithPolicy(Portable, 0, 1, .strict));
+}
+
+const MoveProbe = struct {
+    seen: std.ArrayList([]const u8) = .empty,
+    fail_step: []const u8 = "",
+    fail_error: ?Error = null,
+
+    fn reach(ctx: ?*anyopaque, step: []const u8) void {
+        const self: *MoveProbe = @ptrCast(@alignCast(ctx.?));
+        self.seen.append(std.testing.allocator, std.testing.allocator.dupe(u8, step) catch return) catch {};
+    }
+    fn fail(ctx: ?*anyopaque, step: []const u8) ?Error {
+        const self: *MoveProbe = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, step, self.fail_step)) return self.fail_error;
+        return null;
+    }
+    fn hit(self: MoveProbe, step: []const u8) bool {
+        for (self.seen.items) |s| if (std.mem.eql(u8, s, step)) return true;
+        return false;
+    }
+    fn deinit(self: *MoveProbe) void {
+        for (self.seen.items) |s| std.testing.allocator.free(s);
+        self.seen.deinit(std.testing.allocator);
+    }
+};
+
+test "moveAcross falls back on EXDEV and removes the source after publish" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const srcf = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(srcf, "payload\n");
+    sys.close(srcf);
+
+    var probe = MoveProbe{};
+    defer probe.deinit();
+    try moveAcrossInternal(gpa, d, "src", d, "dst", .{ .policy = .strict }, .{
+        .force_cross_device_rename = true,
+        .reach_fn = MoveProbe.reach,
+        .fail_fn = MoveProbe.fail,
+        .ctx = &probe,
+    });
+    try std.testing.expect(probe.hit("move.rename"));
+    try std.testing.expect(probe.hit("move.publish"));
+    try std.testing.expect(probe.hit("move.remove-source"));
+    try std.testing.expectError(error.NotFound, statAt(d, "src", false));
+    const dst = try openRegular(d, "dst", false);
+    defer sys.close(dst.fd);
+    const text = try readAll(gpa, dst.fd, 100);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("payload\n", text);
+}
+
+test "moveAcross keeps the source when publish fails before rename" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-fail-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const srcf = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(srcf, "payload\n");
+    sys.close(srcf);
+
+    var probe = MoveProbe{ .fail_step = "move.publish", .fail_error = error.NoSpace };
+    defer probe.deinit();
+    try std.testing.expectError(error.NoSpace, moveAcrossInternal(gpa, d, "src", d, "dst", .{ .policy = .strict }, .{
+        .force_cross_device_rename = true,
+        .reach_fn = MoveProbe.reach,
+        .fail_fn = MoveProbe.fail,
+        .ctx = &probe,
+    }));
+    const src = try openRegular(d, "src", false);
+    defer sys.close(src.fd);
+    const text = try readAll(gpa, src.fd, 100);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("payload\n", text);
+    try std.testing.expectError(error.NotFound, statAt(d, "dst", false));
 }
