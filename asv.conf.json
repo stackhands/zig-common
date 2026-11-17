@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "project": "zig-common",
+  "project_url": "https://github.com/stackhands/zig-common",
+  "repo": ".",
+  "branches": [
+    "main"
+  ],
+  "environment_type": "existing",
+  "benchmark_dir": "benchmarks",
+  "results_dir": ".asv/results"
+}

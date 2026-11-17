@@ -1,0 +1,60 @@
+name: benchmarks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+
+      - name: Install ASV
+        run: |
+          python3 -m venv /tmp/zig-common-asv
+          /tmp/zig-common-asv/bin/pip install asv==0.6.6
+          mkdir -p .asv
+
+      - uses: HaoZeke/asv-perch@v1.2.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          results-path: .asv/results/
+          init-command: /tmp/zig-common-asv/bin/asv machine --yes
+          preserve-paths: benchmarks/, asv.conf.json, .asv/
+          benchmark-command: >-
+            /tmp/zig-common-asv/bin/asv run
+            -E existing:/tmp/zig-common-asv/bin/python
+            --set-commit-hash {sha} --record-samples --quick
+          baseline: |
+            label: main
+            sha: ${{ github.event.pull_request.base.sha }}
+            setup: >-
+              zig build-exe -O ReleaseFast
+              -femit-bin=.asv/benchmark-driver
+              --dep zig_common -Mroot=benchmarks/driver.zig
+              --dep zig_common_options -Mzig_common=src/root.zig
+              -Mzig_common_options=benchmarks/options.zig
+          contenders: |
+            - label: pr
+              sha: ${{ github.event.pull_request.head.sha }}
+              setup: >-
+                zig build-exe -O ReleaseFast
+                -femit-bin=.asv/benchmark-driver
+                --dep zig_common -Mroot=benchmarks/driver.zig
+                --dep zig_common_options -Mzig_common=src/root.zig
+                -Mzig_common_options=benchmarks/options.zig
+          label-before: main
+          label-after: pr

@@ -17,3 +17,5 @@ zig-out/
 /docs/**/__pycache__/
 /.pixi/
 /.lycheecache
+/.asv/
+/benchmarks/__pycache__/
