@@ -1,0 +1,44 @@
+name: large-file-audit
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find files at least 1 MiB
+        id: audit
+        continue-on-error: true
+        uses: HaoZeke/large-file-auditor@v0.1.0
+        with:
+          file-size-threshold: 1M
+
+      - name: Report introducing commits
+        if: steps.audit.outcome == 'failure'
+        env:
+          LARGE_FILES: ${{ steps.audit.outputs.large-files-list }}
+        run: |
+          if [ -n "$LARGE_FILES" ] && [ "$LARGE_FILES" != "[]" ]; then
+            printf '%s\n' "$LARGE_FILES" |
+              jq -r '.[].blobSha' |
+              while IFS= read -r blob; do
+                commit="$(
+                  git log --all --find-object="$blob" --reverse \
+                    --format='%H %s' | awk 'NR == 1 { print; exit }'
+                )"
+                printf 'Large blob %s was introduced by %s\n' "$blob" "$commit"
+              done
+          else
+            printf '%s\n' 'The large-file auditor failed before producing a report.'
+          fi
+          exit 1
