@@ -30,6 +30,9 @@ pub const Ops = struct {
     fchmod: *const fn (fd: sys.fd_t, mode: u32) usize = realChmod,
     fchown: *const fn (fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize = realChown,
     fsync: *const fn (fd: sys.fd_t) usize = realFsync,
+    openat: *const fn (dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize = realOpenat,
+    write: *const fn (fd: sys.fd_t, bytes: []const u8) usize = realWrite,
+    renameat: *const fn (old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize = realRenameat,
     geteuid: *const fn () linux.uid_t = realGeteuid,
     created: *const fn (fd: sys.fd_t) void = realCreated,
 };
@@ -66,6 +69,15 @@ fn realChown(fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize {
 fn realFsync(fd: sys.fd_t) usize {
     return linux.fsync(fd);
 }
+fn realOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
+    return linux.openat(dir, path, flags, mode);
+}
+fn realWrite(fd: sys.fd_t, bytes: []const u8) usize {
+    return linux.write(fd, bytes.ptr, bytes.len);
+}
+fn realRenameat(old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize {
+    return linux.renameat(old_dir, old_path, new_dir, new_path);
+}
 fn realGeteuid() linux.uid_t {
     return linux.geteuid();
 }
@@ -76,6 +88,29 @@ fn op(f: anytype, args: anytype) sys.Error!usize {
     while (true) {
         if (try sys.result(@call(.auto, f, args))) |r| return r;
     }
+}
+
+fn openTemp(path: []const u8, flags: sys.O, mode: linux.mode_t) sys.Error!sys.fd_t {
+    var zb: [sys.path_max:0]u8 = undefined;
+    var f = flags;
+    f.CLOEXEC = true;
+    const rc = try op(ops.openat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, f, mode });
+    return @intCast(rc);
+}
+
+fn writeTemp(fd: sys.fd_t, bytes: []const u8) sys.Error!void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try op(ops.write, .{ fd, bytes[off..] });
+        if (n == 0) return error.NoSpace;
+        off += n;
+    }
+}
+
+fn renameTemp(old_path: []const u8, new_path: []const u8) sys.Error!void {
+    var za: [sys.path_max:0]u8 = undefined;
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = try op(ops.renameat, .{ fsx.cwd, (try sys.z(&za, old_path)).ptr, fsx.cwd, (try sys.z(&zb, new_path)).ptr });
 }
 
 /// Python's OSError text for an error from one of the calls, so a message
@@ -445,7 +480,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    const fd = try openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     const created = fsx.fstat(fd) catch |err| {
         sys.close(fd);
         // Created above with O_EXCL, so it is this call's file.
@@ -456,7 +491,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     errdefer discard(tmp, created);
     {
         defer sys.close(fd);
-        try sys.writeAll(fd, data);
+        try writeTemp(fd, data);
         var inner: Why = .{};
         defer inner.deinit(a);
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
@@ -479,7 +514,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
+    try renameTemp(tmp, path);
     try fsyncDir(parent);
 }
 
