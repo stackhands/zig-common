@@ -123,6 +123,83 @@ pub fn realpath(dir: fd_t, path: []const u8, out: *[sys.path_max]u8) Error![]con
     return realpathFd(fd, out);
 }
 
+/// Normalize `path` like Python's `posixpath.normpath`: drop "." segments
+/// and repeated slashes, resolve ".." segments without following symbolic
+/// links, and keep one or two leading slashes while collapsing three or
+/// more to one. The caller owns the returned slice.
+pub fn normPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
+    const slashes: usize = if (!std.mem.startsWith(u8, path, "/"))
+        0
+    else if (std.mem.startsWith(u8, path, "//") and !std.mem.startsWith(u8, path, "///"))
+        2
+    else
+        1;
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(gpa);
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        const after_up = parts.items.len > 0 and std.mem.eql(u8, parts.items[parts.items.len - 1], "..");
+        if (!std.mem.eql(u8, part, "..") or (slashes == 0 and parts.items.len == 0) or after_up) {
+            try parts.append(gpa, part);
+        } else {
+            _ = parts.pop();
+        }
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendNTimes(gpa, '/', slashes);
+    for (parts.items, 0..) |part, i| {
+        if (i > 0) try out.append(gpa, '/');
+        try out.appendSlice(gpa, part);
+    }
+    if (out.items.len == 0) try out.append(gpa, '.');
+    return out.toOwnedSlice(gpa);
+}
+
+/// Return a normalized absolute path like Python's `os.path.abspath`,
+/// joining relative paths to the current working directory without
+/// following symbolic links. The caller owns the returned slice.
+pub fn absPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
+    if (std.mem.startsWith(u8, path, "/")) return normPath(gpa, path);
+    var buf: [sys.path_max]u8 = undefined;
+    const cwd_path = realpath(cwd, ".", &buf) catch return normPath(gpa, path);
+    const joined = try std.mem.concat(gpa, u8, &.{ cwd_path, "/", path });
+    defer gpa.free(joined);
+    return normPath(gpa, joined);
+}
+
+test "normPath and absPath match posixpath.normpath and os.path.abspath" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "", .want = "." },
+        .{ .in = ".", .want = "." },
+        .{ .in = "a/./b/../c", .want = "a/c" },
+        .{ .in = "../a/b/..", .want = "../a" },
+        .{ .in = "/a/b/../c/", .want = "/a/c" },
+        .{ .in = "/../../a", .want = "/a" },
+        .{ .in = "//a/b/..", .want = "//a" },
+        .{ .in = "///a//b", .want = "/a/b" },
+    };
+    for (cases) |tc| {
+        const got = try normPath(gpa, tc.in);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(tc.want, got);
+    }
+
+    const abs_lit = try absPath(gpa, "///opt/./x/../bin/");
+    defer gpa.free(abs_lit);
+    try std.testing.expectEqualStrings("/opt/bin", abs_lit);
+
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &buf);
+    const abs_rel = try absPath(gpa, "sub/./file");
+    defer gpa.free(abs_rel);
+    const expected = try std.mem.concat(gpa, u8, &.{ here, "/sub/file" });
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, abs_rel);
+}
+
 /// Open an existing regular file for reading. `follow` decides whether a
 /// final symbolic link is followed. A FIFO or device is refused without
 /// blocking on it.
