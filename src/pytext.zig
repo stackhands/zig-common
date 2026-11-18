@@ -3,6 +3,8 @@
 //! decoder, str.isspace/strip/split, and shlex.quote. Tools ported from
 //! Python use these so a byte string means what it meant there.
 const std = @import("std");
+const linux = std.os.linux;
+const sys = @import("sys.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -188,6 +190,27 @@ pub fn reprStrAlloc(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Format an `OSError` message with Python-quoted path: `"[Errno N] text: 'path'"`
+/// (or `"ErrorName: 'path'"` when `err` is not a `sys.Error`).
+pub fn osError(gpa: Allocator, err: anyerror, path: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, if (sys.asError(err)) |e| sys.describe(e) else @errorName(err));
+    try out.appendSlice(gpa, ": ");
+    try reprStr(&out, gpa, path);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Format an `OSError` message for an explicit `linux.E` and Python-quoted path.
+pub fn osErrorErrno(gpa: Allocator, e: linux.E, path: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, sys.describeErrno(e));
+    try out.appendSlice(gpa, ": ");
+    try reprStr(&out, gpa, path);
+    return out.toOwnedSlice(gpa);
+}
+
 test "decodeReplace uses maximal subparts" {
     const gpa = std.testing.allocator;
     const r = try decodeReplace(gpa, "a\xe2\x82b\xff\xf0\x9f\x98");
@@ -247,4 +270,17 @@ test "reprStr and reprStrAlloc match Python repr" {
         defer gpa.free(r);
         try std.testing.expectEqualStrings(cs[1], r);
     }
+}
+
+test "osError and osErrorErrno format OSError messages with Python path quoting" {
+    const gpa = std.testing.allocator;
+    const e1 = try osError(gpa, error.NotFound, "/no/such");
+    defer gpa.free(e1);
+    try std.testing.expectEqualStrings("[Errno 2] No such file or directory: '/no/such'", e1);
+    const e2 = try osError(gpa, error.CustomThing, "a'b");
+    defer gpa.free(e2);
+    try std.testing.expectEqualStrings("CustomThing: \"a'b\"", e2);
+    const e3 = try osErrorErrno(gpa, .NAMETOOLONG, "/long");
+    defer gpa.free(e3);
+    try std.testing.expectEqualStrings("[Errno 36] File name too long: '/long'", e3);
 }
