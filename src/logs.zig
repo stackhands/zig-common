@@ -215,3 +215,43 @@ test "renameInList" {
     try std.testing.expectEqualStrings("/r/a.log.gz\n/r/b.log\n", got);
     try std.testing.expect((try renameInList(gpa, "/r/b.log\n", &m)) == null);
 }
+
+test "gzipInPlace refuses missing files, symlinks, directories, hard links, and existing archives" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-err-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectError(error.NotFound, gzipInPlace(gpa, io, dir, "missing.log"));
+
+    var sub_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(dir, (try sys.z(&sub_z, "sub")).ptr, 0o700);
+    try std.testing.expectError(error.InvalidArgument, gzipInPlace(gpa, io, dir, "sub"));
+
+    const orig = try sys.openat(dir, "orig.log", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(orig, "hello");
+    sys.close(orig);
+
+    var lnk_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.symlinkat("orig.log", dir, (try sys.z(&lnk_z, "lnk.log")).ptr);
+    try std.testing.expectError(error.SymLink, gzipInPlace(gpa, io, dir, "lnk.log"));
+
+    var hl_z: [sys.path_max:0]u8 = undefined;
+    var orig_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.linkat(dir, (try sys.z(&orig_z, "orig.log")).ptr, dir, (try sys.z(&hl_z, "hard.log")).ptr, 0);
+    try std.testing.expectError(error.TooManyLinks, gzipInPlace(gpa, io, dir, "orig.log"));
+    sys.unlinkat(dir, "hard.log", 0) catch {};
+
+    const gz = try sys.openat(dir, "orig.log.gz", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(gz);
+    try std.testing.expectError(error.Exists, gzipInPlace(gpa, io, dir, "orig.log"));
+}
