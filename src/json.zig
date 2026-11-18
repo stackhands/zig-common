@@ -48,33 +48,50 @@ pub const Value = union(enum) {
 /// not yet decoded, and its value.
 pub const Member = struct { key: []const u8, value: Value };
 
-/// A raw JSON key equals `want` (ASCII, as every key the guard looks up
-/// is) once its escapes are decoded.
+/// A raw JSON key equals `want` (UTF-8 or surrogateescape cache bytes) once
+/// its escapes and UTF-16 surrogate pairs are decoded.
 fn keyEql(raw: []const u8, want: []const u8) bool {
     var i: usize = 0;
     var j: usize = 0;
     while (i < raw.len) {
-        var c: u21 = raw[i];
-        if (c == '\\') {
+        var cp: u21 = undefined;
+        if (raw[i] != '\\') {
+            const ch = text.nextChar(raw[i..]);
+            cp = ch.cp orelse return false;
+            i += ch.len;
+        } else {
             if (i + 1 >= raw.len) return false;
             const e = raw[i + 1];
+            i += 2;
             if (e == 'u') {
-                c = hex4(raw, i + 2) catch return false;
-                i += 6;
+                cp = hex4(raw, i) catch return false;
+                i += 4;
+                if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= raw.len and raw[i] == '\\' and raw[i + 1] == 'u') {
+                    const lo = hex4(raw, i + 2) catch return false;
+                    if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+                }
             } else {
-                c = switch (e) {
+                cp = switch (e) {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
                     'b' => 0x08,
                     'f' => 0x0c,
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
-                    else => e,
+                    else => return false,
                 };
-                i += 2;
             }
-        } else i += 1;
-        if (j >= want.len or c != want[j]) return false;
-        j += 1;
+        }
+        if (j >= want.len) return false;
+        const wch = text.nextChar(want[j..]);
+        const wcp: u21 = wch.cp orelse (0xDC00 + @as(u21, want[j]));
+        if (cp != wcp) return false;
+        j += wch.len;
     }
     return j == want.len;
 }
@@ -435,6 +452,25 @@ test "parse objects, duplicates and nesting" {
     const e = try parse(a, "{\"\\u006bind\": \"x\"}");
     try std.testing.expect(e.get("kind") != null);
     try std.testing.expectError(error.Syntax, parse(a, "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"));
+}
+
+test "Value.get matches escaped UTF-8, surrogate pairs, and cache-escaped keys" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const v1 = try parse(a, "{\"\\u00e9\": 1, \"caf\\u00e9\": 2}");
+    try std.testing.expectEqualStrings("1", v1.get("é").?.number);
+    try std.testing.expectEqualStrings("2", v1.get("café").?.number);
+
+    const v2 = try parse(a, "{\"\\uD83D\\uDE00\": 42}");
+    try std.testing.expectEqualStrings("42", v2.get("😀").?.number);
+
+    const v3 = try parse(a, "{\"café\": \"raw\"}");
+    try std.testing.expectEqualStrings("raw", v3.get("café").?.string);
+
+    const v4 = try parse(a, "{\"\\udce9\": \"byte\"}");
+    try std.testing.expectEqualStrings("byte", v4.get("\xe9").?.string);
 }
 
 /// `inner` inside `n` arrays, or objects when `open` opens one.
