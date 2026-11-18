@@ -154,6 +154,40 @@ pub fn shellQuote(gpa: Allocator, v: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// repr(str) as Python prints a byte string decoded with surrogateescape:
+/// single quotes unless `s` has `'` and no `"`, backslash escapes for `\\`,
+/// `\t`, `\n`, `\r` and that quote, `\xNN` for non-printable Latin-1 codes
+/// up to U+00A0 and U+00AD, and `\udcNN` for invalid UTF-8 bytes.
+pub fn reprStr(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8) Allocator.Error!void {
+    const quote: u8 = if (std.mem.findScalar(u8, s, '\'') != null and std.mem.findScalar(u8, s, '"') == null) '"' else '\'';
+    try out.append(gpa, quote);
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = nextChar(s[i..]);
+        if (ch.cp) |cp| switch (cp) {
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            0...8, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xa0, 0xad => try out.print(gpa, "\\x{x:0>2}", .{cp}),
+            else => {
+                if (cp == quote) try out.append(gpa, '\\');
+                try out.appendSlice(gpa, s[i .. i + ch.len]);
+            },
+        } else try out.print(gpa, "\\udc{x:0>2}", .{s[i]});
+        i += ch.len;
+    }
+    try out.append(gpa, quote);
+}
+
+/// Allocate and return `reprStr` for `s`.
+pub fn reprStrAlloc(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try reprStr(&out, gpa, s);
+    return out.toOwnedSlice(gpa);
+}
+
 test "decodeReplace uses maximal subparts" {
     const gpa = std.testing.allocator;
     const r = try decodeReplace(gpa, "a\xe2\x82b\xff\xf0\x9f\x98");
@@ -193,5 +227,24 @@ test "shellQuote" {
         const q = try shellQuote(gpa, cs[0]);
         defer gpa.free(q);
         try std.testing.expectEqualStrings(cs[1], q);
+    }
+}
+
+test "reprStr and reprStrAlloc match Python repr" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "/tmp/x", "'/tmp/x'" },
+        .{ "it's", "\"it's\"" },
+        .{ "a'b\"c", "'a\\'b\"c'" },
+        .{ "a\\b", "'a\\\\b'" },
+        .{ "\t\n\r\x01\x7f", "'\\t\\n\\r\\x01\\x7f'" },
+        .{ "caf\xe9", "'caf\\udce9'" },
+        .{ "caf\u{e9}", "'caf\u{e9}'" },
+        .{ "\u{a0}\u{ad}\u{85}\u{ff}", "'\\xa0\\xad\\x85\u{ff}'" },
+    };
+    for (cases) |cs| {
+        const r = try reprStrAlloc(gpa, cs[0]);
+        defer gpa.free(r);
+        try std.testing.expectEqualStrings(cs[1], r);
     }
 }
