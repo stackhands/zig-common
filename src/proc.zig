@@ -704,3 +704,43 @@ test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
     try std.testing.expectError(error.NoChild, run(std.testing.allocator, "/bin/sh", &.{ "sh", "-c", "exit 3" }, no_env, .{}));
     try std.testing.expectEqual(linux.E.CHILD, sys.last_errno);
 }
+
+test "which, groupAlive, and run cover error and boundary paths" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "a/b", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "no-such-zig-common-tool", "/bin:/usr/bin"));
+
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-proc-err-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+    var sub_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(dir, (try sys.z(&sub_z, "sub")).ptr, 0o755);
+    const nonexec = try sys.openat(dir, "plain", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(nonexec);
+    const exec = try sys.openat(dir, "tool", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o755);
+    sys.close(exec);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "sub", base));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain", base));
+    const found = (try which(gpa, "tool", base)).?;
+    defer gpa.free(found);
+    try std.testing.expect(std.mem.endsWith(u8, found, "/tool"));
+
+    try std.testing.expect(!groupAlive(2_000_000_000));
+    killGroup(0, .TERM);
+    stopGroup(0);
+
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/\x00sh", &.{"sh"}, no_env, .{}));
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/sh", &.{ "sh", "bad\x00arg" }, no_env, .{}));
+    try std.testing.expectError(error.StreamTooLong, run(gpa, "/bin/sh", &.{ "sh", "-c", "printf 12345678" }, no_env, .{ .stdout_limit = 4 }));
+    try std.testing.expectError(error.NotFound, run(gpa, "/no/such/zig-common-exe", &.{"x"}, no_env, .{ .exec_error = true }));
+}
