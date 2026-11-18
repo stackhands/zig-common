@@ -66,12 +66,12 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
 pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
     const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
     if (deadline == null and cancel == null) {
-        _ = try sys.call(linux.flock, .{ fd, std.posix.LOCK.EX });
+        _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
         return;
     }
     while (true) {
         if (cancel) |c| if (c.load(.seq_cst)) return error.Canceled;
-        const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         switch (linux.errno(rc)) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
@@ -465,4 +465,51 @@ test "lockExclusiveCancel returns Canceled when cancel is set" {
     defer sys.close(fd2);
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, lockExclusiveCancel(fd2, 60_000, &cancel));
+}
+
+test "lockExclusive covers timeout 0, bounded timeout, and unsupported flock" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try gpa.print("{s}/.zig-cache/zig-common-lockerr-{d}", .{ cwd, linux.getpid() });
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        gpa.free(base);
+    }
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(dir);
+
+    var sub_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(dir, (try sys.z(&sub_z, "sub")).ptr, 0o700);
+    try std.testing.expectError(error.IsDir, openPrivate(dir, "sub", true));
+    try std.testing.expectError(error.InvalidArgument, readPrivate(gpa, -1, "x", 64));
+    try std.testing.expectError(error.InvalidArgument, writePrivate(gpa, -1, "x", "y"));
+
+    const fd1 = (try openPrivate(dir, "lck", true)).?;
+    defer sys.close(fd1);
+    try lockExclusive(fd1, 0);
+
+    const fd2 = try sys.openat(dir, "lck", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    try std.testing.expectError(error.TimedOut, lockExclusive(fd2, 0));
+    try std.testing.expectError(error.TimedOut, lockExclusive(fd2, 40));
+
+    const Hooks = struct {
+        var err_code: linux.E = .OPNOTSUPP;
+        fn fail(_: fsx.fd_t, _: i32) usize {
+            return @bitCast(-@as(isize, @backingInt(err_code)));
+        }
+    };
+    defer lock_ops.* = .{};
+    lock_ops.flock = Hooks.fail;
+    for ([_]linux.E{ .OPNOTSUPP, .NOSYS }) |e| {
+        Hooks.err_code = e;
+        for ([_]?u32{ null, 0, 25 }) |timeout| {
+            sys.last_errno = .SUCCESS;
+            try std.testing.expectError(error.Unsupported, lockExclusive(fd2, timeout));
+            try std.testing.expectEqual(e, sys.last_errno);
+        }
+    }
 }
