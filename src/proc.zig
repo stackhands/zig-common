@@ -861,3 +861,31 @@ test "which resolves executable candidates directly" {
     try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
     try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
 }
+
+test "which, groupAlive, and run cover error and boundary paths" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "a/b", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "no-such-zig-common-tool", "/bin:/usr/bin"));
+
+    const fixture = try makeExecFixture(gpa, "which-err");
+    defer fixture.deinit(gpa);
+    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+    defer sys.close(dir);
+    _ = linux.mkdirat(dir, "sub", 0o755);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "sub", fixture.base));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
+    const found = (try which(gpa, "tool.sh", fixture.base)).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    try std.testing.expect(!groupAlive(2_000_000_000));
+    killGroup(0, .TERM);
+    stopGroup(0);
+
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/\x00sh", &.{"sh"}, no_env, .{}));
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/sh", &.{ "sh", "bad\x00arg" }, no_env, .{}));
+    try std.testing.expectError(error.StreamTooLong, run(gpa, "/bin/sh", &.{ "sh", "-c", "printf 12345678" }, no_env, .{ .stdout_limit = 4 }));
+    try std.testing.expectError(error.NotFound, run(gpa, "/no/such/zig-common-exe", &.{"x"}, no_env, .{ .exec_error = true }));
+}
