@@ -262,9 +262,15 @@ fn describeNamed(comptime e: linux.E) []const u8 {
         std.fmt.comptimePrint("[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) });
 }
 
-/// The strerror text for `e`, or the Zig enum tag name when `errnoText` does not name it.
+/// The strerror text for `e`, the Zig enum tag name when `errnoText` does not
+/// name a known tag, or `"Unknown error N"` for an unnamed errno value.
 pub fn strerror(e: linux.E) []const u8 {
-    return errnoText(e) orelse @tagName(e);
+    if (errnoText(e)) |text| return text;
+    if (std.enums.tagName(linux.E, e)) |name| return name;
+    const S = struct {
+        threadlocal var buf: [32]u8 = undefined;
+    };
+    return std.mem.print(&S.buf, "Unknown error {d}", .{@backingInt(e)}) catch "Unknown error";
 }
 
 /// Map a raw result. EINTR is returned as `null` so callers can retry.
@@ -428,4 +434,13 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     }
     try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
     try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
+}
+
+test "strerror formats unnamed errno values instead of panicking" {
+    var raw: u16 = 134;
+    const unknown_134: linux.E = @fromBackingInt(raw);
+    try std.testing.expectEqualStrings("Unknown error 134", strerror(unknown_134));
+    raw = 999;
+    const unknown_999: linux.E = @fromBackingInt(raw);
+    try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
 }
