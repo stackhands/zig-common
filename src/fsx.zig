@@ -507,6 +507,70 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
     done = true;
 }
 
+/// Create a private 0700 directory `{dir}/{prefix}XXXXXXXX` with a random
+/// suffix, retrying on `error.Exists`, and return its path allocated from
+/// `gpa`. The caller owns the returned slice.
+pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Allocator.Error)![]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        var rnd: [8]u8 = undefined;
+        // A name from bytes getrandom did not fill would not be random.
+        const got = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+        if (got != rnd.len) return error.Unexpected;
+        for (&rnd) |*b| b.* = alphabet[b.* % alphabet.len];
+        const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, rnd });
+        defer gpa.free(name);
+        const path = try std.fs.path.join(gpa, &.{ dir, name });
+        errdefer gpa.free(path);
+        var zb: [sys.path_max:0]u8 = undefined;
+        const z = try sys.z(&zb, path);
+        _ = sys.call(linux.mkdirat, .{ cwd, z.ptr, @as(linux.mode_t, 0o700) }) catch |err| switch (err) {
+            error.Exists => {
+                gpa.free(path);
+                continue;
+            },
+            else => return err,
+        };
+        return path;
+    }
+    return error.Exists;
+}
+
+test "mkdtemp creates private 0700 directories with distinct names" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-mkdtemp-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, base) catch {};
+
+    const a = try mkdtemp(gpa, base, "pre-");
+    defer gpa.free(a);
+    const b_base = try std.fmt.allocPrint(gpa, "{s}/", .{base});
+    defer gpa.free(b_base);
+    const b = try mkdtemp(gpa, b_base, "pre-");
+    defer gpa.free(b);
+
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    const expected_prefix = try std.fmt.allocPrint(gpa, "{s}/pre-", .{base});
+    defer gpa.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, a, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, a.len);
+    try std.testing.expect(std.mem.startsWith(u8, b, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, b.len);
+
+    const st = try statAt(cwd, a, false);
+    try std.testing.expect(st.isDir());
+    try std.testing.expectEqual(@as(u32, 0), st.perm() & 0o077);
+
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkdtemp(gpa, missing, "pre-"));
+}
+
 /// The `d_type` values of a directory entry, as `std.os.linux.DT`:
 /// `DT.REG`, `DT.DIR`, `DT.LNK`, `DT.UNKNOWN` and the rest.
 pub const DT = linux.DT;
