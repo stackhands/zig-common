@@ -1079,3 +1079,58 @@ test "moveAcross keeps the source when publish fails before rename" {
     try std.testing.expectEqualStrings("payload\n", text);
     try std.testing.expectError(error.NotFound, statAt(d, "dst", false));
 }
+
+test "fsx public helpers return expected errors on bad paths and descriptors" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-fsx-err-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+
+    const reg_fd = try sys.openat(d, "reg", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try sys.writeAll(reg_fd, "0123456789");
+    sys.close(reg_fd);
+    var dir_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(d, (try sys.z(&dir_z, "sub")).ptr, 0o700);
+    var lnk_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.symlinkat("reg", d, (try sys.z(&lnk_z, "lnk")).ptr);
+    var dlnk_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.symlinkat("sub", d, (try sys.z(&dlnk_z, "dlnk")).ptr);
+
+    try std.testing.expectError(error.InvalidArgument, fstat(-1));
+    try std.testing.expectError(error.NotFound, statAt(d, "missing", false));
+    var out: [sys.path_max]u8 = undefined;
+    try std.testing.expectError(error.NotFound, realpathFd(-1, &out));
+    try std.testing.expectError(error.NotFound, realpath(d, "missing", &out));
+
+    try std.testing.expectError(error.NotFound, openRegular(d, "missing", false));
+    try std.testing.expectError(error.SymLink, openRegular(d, "lnk", false));
+    try std.testing.expectError(error.InvalidArgument, openRegular(d, "sub", false));
+
+    try std.testing.expectError(error.NotFound, openDir(d, "missing", false));
+    try std.testing.expectError(error.NotDir, openDir(d, "reg", false));
+    try std.testing.expectError(error.NotDir, openDir(d, "dlnk", false));
+
+    const opened = try openRegular(d, "reg", false);
+    defer sys.close(opened.fd);
+    try std.testing.expectError(error.SymLink, copyTo(opened.fd, opened.stat, d, "lnk"));
+    try std.testing.expectError(error.IsDir, copyTo(opened.fd, opened.stat, d, "sub"));
+    try std.testing.expectError(error.SymLink, appendLine(gpa, d, "lnk", "x"));
+    try std.testing.expectError(error.IsDir, appendLine(gpa, d, "sub", "x"));
+    try std.testing.expectError(error.StreamTooLong, readAll(gpa, opened.fd, 4));
+    try std.testing.expectError(error.NotFound, moveAcross(gpa, d, "missing", d, "dst", .{}));
+    try std.testing.expectError(error.NotFound, replaceContents(gpa, d, "missing", "x"));
+    try std.testing.expectError(error.SymLink, replaceContents(gpa, d, "lnk", "x"));
+    try std.testing.expectError(error.NotFound, entryType(d, .{ .name = "missing", .type = DT.UNKNOWN }));
+    var bad_it = try DirIter.init(gpa, -1);
+    defer bad_it.deinit(gpa);
+    try std.testing.expectError(error.InvalidArgument, bad_it.next());
+    try std.testing.expectError(error.NotFound, deleteTree(gpa, d, "missing"));
+}
