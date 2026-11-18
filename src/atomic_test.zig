@@ -1731,3 +1731,46 @@ test "atomicWrite frees what it allocates but a refusal's message" {
         try expectAttrs(s.expected, m.getPath(s.path));
     }
 }
+
+fn enospcWrite(_: sys.fd_t, _: []const u8) usize {
+    return err(.NOSPC);
+}
+
+fn erofsOpenat(_: sys.fd_t, _: [*:0]const u8, _: sys.O, _: linux.mode_t) usize {
+    return err(.ROFS);
+}
+
+fn exdevRenameat(_: sys.fd_t, _: [*:0]const u8, _: sys.fd_t, _: [*:0]const u8) usize {
+    return err(.XDEV);
+}
+
+test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching the live file" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const pt = staleModule(dir);
+
+    atomic.ops.write = enospcWrite;
+    try testing.expectError(error.NoSpace, write(pt[0], "new", replace));
+    try testing.expectEqualStrings("[Errno 28] No space left on device", atomic.describe(error.NoSpace));
+    try testing.expect(!exists(pt[1]));
+    try testing.expectEqualStrings("old", readFile(pt[0]));
+
+    atomic.ops.* = .{};
+    atomic.ops.openat = erofsOpenat;
+    try testing.expectError(error.ReadOnly, write(pt[0], "new", replace));
+    try testing.expectEqualStrings("[Errno 30] Read-only file system", atomic.describe(error.ReadOnly));
+    try testing.expect(!exists(pt[1]));
+    try testing.expectEqualStrings("old", readFile(pt[0]));
+
+    atomic.ops.* = .{};
+    atomic.ops.renameat = exdevRenameat;
+    try testing.expectError(error.CrossDevice, write(pt[0], "new", replace));
+    try testing.expectEqualStrings("[Errno 18] Invalid cross-device link", atomic.describe(error.CrossDevice));
+    try testing.expect(!exists(pt[1]));
+    try testing.expectEqualStrings("old", readFile(pt[0]));
+
+    try testing.expectError(error.NotDir, atomic.makedirs(join(pt[0], "child")));
+    try testing.expectError(error.NotFound, atomic.fsyncDir(join(dir, "absent")));
+}
