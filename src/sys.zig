@@ -262,6 +262,11 @@ fn describeNamed(comptime e: linux.E) []const u8 {
         std.fmt.comptimePrint("[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) });
 }
 
+/// The strerror text for `e`, or the Zig enum tag name when `errnoText` does not name it.
+pub fn strerror(e: linux.E) []const u8 {
+    return errnoText(e) orelse @tagName(e);
+}
+
 /// Map a raw result. EINTR is returned as `null` so callers can retry.
 fn map(rc: usize) Error!?usize {
     const e = linux.errno(rc);
@@ -409,6 +414,8 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     try std.testing.expectEqual(@as(?Error, null), asError(error.OutOfMemory));
     try std.testing.expectEqualStrings("[Errno 133] Memory page has hardware error", describeErrno(.HWPOISON));
     try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
+    try std.testing.expectEqualStrings("No such file or directory", strerror(.NOENT));
+    try std.testing.expectEqualStrings("File name too long", strerror(.NAMETOOLONG));
     const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
     defer close(compat_fd);
     var compat: std.ArrayList(u8) = .empty;
