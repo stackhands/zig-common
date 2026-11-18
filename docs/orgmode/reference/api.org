@@ -10,6 +10,175 @@ A declaration's doc comment is its description.
 - [[file:api/zig/index.md][Zig API]]: every =pub= declaration, one page per source file, read with the compiler's own parser by =docs/tools/zig_api.zig=, each linked to its source line at that commit.
 - [[autodoc:/][Zig autodoc]]: the same declarations in the browser =zig build docs= makes, with search and source views.
 
+** Public functions and error sets
+
+Each module below lists every public function (=pub fn= or =pub inline fn=) and the error set it can return.
+
+*** =zig_common.sys=
+
+Error set: [[zig:zig_common.sys.Error]].
+
+| Function                               | Error set                     |
+|----------------------------------------+-------------------------------|
+| [[zig:zig_common.sys.errnoText]]       | none                          |
+| [[zig:zig_common.sys.describe]]        | none                          |
+| [[zig:zig_common.sys.asError]]         | none                          |
+| [[zig:zig_common.sys.describeErrno]]   | none                          |
+| [[zig:zig_common.sys.result]]          | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.call]]            | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.z]]               | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.openat]]          | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.close]]           | none                          |
+| [[zig:zig_common.sys.read]]            | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.writeAll]]        | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.fchmod]]          | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.fchown]]          | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.fsync]]           | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.unlinkat]]        | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.renameat]]        | [[zig:zig_common.sys.Error]]  |
+| [[zig:zig_common.sys.getuid]]          | none                          |
+
+*** =zig_common.fsx=
+
+Error set: [[zig:zig_common.fsx.Error]] (alias of [[zig:zig_common.sys.Error]]).
+
+| Function                                    | Error set                                                         |
+|---------------------------------------------+-------------------------------------------------------------------|
+| [[zig:zig_common.fsx.Stat.isReg]]           | none                                                              |
+| [[zig:zig_common.fsx.Stat.isDir]]           | none                                                              |
+| [[zig:zig_common.fsx.Stat.isLink]]          | none                                                              |
+| [[zig:zig_common.fsx.Stat.perm]]            | none                                                              |
+| [[zig:zig_common.fsx.DirIter.init]]         | =Allocator.Error=                                                 |
+| [[zig:zig_common.fsx.DirIter.deinit]]       | none                                                              |
+| [[zig:zig_common.fsx.DirIter.next]]         | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.fstat]]                | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.statAt]]               | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.realpathFd]]           | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.realpath]]             | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.openRegular]]          | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.openDir]]              | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.copyTo]]               | [[zig:zig_common.fsx.Error]]                                      |
+| [[zig:zig_common.fsx.appendLine]]           | [[zig:zig_common.fsx.Error]], =Allocator.Error=                            |
+| [[zig:zig_common.fsx.readAll]]              | [[zig:zig_common.fsx.Error]], =Allocator.Error=, =error{StreamTooLong}=    |
+| [[zig:zig_common.fsx.moveAcross]]           | [[zig:zig_common.fsx.Error]], =Allocator.Error=                            |
+| [[zig:zig_common.fsx.replaceContents]]      | [[zig:zig_common.fsx.Error]], =Allocator.Error=                            |
+| [[zig:zig_common.fsx.entryType]]            | [[zig:zig_common.fsx.Error]]                                               |
+| [[zig:zig_common.fsx.deleteTree]]           | [[zig:zig_common.fsx.Error]], =Allocator.Error=                            |
+
+*** =zig_common.proc=
+
+Error set: [[zig:zig_common.proc.Error]].
+
+| Function                               | Error set                     |
+|----------------------------------------+-------------------------------|
+| [[zig:zig_common.proc.Term.code]]      | none                          |
+| [[zig:zig_common.proc.Result.deinit]]  | none                          |
+| [[zig:zig_common.proc.which]]          | =Allocator.Error=             |
+| [[zig:zig_common.proc.groupAlive]]     | none                          |
+| [[zig:zig_common.proc.killGroup]]      | none                          |
+| [[zig:zig_common.proc.stopGroup]]      | none                          |
+| [[zig:zig_common.proc.run]]            | [[zig:zig_common.proc.Error]] |
+
+*** =zig_common.logs=
+
+Error set: [[zig:zig_common.logs.GzipError]].
+
+| Function                               | Error set                           |
+|----------------------------------------+-------------------------------------|
+| [[zig:zig_common.logs.gzipInPlace]]    | [[zig:zig_common.logs.GzipError]]   |
+| [[zig:zig_common.logs.renameInList]]   | =Allocator.Error=                   |
+
+*** =zig_common.cli=
+
+| Function                               | Error set |
+|----------------------------------------+-----------|
+| [[zig:zig_common.cli.put]]             | none      |
+| [[zig:zig_common.cli.print]]           | none      |
+| [[zig:zig_common.cli.out]]             | none      |
+| [[zig:zig_common.cli.err]]             | none      |
+| [[zig:zig_common.cli.die]]             | none      |
+| [[zig:zig_common.cli.versionLine]]     | none      |
+
+*** =zig_common.env=
+
+| Function                               | Error set                                              |
+|----------------------------------------+--------------------------------------------------------|
+| [[zig:zig_common.env.Env.fromEnvp]]    | none                                                   |
+| [[zig:zig_common.env.Env.get]]         | none                                                   |
+| [[zig:zig_common.env.Env.duplicates]]  | =Allocator.Error=                                      |
+| [[zig:zig_common.env.Builder.init]]    | none                                                   |
+| [[zig:zig_common.env.Builder.deinit]]  | none                                                   |
+| [[zig:zig_common.env.Builder.fromEnv]] | =Allocator.Error=                                      |
+| [[zig:zig_common.env.Builder.set]]     | =Allocator.Error=                                      |
+| [[zig:zig_common.env.Builder.unset]]   | none                                                   |
+| [[zig:zig_common.env.Builder.get]]     | none                                                   |
+| [[zig:zig_common.env.Builder.envp]]    | =Allocator.Error=, =error{InvalidArgument}= |
+| [[zig:zig_common.env.validName]]       | none                                                   |
+
+*** =zig_common.state=
+
+Error sets: [[zig:zig_common.state.Error]], [[zig:zig_common.state.RootLock.AcquireError]], [[zig:zig_common.state.LockError]].
+
+| Function                                  | Error set                                                   |
+|-------------------------------------------+-------------------------------------------------------------|
+| [[zig:zig_common.state.RootLock.acquire]] | [[zig:zig_common.state.RootLock.AcquireError]]              |
+| [[zig:zig_common.state.RootLock.release]] | none                                                        |
+| [[zig:zig_common.state.privateOk]]        | none                                                        |
+| [[zig:zig_common.state.openPrivate]]      | [[zig:zig_common.state.Error]]                              |
+| [[zig:zig_common.state.lockExclusive]]    | [[zig:zig_common.state.LockError]]                          |
+| [[zig:zig_common.state.readPrivate]]      | [[zig:zig_common.state.Error]], =Allocator.Error= |
+| [[zig:zig_common.state.writePrivate]]     | [[zig:zig_common.state.Error]], =Allocator.Error= |
+
+*** =zig_common.json=
+
+Error sets: [[zig:zig_common.json.ParseError]], [[zig:zig_common.json.DecodeError]].
+
+| Function                                   | Error set                              |
+|--------------------------------------------+----------------------------------------|
+| [[zig:zig_common.json.Value.get]]          | none                                   |
+| [[zig:zig_common.json.Py.s]]               | none                                   |
+| [[zig:zig_common.json.Py.opt]]             | none                                   |
+| [[zig:zig_common.json.parse]]              | [[zig:zig_common.json.ParseError]]     |
+| [[zig:zig_common.json.decodeCache]]        | [[zig:zig_common.json.DecodeError]]    |
+| [[zig:zig_common.json.decodeWire]]         | [[zig:zig_common.json.DecodeError]]    |
+| [[zig:zig_common.json.writeCacheString]]   | =Allocator.Error=                      |
+| [[zig:zig_common.json.writeWireString]]    | =Allocator.Error=                      |
+| [[zig:zig_common.json.toPy]]               | [[zig:zig_common.json.DecodeError]]    |
+| [[zig:zig_common.json.pyTextLess]]         | none                                   |
+| [[zig:zig_common.json.dumps]]              | =Allocator.Error=                      |
+
+*** =zig_common.pytext=
+
+| Function                               | Error set         |
+|----------------------------------------+-------------------|
+| [[zig:zig_common.pytext.nextChar]]     | none              |
+| [[zig:zig_common.pytext.decodeReplace]]| =Allocator.Error= |
+| [[zig:zig_common.pytext.pyWhitespace]] | none              |
+| [[zig:zig_common.pytext.pyStrip]]      | none              |
+| [[zig:zig_common.pytext.pySplit]]      | =Allocator.Error= |
+| [[zig:zig_common.pytext.shellQuote]]   | =Allocator.Error= |
+
+*** =zig_common.atomic=
+
+Error set: [[zig:zig_common.atomic.Error]].
+
+| Function                                  | Error set                       |
+|-------------------------------------------+---------------------------------|
+| [[zig:zig_common.atomic.Why.deinit]]      | none                            |
+| [[zig:zig_common.atomic.Acls.eql]]        | none                            |
+| [[zig:zig_common.atomic.Acls.deinit]]     | none                            |
+| [[zig:zig_common.atomic.Metadata.deinit]] | none                            |
+| [[zig:zig_common.atomic.Faults.reach]]    | none                            |
+| [[zig:zig_common.atomic.Faults.fails]]    | none                            |
+| [[zig:zig_common.atomic.describe]]        | none                            |
+| [[zig:zig_common.atomic.readAcls]]        | [[zig:zig_common.atomic.Error]] |
+| [[zig:zig_common.atomic.readMetadata]]    | [[zig:zig_common.atomic.Error]] |
+| [[zig:zig_common.atomic.injected]]        | [[zig:zig_common.atomic.Error]] |
+| [[zig:zig_common.atomic.fileMode]]        | none                            |
+| [[zig:zig_common.atomic.fsyncDir]]        | [[zig:zig_common.sys.Error]]    |
+| [[zig:zig_common.atomic.makedirs]]        | [[zig:zig_common.sys.Error]]    |
+| [[zig:zig_common.atomic.atomicWrite]]     | [[zig:zig_common.atomic.Error]] |
+
 #+begin_export rst
 .. toctree::
    :hidden:
