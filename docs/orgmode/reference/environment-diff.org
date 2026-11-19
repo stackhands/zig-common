@@ -1,0 +1,19 @@
+#+TITLE: Environment diff
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Environment diff
+
+[[zig:zig_common.env.Builder.diff]] records how two builders differ.
+[[zig:zig_common.env.Diff.reverse]] exchanges the two sides of that record.
+[[zig:zig_common.env.Diff.patch]] applies one side to a builder.
+
+| Operation                              | What it does                                                                                                                                       |
+|----------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------|
+| [[zig:zig_common.env.Builder.diff]]    | For each name whose bytes differ, =prev= holds the starting value and =next= holds the resulting value. A name both sides set equally is in neither. |
+| [[zig:zig_common.env.Diff.reverse]]    | Returns a diff with =prev= and =next= exchanged.                                                                                                   |
+| [[zig:zig_common.env.Diff.patch]]      | Removes a name that =prev= has and =next= omits, then sets every name in =next=. A name already present keeps its place. A name added goes last. |
+
+Patching =diff(from, to)= onto =from= leaves =from= with the names and values =to= has.
+Patching the reverse of that diff onto =to= leaves =to= with the names and values =from= had.
+Values are the raw bytes the builder stores.
