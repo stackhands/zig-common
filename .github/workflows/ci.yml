@@ -69,4 +69,8 @@ jobs:
       - working-directory: tool
         env:
           ARGS: ${{ matrix.args }}
+          # setup-zig points the local cache at the workspace root. The tools'
+          # tests make their scratch directories under ./.zig-cache, as a
+          # checkout of the tool alone has it, so the cache goes back there.
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/tool/.zig-cache
         run: zig build $ARGS test --summary all --fork="$GITHUB_WORKSPACE/zig-common"
