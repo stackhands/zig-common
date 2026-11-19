@@ -964,6 +964,29 @@ test "openRegular reports not a regular file for a FIFO" {
     try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
+test "copyTo reports not a regular file for a FIFO destination" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-copy-fifo-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    const srcfd = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    try sys.writeAll(srcfd, "text\n");
+    sys.close(srcfd);
+    const src = try openRegular(d, "src", false);
+    defer sys.close(src.fd);
+    _ = try sys.call(linux.mknodat, .{ d, "dst", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+    try std.testing.expectError(error.NotRegularFile, copyTo(src.fd, src.stat, d, "dst"));
+    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
+}
+
 /// A filesystem's answer to each ACL form, GPFS native, generic NFSv4 and
 /// POSIX access: the bytes of a form it shows, or its errno. Any other name
 /// is unsupported. Records what copyAcls sets.
