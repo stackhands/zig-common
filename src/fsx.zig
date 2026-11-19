@@ -482,7 +482,7 @@ fn copyTreeContents(gpa: Allocator, src_fd: fd_t, dst_fd: fd_t, policy: MoveAcro
                 try sys.fsync(ddir);
             },
             DT.LNK => try copyLinkAt(src_fd, e.name, dst_fd, e.name),
-            else => return error.InvalidArgument,
+            else => return error.NotRegularFile,
         }
     }
     try sys.fsync(dst_fd);
@@ -1157,6 +1157,30 @@ test "moveAcross reports not a regular file for a FIFO source on EXDEV fallback"
     }
     _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
     try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "pipe", d, "dst", .{ .policy = .strict }, .{
+        .force_cross_device_rename = true,
+    }));
+    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
+}
+
+test "moveAcross reports not a regular file for a FIFO entry in a moved tree" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-tree-fifo-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = linux.mkdirat(d, "tree", 0o700);
+    const tree = try openDir(d, "tree", false);
+    defer sys.close(tree);
+    _ = try sys.call(linux.mknodat, .{ tree, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+
+    try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "tree", d, "dst", .{ .policy = .strict }, .{
         .force_cross_device_rename = true,
     }));
     try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
