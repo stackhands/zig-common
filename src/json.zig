@@ -355,12 +355,6 @@ pub fn decodeWire(arena: Allocator, raw: []const u8) DecodeError![]u8 {
     return out;
 }
 
-fn escapeCp(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) Allocator.Error!void {
-    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
-    defer out.* = aw.toArrayList();
-    writeEscapedCpTo(&aw.writer, cp) catch return error.OutOfMemory;
-}
-
 fn writeEscapedCpTo(w: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
     switch (cp) {
         '"' => try w.writeAll("\\\""),
@@ -407,9 +401,11 @@ pub fn writeCacheString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const 
 
 /// A JSON string of `bytes` as wire text: one code point per byte.
 pub fn writeWireString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
-    try out.append(gpa, '"');
-    for (bytes) |b| try escapeCp(out, gpa, b);
-    try out.append(gpa, '"');
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = aw.toArrayList();
+    aw.writer.writeByte('"') catch return error.OutOfMemory;
+    for (bytes) |b| writeEscapedCpTo(&aw.writer, b) catch return error.OutOfMemory;
+    aw.writer.writeByte('"') catch return error.OutOfMemory;
 }
 
 test "cache strings round-trip bytes that are not UTF-8" {
@@ -435,11 +431,18 @@ test "wire strings are one byte per code point" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    try writeWireString(&out, a, "x\xff\xc3\xa9");
-    try std.testing.expectEqualStrings("\"x\\u00ff\\u00c3\\u00a9\"", out.items);
-    const v = try parse(a, out.items);
-    try std.testing.expectEqualStrings("x\xff\xc3\xa9", try decodeWire(a, v.string));
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "x\xff\xc3\xa9", .want = "\"x\\u00ff\\u00c3\\u00a9\"" },
+        .{ .in = "\x00\x1fA", .want = "\"\\u0000\\u001fA\"" },
+    };
+    for (cases) |tc| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try writeWireString(&out, a, tc.in);
+        try std.testing.expectEqualStrings(tc.want, out.items);
+        const v = try parse(a, out.items);
+        try std.testing.expectEqualStrings(tc.in, try decodeWire(a, v.string));
+    }
     try std.testing.expectError(error.Encoding, decodeWire(a, "\\u0100"));
 }
 
