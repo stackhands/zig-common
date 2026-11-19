@@ -146,6 +146,7 @@ const WhichOptions = struct {
     result_path: ResultPath = .absolute,
     executable_check: ExecutableCheck = .regular_file,
     slash_name: SlashName = .reject,
+    slash_split_join: bool = false,
 };
 
 /// Search `path_env` (colon-separated, an empty entry meaning the current
@@ -180,7 +181,7 @@ fn resolveSearchPath(path_env: ?[]const u8, opts: WhichOptions) ?[]const u8 {
 }
 
 fn candidatePath(gpa: Allocator, dir_raw: []const u8, name: []const u8, opts: WhichOptions) Allocator.Error![]u8 {
-    if (dir_raw.len == 0 and opts.empty_path == .search_cwd) return std.fs.path.join(gpa, &.{ ".", name });
+    if (dir_raw.len == 0 and opts.empty_path == .search_cwd) return std.fs.path.join(gpa, &.{ "", name });
     return std.fs.path.join(gpa, &.{ dir_raw, name });
 }
 
@@ -196,7 +197,17 @@ fn whichWithOptions(gpa: Allocator, cwd_dir: fsx.fd_t, name: []const u8, path_en
     if (name.len == 0) return null;
     if (std.mem.findScalar(u8, name, '/') != null) return switch (opts.slash_name) {
         .reject => null,
-        .check_direct => if (isExecutableAt(cwd_dir, name, opts.executable_check)) try gpa.dupe(u8, name) else null,
+        .check_direct => blk: {
+            const candidate = if (opts.slash_split_join)
+                try shutilSplitJoinPosix(gpa, name)
+            else
+                try gpa.dupe(u8, name);
+            if (!isExecutableAt(cwd_dir, candidate, opts.executable_check)) {
+                gpa.free(candidate);
+                break :blk null;
+            }
+            break :blk candidate;
+        },
     };
 
     const path = resolveSearchPath(path_env, opts) orelse return null;
@@ -212,6 +223,48 @@ fn whichWithOptions(gpa: Allocator, cwd_dir: fsx.fd_t, name: []const u8, path_en
         };
     }
     return null;
+}
+
+fn shutilSplitPosix(path: []const u8) struct { head: []const u8, tail: []const u8 } {
+    const cut = (std.mem.lastIndexOfScalar(u8, path, '/') orelse return .{ .head = "", .tail = path }) + 1;
+    var head = path[0..cut];
+    const tail = path[cut..];
+    if (head.len > 0) {
+        var all_slash = true;
+        for (head) |c| if (c != '/') {
+            all_slash = false;
+            break;
+        };
+        if (!all_slash) head = std.mem.trimEnd(u8, head, "/");
+    }
+    return .{ .head = head, .tail = tail };
+}
+
+fn shutilJoinPosix(gpa: Allocator, head: []const u8, tail: []const u8) Allocator.Error![]u8 {
+    if (head.len == 0 or tail.len > 0 and tail[0] == '/') return gpa.dupe(u8, tail);
+    if (head[head.len - 1] == '/') return std.fmt.allocPrint(gpa, "{s}{s}", .{ head, tail });
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ head, tail });
+}
+
+fn shutilSplitJoinPosix(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
+    const parts = shutilSplitPosix(path);
+    return shutilJoinPosix(gpa, parts.head, parts.tail);
+}
+
+/// Search an executable path with POSIX `shutil.which` behavior:
+/// an unset PATH uses "/bin:/usr/bin", an empty PATH returns null, empty
+/// PATH entries search the current directory and keep relative hits, and a
+/// name containing '/' is checked directly after split/join normalization.
+pub fn whichShutil(gpa: Allocator, name: []const u8, path_env: ?[]const u8) Allocator.Error!?[]u8 {
+    return whichWithOptions(gpa, std.Io.Dir.cwd().handle, name, path_env, .{
+        .unset_path = .use_default,
+        .default_path = "/bin:/usr/bin",
+        .empty_path = .return_none,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    });
 }
 
 /// Resolve an executable name to an absolute path. A name with '/' is treated
@@ -933,6 +986,72 @@ test "which resolves executable candidates directly" {
 
     try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
     try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
+}
+
+test "whichShutil uses os.defpath when PATH is unset" {
+    const gpa = std.testing.allocator;
+    const found = (try whichShutil(gpa, "sh", null)).?;
+    defer gpa.free(found);
+    try std.testing.expect(found.len > 0 and found[0] == '/');
+    try std.testing.expectEqualStrings("sh", std.fs.path.basename(found));
+}
+
+test "whichShutil returns null for an empty PATH" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-empty");
+    defer fixture.deinit(gpa);
+    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", ""));
+}
+
+test "whichShutil empty entry search uses provided cwd handle" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-cwd-handle");
+    defer fixture.deinit(gpa);
+    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+    defer sys.close(dir);
+
+    const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", .{
+        .unset_path = .use_default,
+        .default_path = "/bin:/usr/bin",
+        .empty_path = .search_cwd,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    })).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings("tool.sh", found);
+}
+
+test "whichShutil slash normalization keeps //x and collapses a//x" {
+    const gpa = std.testing.allocator;
+    const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
+    defer gpa.free(collapsed);
+    try std.testing.expectEqualStrings("a/x", collapsed);
+
+    const double = try shutilSplitJoinPosix(gpa, "//x");
+    defer gpa.free(double);
+    try std.testing.expectEqualStrings("//x", double);
+
+    const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
+    defer gpa.free(dotted);
+    try std.testing.expectEqualStrings(".//a/x", dotted);
+}
+
+test "whichShutil slash paths ending in slash do not match regular files" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-slash-tail");
+    defer fixture.deinit(gpa);
+
+    const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
+    defer gpa.free(slash);
+    const found = (try whichShutil(gpa, slash, "")).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
+    defer gpa.free(trailing);
+    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
 }
 
 test "which, groupAlive, and run cover error and boundary paths" {
