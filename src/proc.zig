@@ -694,15 +694,29 @@ const ExecFixture = struct {
     base: []u8,
     exe_path: []u8,
     plain_path: []u8,
+
+    fn deinit(self: ExecFixture, gpa: Allocator) void {
+        fsx.deleteTree(gpa, fsx.cwd, self.base) catch {};
+        gpa.free(self.plain_path);
+        gpa.free(self.exe_path);
+        gpa.free(self.base);
+    }
 };
 
-fn makeExecFixture(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)!ExecFixture {
+fn fixtureBasePath(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)![]u8 {
     var cwd_buf: [sys.path_max]u8 = undefined;
     const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-proc-fixture-{s}-{d}", .{ here, tag, linux.getpid() });
+    return std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-proc-fixture-{s}-{d}", .{ here, tag, linux.getpid() });
+}
+
+fn makeExecFixtureWithCreated(gpa: Allocator, tag: []const u8, created_dir: ?*bool) (sys.Error || Allocator.Error)!ExecFixture {
+    if (created_dir) |state| state.* = false;
+    const base = try fixtureBasePath(gpa, tag);
     errdefer gpa.free(base);
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    if (created_dir) |state| state.* = true;
+    errdefer fsx.deleteTree(std.heap.page_allocator, fsx.cwd, base) catch {};
 
     const exe_path = try std.fs.path.join(gpa, &.{ base, "tool.sh" });
     errdefer gpa.free(exe_path);
@@ -716,6 +730,40 @@ fn makeExecFixture(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Erro
     defer sys.close(plain_fd);
     try sys.writeAll(plain_fd, "text\n");
     return .{ .base = base, .exe_path = exe_path, .plain_path = plain_path };
+}
+
+fn makeExecFixture(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)!ExecFixture {
+    return makeExecFixtureWithCreated(gpa, tag, null);
+}
+
+test "makeExecFixture removes scratch directories after setup failures" {
+    const gpa = std.testing.allocator;
+    var saw_success = false;
+    var saw_failure_after_dir = false;
+
+    for (0..64) |fail_index| {
+        var tag_buf: [64]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "oom-cleanup-{d}", .{fail_index});
+        const base = try fixtureBasePath(gpa, tag);
+        defer gpa.free(base);
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+
+        var created_dir = false;
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const fixture = makeExecFixtureWithCreated(failing.allocator(), tag, &created_dir) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, base, false));
+            if (created_dir) saw_failure_after_dir = true;
+            continue;
+        };
+
+        saw_success = true;
+        fixture.deinit(gpa);
+        break;
+    }
+
+    try std.testing.expect(saw_success);
+    try std.testing.expect(saw_failure_after_dir);
 }
 
 test "a closed stdout at start does not send the child's stderr to its stdout" {
@@ -759,10 +807,7 @@ test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
 test "resolveExecutable resolves slash paths and PATH lookup" {
     const gpa = std.testing.allocator;
     const fixture = try makeExecFixture(gpa, "resolve");
-    defer gpa.free(fixture.plain_path);
-    defer gpa.free(fixture.exe_path);
-    defer gpa.free(fixture.base);
-    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
+    defer fixture.deinit(gpa);
 
     const dir_path = try std.fs.path.join(gpa, &.{ fixture.base, "dir" });
     defer gpa.free(dir_path);
@@ -785,10 +830,7 @@ test "resolveExecutable resolves slash paths and PATH lookup" {
 test "resolveExecutable handles relative slash paths" {
     const gpa = std.testing.allocator;
     const fixture = try makeExecFixture(gpa, "resolve-relative");
-    defer gpa.free(fixture.plain_path);
-    defer gpa.free(fixture.exe_path);
-    defer gpa.free(fixture.base);
-    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
+    defer fixture.deinit(gpa);
 
     var cwd_buf: [sys.path_max:0]u8 = undefined;
     const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
@@ -810,10 +852,7 @@ test "resolveExecutable handles relative slash paths" {
 test "which resolves executable candidates directly" {
     const gpa = std.testing.allocator;
     const fixture = try makeExecFixture(gpa, "which");
-    defer gpa.free(fixture.plain_path);
-    defer gpa.free(fixture.exe_path);
-    defer gpa.free(fixture.base);
-    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
+    defer fixture.deinit(gpa);
 
     const found = (try which(gpa, "tool.sh", fixture.base)).?;
     defer gpa.free(found);
