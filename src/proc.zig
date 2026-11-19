@@ -141,6 +141,25 @@ fn isExecutableFile(path: []const u8) bool {
     return st.isReg();
 }
 
+/// Resolve an executable name to an absolute path. A name with '/' is treated
+/// as a path and returned as an absolute path when it names an executable
+/// regular file; other names are looked up in `path_env`, or in
+/// "/bin:/usr/bin" when `path_env` is null.
+pub fn resolveExecutable(gpa: Allocator, name: []const u8, path_env: ?[]const u8) Allocator.Error!?[]u8 {
+    if (name.len == 0) return null;
+    if (std.mem.findScalar(u8, name, '/') == null) return which(gpa, name, path_env orelse "/bin:/usr/bin");
+
+    const abs = if (std.fs.path.isAbsolute(name))
+        try gpa.dupe(u8, name)
+    else
+        try fsx.absPath(gpa, name);
+    if (!isExecutableFile(abs)) {
+        gpa.free(abs);
+        return null;
+    }
+    return abs;
+}
+
 fn nowMs() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
@@ -707,4 +726,43 @@ test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
     defer _ = linux.sigaction(.CHLD, &old, null);
     try std.testing.expectError(error.NoChild, run(std.testing.allocator, "/bin/sh", &.{ "sh", "-c", "exit 3" }, no_env, .{}));
     try std.testing.expectEqual(linux.E.CHILD, sys.last_errno);
+}
+
+test "resolveExecutable resolves slash paths and PATH lookup" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-resolve-exe-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+
+    const exe_path = try std.fs.path.join(gpa, &.{ base, "tool.sh" });
+    defer gpa.free(exe_path);
+    const exe_fd = try sys.openat(fsx.cwd, exe_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+    defer sys.close(exe_fd);
+    try sys.writeAll(exe_fd, "#!/bin/sh\nexit 0\n");
+
+    const nonexec_path = try std.fs.path.join(gpa, &.{ base, "plain.txt" });
+    defer gpa.free(nonexec_path);
+    const nonexec_fd = try sys.openat(fsx.cwd, nonexec_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer sys.close(nonexec_fd);
+    try sys.writeAll(nonexec_fd, "text\n");
+
+    const dir_path = try std.fs.path.join(gpa, &.{ base, "dir" });
+    defer gpa.free(dir_path);
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, dir_path)).ptr, 0o755);
+
+    const by_path = (try resolveExecutable(gpa, exe_path, null)).?;
+    defer gpa.free(by_path);
+    try std.testing.expectEqualStrings(exe_path, by_path);
+
+    const by_name = (try resolveExecutable(gpa, "tool.sh", base)).?;
+    defer gpa.free(by_name);
+    try std.testing.expectEqualStrings(exe_path, by_name);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, nonexec_path, null));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, dir_path, null));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, "not-present-tool", base));
 }
