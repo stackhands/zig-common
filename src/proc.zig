@@ -781,3 +781,28 @@ test "resolveExecutable resolves slash paths and PATH lookup" {
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, dir_path, null));
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, "not-present-tool", fixture.base));
 }
+
+test "resolveExecutable handles relative slash paths" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "resolve-relative");
+    defer gpa.free(fixture.plain_path);
+    defer gpa.free(fixture.exe_path);
+    defer gpa.free(fixture.base);
+    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
+
+    var cwd_buf: [sys.path_max:0]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const exe_rel = try std.fs.path.relativeAlloc(gpa, here, null, here, fixture.exe_path);
+    defer gpa.free(exe_rel);
+    const rel_exe = try std.fs.path.join(gpa, &.{ ".", exe_rel });
+    defer gpa.free(rel_exe);
+    const resolved = (try resolveExecutable(gpa, rel_exe, null)).?;
+    defer gpa.free(resolved);
+    try std.testing.expectEqualStrings(fixture.exe_path, resolved);
+
+    const plain_rel = try std.fs.path.relativeAlloc(gpa, here, null, here, fixture.plain_path);
+    defer gpa.free(plain_rel);
+    const rel_plain = try std.fs.path.join(gpa, &.{ ".", plain_rel });
+    defer gpa.free(rel_plain);
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, rel_plain, null));
+}
