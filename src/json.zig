@@ -356,39 +356,53 @@ pub fn decodeWire(arena: Allocator, raw: []const u8) DecodeError![]u8 {
 }
 
 fn escapeCp(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) Allocator.Error!void {
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = aw.toArrayList();
+    writeEscapedCpTo(&aw.writer, cp) catch return error.OutOfMemory;
+}
+
+fn writeEscapedCpTo(w: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
     switch (cp) {
-        '"' => try out.appendSlice(gpa, "\\\""),
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        0x08 => try out.appendSlice(gpa, "\\b"),
-        0x0c => try out.appendSlice(gpa, "\\f"),
-        ' '...'!', '#'...'[', ']'...'~' => try out.append(gpa, @intCast(cp)),
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0c => try w.writeAll("\\f"),
+        ' '...'!', '#'...'[', ']'...'~' => try w.writeByte(@intCast(cp)),
         else => {
             var b: [12]u8 = undefined;
             if (cp >= 0x10000) {
                 const v = cp - 0x10000;
                 const s = std.mem.print(&b, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) }) catch unreachable;
-                try out.appendSlice(gpa, s);
+                try w.writeAll(s);
             } else {
                 const s = std.mem.print(&b, "\\u{x:0>4}", .{cp}) catch unreachable;
-                try out.appendSlice(gpa, s);
+                try w.writeAll(s);
             }
         },
     }
 }
 
-/// A JSON string of `bytes` as the Python guard wrote cache text.
-pub fn writeCacheString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
-    try out.append(gpa, '"');
+/// A JSON string of `bytes` as the Python guard wrote cache text, written to
+/// `w` without allocating.
+pub fn writeCacheStringTo(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
     var i: usize = 0;
     while (i < bytes.len) {
         const ch = text.nextChar(bytes[i..]);
-        if (ch.cp) |cp| try escapeCp(out, gpa, cp) else try escapeCp(out, gpa, 0xDC00 + @as(u21, bytes[i]));
+        if (ch.cp) |cp| try writeEscapedCpTo(w, cp) else try writeEscapedCpTo(w, 0xDC00 + @as(u21, bytes[i]));
         i += ch.len;
     }
-    try out.append(gpa, '"');
+    try w.writeByte('"');
+}
+
+/// A JSON string of `bytes` as the Python guard wrote cache text.
+pub fn writeCacheString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = aw.toArrayList();
+    writeCacheStringTo(&aw.writer, bytes) catch return error.OutOfMemory;
 }
 
 /// A JSON string of `bytes` as wire text: one code point per byte.
@@ -427,6 +441,27 @@ test "wire strings are one byte per code point" {
     const v = try parse(a, out.items);
     try std.testing.expectEqualStrings("x\xff\xc3\xa9", try decodeWire(a, v.string));
     try std.testing.expectError(error.Encoding, decodeWire(a, "\\u0100"));
+}
+
+test "writeCacheStringTo matches writeCacheString over invalid, astral, and control bytes" {
+    const gpa = std.testing.allocator;
+    const sample = "a\"\xff\u{1F600}\n\x01";
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try writeCacheString(&list, gpa, sample);
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCacheStringTo(&w, sample);
+    try std.testing.expectEqualStrings(list.items, buf[0..w.end]);
+}
+
+test "writeCacheStringTo reports WriteFailed for a 64-byte fixed writer" {
+    const long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.WriteFailed, writeCacheStringTo(&w, long));
 }
 
 test "a truncated or malformed escape is an encoding error" {
