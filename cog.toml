@@ -1,0 +1,13 @@
+# `cog bump --minor` (or --patch, --major, --version X.Y.Z) on a release branch
+# sets the version in build.zig.zon, commits `chore(version): vX.Y.Z` and
+# creates the tag on that commit. RELEASING.md has the steps around it.
+tag_prefix = "v"
+ignore_merge_commits = true
+# CHANGELOG.md is built by towncrier from changelog.d/.
+disable_changelog = true
+branch_whitelist = ["chore/release-*"]
+
+pre_bump_hooks = [
+    "sed -i 's/^\\( *\\.version = \\)\"[0-9.]*\",$/\\1\"{{version}}\",/' build.zig.zon",
+    "grep -q '^| {{version}} |' COMPAT.md",
+]

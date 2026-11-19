@@ -2,6 +2,7 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
+| 0.11.0 | 0.17.1 | eb-keep-logs and eessi-arch-guard on their next releases (`syslog`: the RFC 5424 and journald emitter each carried a copy of); eb-keep-logs builds against it in CI |
 | 0.10.0 | 0.17.1 | eessi-arch-guard and eb-staged-rebuild (`fsx.mkdtemp`, `fsx.normPath`, `fsx.absPath`); eb-keep-logs builds against it in CI |
 | 0.9.0 | 0.17.1 | eessi-arch-guard on its next release (proc.killGroup); eb-keep-logs builds against it in CI |
 | 0.8.1 | 0.17.1 | eb-staged-rebuild, eb-keep-logs and eessi-arch-guard on their next releases (umask read without changing it, std names without deprecated aliases) |
