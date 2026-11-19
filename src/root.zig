@@ -19,6 +19,8 @@ pub const json = @import("json.zig");
 pub const pytext = @import("pytext.zig");
 /// Replacing a file whose owner, mode and ACLs must survive.
 pub const atomic = @import("atomic.zig");
+/// Events to syslog (RFC 5424) and systemd-journald.
+pub const syslog = @import("syslog.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -1,0 +1,1 @@
+`syslog`: the RFC 5424 and systemd-journald event emitter that eb-keep-logs and eessi-arch-guard each carried a copy of: `Target`, `parseTarget`, `parsePen`, `formatRfc5424`, `formatJournald` and `emit`.
