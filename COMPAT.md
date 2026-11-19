@@ -2,6 +2,9 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
+| 0.12.0 | 0.17.1 | eb-keep-logs (`syslog.emitFor` with its own `Identity`) and eessi-arch-guard (`syslog.send`, the transport under its own formatting) on their next releases; eb-keep-logs builds against it in CI |
+| 0.11.0 | 0.17.1 | eb-keep-logs and eessi-arch-guard on their next releases (`syslog`: the RFC 5424 and journald emitter each carried a copy of); eb-keep-logs builds against it in CI |
+| 0.10.0 | 0.17.1 | eessi-arch-guard and eb-staged-rebuild (`fsx.mkdtemp`, `fsx.normPath`, `fsx.absPath`); eb-keep-logs builds against it in CI |
 | 0.9.0 | 0.17.1 | eessi-arch-guard on its next release (proc.killGroup); eb-keep-logs builds against it in CI |
 | 0.8.1 | 0.17.1 | eb-local 2.0.0 (its first Zig release) to 2.4.0; eb-staged-rebuild, eb-keep-logs and eessi-arch-guard on their next releases (umask read without changing it, std names without deprecated aliases) |
 | 0.8.0 | 0.17.1 | eb-staged-rebuild 1.0.0 (errno text as Python prints it, from the errno the kernel gave); eb-keep-logs builds against it in CI |

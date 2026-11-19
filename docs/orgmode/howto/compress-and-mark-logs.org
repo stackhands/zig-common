@@ -1,0 +1,100 @@
+#+TITLE: Compress logs and keep them marked
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Compress logs and keep them marked
+
+Use this when a tool compresses build logs that may carry a licence number, as eb-keep-logs's =rotate= does.
+Such a log is marked by a line in its directory's =.licensed-logs= list, which names it by its absolute path, so a log renamed to =NAME.gz= is renamed in the list too or its mark is lost.
+[[zig:zig_common.logs.gzipInPlace]] compresses one file as =gzip -9= does, and [[zig:zig_common.logs.renameInList]] gives the list's new text.
+
+** Before you start
+
+- The tool depends on zig-common; [[file:../tutorials/first-tool.org][the tutorial]] sets that up.
+- The tool runs as the logs' owner, or as root: the archive gets the log's owner only when the tool may set it.
+
+** Steps
+
+1. Open the directory, and take its absolute path as the kernel has it, which is how the list names files:
+
+   #+begin_src zig
+   const dir = try common.fsx.openDir(common.fsx.cwd, args[1], false);
+   defer common.sys.close(dir);
+   var path_buf: [common.sys.path_max]u8 = undefined;
+   const here = try arena.dupe(u8, try common.fsx.realpathFd(dir, &path_buf));
+   #+end_src
+
+2. Compress each log, and record its old and new path:
+
+   #+begin_src zig
+   var renames: std.StringHashMapUnmanaged([]const u8) = .empty;
+   for (args[2..]) |name| {
+       try common.logs.gzipInPlace(gpa, init.io, dir, name);
+       const from = try arena.print("{s}/{s}", .{ here, name });
+       try renames.put(arena, from, try arena.print("{s}.gz", .{from}));
+   }
+   #+end_src
+
+   Each archive keeps the log's mode and its access and modification times, and its header carries the log's name.
+   The archive is written under a temporary name and renamed into place, and only then is the log removed.
+
+3. Rewrite the list when it names any of them:
+
+   #+begin_src zig
+   const list = common.fsx.openRegular(dir, common.logs.licensed_list, false) catch |err| switch (err) {
+       error.NotFound => return 0,
+       else => |e| return e,
+   };
+   defer common.sys.close(list.fd);
+   const text = try common.fsx.readAll(gpa, list.fd, 64 << 20);
+   defer gpa.free(text);
+   if (try common.logs.renameInList(gpa, text, &renames)) |new| {
+       defer gpa.free(new);
+       try common.fsx.replaceContents(gpa, dir, common.logs.licensed_list, new);
+   }
+   #+end_src
+
+   =renameInList= returns null when no line changed, and the list is then left as it is.
+   [[zig:zig_common.fsx.replaceContents]] keeps the list's mode and access control list (ACL).
+
+** Check that it worked
+
+For a run directory under =$SCRATCH= that held the two logs of a failed build:
+
+#+begin_src bash
+cd /scratch/alice/build-logs/20261116_101500
+ls -l
+gzip -t Example-1.0-GCCcore-15.2.0.failed.ebout.log.gz && echo "archive ok"
+cat .licensed-logs
+#+end_src
+
+#+begin_example
+total 88
+-rw------- 1 alice alice 42643 Nov 16 10:15 Example-1.0-GCCcore-15.2.0.failed.ebout.log.gz
+-rw------- 1 alice alice 42637 Nov 16 10:15 Example-1.0-GCCcore-15.2.0.stdout.log.gz
+archive ok
+/scratch/alice/build-logs/20261116_101500/Example-1.0-GCCcore-15.2.0.failed.ebout.log.gz
+/scratch/alice/build-logs/20261116_101500/Example-1.0-GCCcore-15.2.0.stdout.log.gz
+#+end_example
+
+The archives keep the logs' mode, 0600, and their modification time, 10:15.
+=gzip -lN= shows the name the header carries.
+
+** If it fails
+
+=gzipInPlace= refuses what =gzip= refuses, and leaves the log as it was.
+
+| Error                   | Cause                                                       | What to do                                                         |
+|-------------------------+-------------------------------------------------------------+--------------------------------------------------------------------|
+| =error.NotFound=        | no log has that name; an earlier run may have compressed it | look for =NAME.gz=                                                 |
+| =error.Exists=          | =NAME.gz= is already there                                  | compare the two, and remove the one that is not wanted             |
+| =error.TooManyLinks=    | the log has another hard link, which would keep its bytes   | find the other name with =find DIR -samefile NAME=, and remove one |
+| =error.SymLink=         | the name is a symbolic link                                 | compress the file it points to, in its own directory               |
+| =error.InvalidArgument= | the name is a directory, a named pipe or a device           | pass the names of regular files only                               |
+
+** Related
+
+- [[zig:zig_common.logs.GzipError]]: the errors =gzipInPlace= returns.
+- [[zig:zig_common.logs.licensed_list]]: the list's name and format.
+- [[https://github.com/stackhands/eb-keep-logs][eb-keep-logs]], which writes the list and rotates log trees.
+- [[https://www.gnu.org/software/gzip/manual/gzip.html][The gzip manual]], for the format and the checks.

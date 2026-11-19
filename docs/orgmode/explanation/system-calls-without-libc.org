@@ -1,0 +1,62 @@
+#+TITLE: System calls without a C library
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* System calls without a C library
+
+Why do the stackhands Zig tools make their Linux system calls through [[zig:zig_common.sys]], with no C library linked, and read their environment through [[zig:zig_common.env]]?
+
+** The problem
+
+Each tool is released as one file per architecture, such as =eb-keep-logs-VERSION-x86_64-linux-musl=, which an EasyBuild recipe installs as a module or a user copies to =~/.local/bin=.
+It has to start on whatever Linux distribution a login node or a compute node runs.
+A program linked against the GNU C Library (glibc) of the machine it was built on does not start where the installed glibc is older: the dynamic loader refuses it, naming the symbol version it lacks, such as =GLIBC_2.34=.
+
+Without a C library, a system call through Zig's =std.os.linux= returns a raw number, in which a failure is a negative errno.
+Each call site would have to decode it, and call again on =EINTR=.
+A signal that arrives during a call, such as =SIGCHLD= when a child exits, makes the call fail with =EINTR= without doing anything, and a tool that takes that for an error fails at random.
+The standard library's portable layer decodes the errno, but one it does not expect becomes =error.Unexpected= and the number is lost, so a message cannot say =[Errno 116] Stale file handle= as the Python tools did.
+
+A C library also holds the environment.
+When a name appears twice, =getenv(3)= returns the first entry, and so does Python's =os.environ=; bash and Zig 0.17.1's =std.process.Init.environ_map= keep the last.
+Given =A=1= and then =A=2=, a Python tool reads =1= and a Zig port that reads =environ_map= reads =2=, and a child started with the block as it came reads whichever entry its own runtime picks.
+
+** How zig-common handles it
+
+The tools link no C library.
+Each builds one static executable per architecture, x86_64 or aarch64, for the target =ARCH-linux-musl= at the architecture's baseline processor model.
+The executable has no dynamic loader and no shared library to find, and Zig 0.17.1 builds it for Linux 5.10 and later.
+
+[[zig:zig_common.sys]] is the one place the raw results are read.
+[[zig:zig_common.sys.call]] makes a call again on =EINTR= and turns any other errno into an error of [[zig:zig_common.sys.Error]].
+Several errnos share an error, as =EACCES= and =EPERM= share =AccessDenied=, because both are Python's =PermissionError=.
+[[zig:zig_common.sys.last_errno]] keeps the errno itself, so [[zig:zig_common.sys.describe]] prints the text Python prints, for the number the kernel gave.
+[[zig:zig_common.sys.openat]] adds =O_CLOEXEC= to every open, so no descriptor reaches a child unless =proc.run= hands it over.
+A path reaches the kernel through [[zig:zig_common.sys.z]], which refuses a zero byte (NUL), and a path of =path_max= (4096) bytes or more, before the call.
+
+[[zig:zig_common.env.Env]] reads the block of =NAME=value= strings the kernel passed, as bytes with no encoding assumed, and [[zig:zig_common.env.Env.get]] returns the first entry for a name, as =getenv= does.
+A child's environment is built with [[zig:zig_common.env.Builder]] from those first entries, with each name once, so the child sees the value the tool acted on.
+[[zig:zig_common.env.Builder.envp]] refuses an empty name, a name with ===, and a NUL byte, any of which would pass the child another variable than the one set.
+=environ_map= stays fine where no Python original sets the rule: the tutorial's =kernel= reads =PATH= from it.
+
+** What was considered and turned down
+
+- /Linking glibc./
+  A release would start only where glibc is at least as new as on the build machine, so it would have to be built on the oldest distribution in use.
+- /Linking musl statically./
+  It removes the version problem, but its calls still report a failure through =errno= and still fail with =EINTR=.
+  The tools would need the same layer around it, on top of a C library to build and keep up to date.
+- /Zig's portable file system and process layers./
+  They lose the errno of a failure they do not expect, which the messages need, and =environ_map= keeps the last of two entries, where the Python tools read the first.
+
+** Limits
+
+- zig-common builds for Linux only: another kernel has other calls and other numbers.
+- An errno that Zig's =linux.E= does not name prints as =[Errno N] Unknown error N=; [[file:../reference/compatibility.org][Compatibility]] lists where this differs from Python.
+- =last_errno= is one value per thread, which the next failed call overwrites, so a message reads it before the next call.
+
+** Further reading
+
+- [[man:syscalls(2)]], [[man:errno(3)]] and [[man:signal(7)]], for interrupted calls.
+- [[man:getenv(3)]] and [[man:environ(7)]].
+- [[file:../reference/api/zig/zig_common.sys.md][The sys module's API]] and [[file:../reference/api/zig/zig_common.env.md][the env module's API]].

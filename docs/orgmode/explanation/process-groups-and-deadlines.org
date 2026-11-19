@@ -1,0 +1,76 @@
+#+TITLE: Process groups and deadlines
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Process groups and deadlines
+
+Why does [[zig:zig_common.proc.run]] start every child in a session of its own, and stop the child's whole process group at a deadline, when the tool asked to run one program?
+
+** The problem
+
+A program a tool runs is seldom one process.
+A module command runs Lmod, =eb= runs compilers, and =sh -c 'a | b'= runs two programs.
+Each process the child starts inherits the child's stdout, the write end of the pipe the tool reads.
+
+When the deadline passes and the tool kills the child alone, the processes the child started go on.
+They still hold the pipe, so the tool's read never sees the end of the output, and the tool waits for a child that is gone.
+When the tool gives up and exits, they go on running on the node, writing into a directory that the next run uses.
+
+Three more events make a plain kill unsafe:
+
+- The child makes its own process group with [[man:setsid(2)]] after the fork, so for a moment there is no group to signal: =kill(-pgid)= then fails with =ESRCH=, and the child runs on.
+- A process id is free again once the child is reaped, and the kernel can give it to another user's process; a kill sent by that number after the reap reaches the wrong process.
+- A tool that is itself stopped, by =SIGTERM= from a batch system or =SIGINT= from a terminal, has to stop its child from a signal handler, where only a few system calls are safe.
+
+** How zig-common handles it
+
+The child leads a process group, and the group, not the process, is what =run= stops.
+
+1. The child calls =setsid= between the fork and the exec, so it leads a new session and a new process group, whose id is its process id.
+   Everything it starts is in that group, unless it makes a group of its own.
+2. =run= writes stdin and reads stdout and stderr in one =poll= loop while it waits, so a child that fills one pipe while the tool reads the other stalls neither.
+3. The deadline, =timeout_ms= after the start and 300 000 ms by default, is read from the monotonic clock.
+   At the deadline =run= sends =SIGTERM= to the group, waits =grace_ms=, 2 000 ms by default, for the child to exit, and then sends =SIGKILL= to the group.
+4. The child is not reaped until the group has been signalled.
+   Until then the exited child is a zombie, which keeps its process id and with it the group id, so no other process can have that number when the signal is sent.
+5. When the child exits on its own, =run= sends =SIGKILL= to the group as well: members that outlive the child are not the tool's to keep.
+
+[[zig:zig_common.proc.killGroup]] is the kill all of these use.
+It signals the group; while there is no such group, it signals the child, which starts nothing before its exec, and then the group again, in case the child made it in between.
+
+A tool stopped from outside stops its child through the same group.
+=Options.cancel= is a flag that a signal handler sets: the signal cuts the wait short, =run= sees the flag, kills the group and returns =error.Canceled=.
+A handler that must stop the group itself reads the group id from =Options.pgid_out= and calls =killGroup=, which makes only =kill= system calls and does not wait, or [[zig:zig_common.proc.stopGroup]], which also waits up to 10 s until no member of the group is alive.
+
+A grandchild that keeps the pipe open after the child exits holds =run= until the deadline, as the output has not ended; =run= then returns =error.TimedOut= and kills the group.
+With =Options.end_with_leader=, =run= returns when the child exits: it kills the group, keeps what the pipes already hold, and closes them.
+
+** What was considered and turned down
+
+- /Killing the child alone./
+  This is the problem above: its children keep the pipe, and run on after the tool.
+- /No deadline by default./
+  A module command on a stalled network file system would then hold the tool for as long as the mount hangs.
+  =run= has a deadline unless the caller passes =null=.
+- /The parent-death signal, =prctl(PR_SET_PDEATHSIG)=./
+  It signals the child when the thread that started it ends.
+  It does not reach the child's own children, and it does nothing at a deadline.
+- /A control group./
+  Writing =1= to a control group's =cgroup.kill= file, on Linux 5.14 and later, stops every process in it, even one that left the process group.
+  It needs a control group of the tool's own, which systemd or root must delegate, and the tools also run where there is none.
+
+** Limits
+
+- A member that calls =setsid= itself leaves the group, and nothing =run= sends reaches it.
+  =sh -c 'setsid sleep 32 > /dev/null & sleep 0.3; echo started'= leaves =sleep 32= running after =run= returns.
+  =end_with_leader= keeps such a process from holding the call while it holds the pipe, but does not stop it.
+- [[zig:zig_common.proc.groupAlive]], which =stopGroup= and =Options.wait_for_group= wait on, reads =/proc=.
+  A read that fails answers that the group is gone, so those waits are best effort.
+- A caller that ignores =SIGCHLD= makes the kernel reap the child at once and drop its status; =run= then returns =error.NoChild=.
+- With =Options.new_session= false the child stays in the tool's own group, and =run= signals the child alone.
+
+** Further reading
+
+- [[file:../howto/stop-a-slow-child.org][Stop a child program that runs too long]].
+- [[zig:zig_common.proc.Options]]: every option, with its default.
+- [[man:setsid(2)]], [[man:kill(2)]], [[man:waitid(2)]] for =WNOWAIT=, and [[man:credentials(7)]] for sessions, process groups and process ids.

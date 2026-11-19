@@ -1,0 +1,114 @@
+#+TITLE: Keep private state in /tmp
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Keep private state in /tmp
+
+Use this when a tool keeps a small file between runs in a directory every user may write, such as =/tmp= on =node017=, and must neither read a file another user put there nor write through a link another user made.
+[[zig:zig_common.state]] trusts a file only when the open descriptor is a regular file of this user with one link and no group or other permission bits, and replaces it by renaming a new file over it.
+[[file:../explanation/descriptor-checks.org][Checks on the descriptor, not the path]] says why.
+
+** Before you start
+
+- The tool depends on zig-common; [[file:../tutorials/first-tool.org][the tutorial]] sets that up.
+- The state is small: the tool reads it with a size limit, and a larger file counts as no state.
+
+** Steps
+
+1. Choose the lock by which runs it must keep apart:
+
+   | Lock                                   | Keeps apart                                                                                         | Files                                       |
+   |----------------------------------------+-----------------------------------------------------------------------------------------------------+---------------------------------------------|
+   | [[zig:zig_common.state.lockExclusive]] | runs of the tool on one machine                                                                     | one lock file the tool names                |
+   | [[zig:zig_common.state.RootLock]]      | runs on every node that shares a state directory, where the file system keeps record locks coherent | =.lock= and =.lock.posix= in that directory |
+
+   The steps that follow use =lockExclusive=, for files in =/tmp=.
+
+2. Name the files after the user id, so that two users never want the same name:
+
+   #+begin_src zig
+   const uid = common.sys.getuid();
+   var name_buf: [64]u8 = undefined;
+   const name = try std.fmt.bufPrint(&name_buf, "example-tool-{d}.state", .{uid});
+   var lock_buf: [64]u8 = undefined;
+   const lock_name = try std.fmt.bufPrint(&lock_buf, "example-tool-{d}.lock", .{uid});
+   #+end_src
+
+3. Open =/tmp= once, then open and lock the lock file through it:
+
+   #+begin_src zig
+   const tmp = try common.fsx.openDir(common.fsx.cwd, "/tmp", false);
+   defer common.sys.close(tmp);
+   const lock = try common.state.openPrivate(tmp, lock_name, true) orelse
+       common.cli.die("tool", "/tmp/{s} is not a private file of this user", .{lock_name});
+   defer common.sys.close(lock);
+   common.state.lockExclusive(lock, 10_000) catch |err| switch (err) {
+       error.TimedOut => common.cli.die("tool", "another run holds /tmp/{s}", .{lock_name}),
+       else => |e| return e,
+   };
+   #+end_src
+
+   [[zig:zig_common.state.openPrivate]] with =create= true makes the file mode 0600 when it is absent, and returns null when the name is anything but a private file of this user.
+   The lock goes when the descriptor is closed, at the latest when the tool exits.
+
+4. Read the state, and write the next one.
+   The example counts its runs:
+
+   #+begin_src zig
+   const old = try common.state.readPrivate(gpa, tmp, name, 64 * 1024);
+   defer if (old) |o| gpa.free(o);
+   const runs: u32 = if (old) |o| std.fmt.parseInt(u32, std.mem.trimEnd(u8, o, "\n"), 10) catch 0 else 0;
+   var out_buf: [16]u8 = undefined;
+   const bytes = try std.fmt.bufPrint(&out_buf, "{d}\n", .{runs + 1});
+   try common.state.writePrivate(gpa, tmp, name, bytes);
+   common.cli.out("run {d}\n", .{runs + 1});
+   #+end_src
+
+   [[zig:zig_common.state.readPrivate]] returns null for a file that is absent, larger than the limit or not private, so the tool starts over instead of trusting it.
+   [[zig:zig_common.state.writePrivate]] writes =.NAME.PID.RANDOM.tmp= with mode 0600 and renames it over the name.
+
+** Check that it worked
+
+Run the tool twice, and list its files:
+
+#+begin_src bash
+tool
+tool
+ls -l /tmp/example-tool-$(id -u).*
+#+end_src
+
+#+begin_example
+run 1
+run 2
+-rw------- 1 alice alice 0 Nov 16 15:27 /tmp/example-tool-1000.lock
+-rw------- 1 alice alice 2 Nov 16 15:27 /tmp/example-tool-1000.state
+#+end_example
+
+Make the state file readable by others, and run the tool again:
+
+#+begin_src bash
+chmod 644 /tmp/example-tool-$(id -u).state
+tool
+#+end_src
+
+#+begin_example
+run 1
+#+end_example
+
+The file was not trusted, so the count started over, and the file is mode 0600 again.
+
+** If it fails
+
+=cli.die= exits with status 2.
+
+| Message                                                                | Cause                                                                                                   | What to do                                                                                               |
+|------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------|
+| =tool: another run holds /tmp/example-tool-1000.lock=                  | another run kept the lock for all of the 10 000 ms                                                      | let that run finish; its lock goes when it exits                                                         |
+| =tool: /tmp/example-tool-1000.lock is not a private file of this user= | the name is a symbolic link, a named pipe, a file with group or other bits, or a file another user owns | look at it with =ls -l=; remove it if it is yours                                                        |
+| =error.AccessDenied= from =readPrivate= or =writePrivate=              | another user's file has the state's name, and the sticky bit of =/tmp= lets only its owner replace it   | a file at your user id's name from another user was put there on purpose: tell the node's administrators |
+
+** Related
+
+- [[zig:zig_common.state.privateOk]]: the test every file passes.
+- [[zig:zig_common.state.RootLock]], for a state directory that several nodes share.
+- [[man:flock(2)]] and [[man:fcntl(2)]], for the two kinds of lock.

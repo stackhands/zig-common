@@ -11,10 +11,15 @@ const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
+/// The child's environment block, as execve(2) takes it; `env.Builder.envp`
+/// makes one.
 pub const Envp = [*:null]const ?[*:0]const u8;
 
+/// How the child ended.
 pub const Term = union(enum) {
+    /// Its exit status, 0 to 255.
     exited: u8,
+    /// The number of the signal that killed it.
     signaled: u32,
 
     /// The shell's view of the status: the exit code, or 128 + signal.
@@ -26,6 +31,9 @@ pub const Term = union(enum) {
     }
 };
 
+/// How `run` starts the child and waits for it. By default stdout may be
+/// up to 1 MiB, stderr goes to /dev/null, and the child's process group is
+/// killed 300 000 ms after the start.
 pub const Options = struct {
     /// Bytes written to the child's stdin, which is then closed; null means
     /// stdin is /dev/null.
@@ -71,40 +79,211 @@ pub const Options = struct {
     exec_error: bool = false,
 };
 
+/// What `run` returns once the child has ended: how, and what it wrote.
+/// The two outputs are allocated from the allocator given to `run`;
+/// `deinit` frees them.
 pub const Result = struct {
     term: Term,
+    /// What the child wrote to stdout, at most `Options.stdout_limit`
+    /// bytes.
     stdout: []u8,
+    /// What the child wrote to stderr, at most `Options.stderr_limit`
+    /// bytes; empty when that is 0.
     stderr: []u8,
 
+    /// Free `stdout` and `stderr`, with the allocator `run` was given.
     pub fn deinit(r: Result, gpa: Allocator) void {
         gpa.free(r.stdout);
         gpa.free(r.stderr);
     }
 };
 
+/// The errors of `run`. Each of the first three kills the child's process
+/// group, or with `new_session` false the child, before it is returned:
+///
+/// - `error.TimedOut`: the child was still running at `Options.timeout_ms`
+/// - `error.Canceled`: `Options.cancel` was set
+/// - `error.StreamTooLong`: stdout passed `Options.stdout_limit`, with
+///   `stdout_overflow` at `.fail`
+/// - `error.NotAbsolute`: `exe` does not start with `/`
+/// - `error.InvalidArgument`: `exe` or an argument has a NUL byte
+/// - `error.NoChild`: the caller ignores SIGCHLD, so the status is lost
+///
+/// With `Options.exec_error`, a failed exec is its errno's `sys.Error`,
+/// such as `error.NotFound` for ENOENT. Otherwise it is a child that
+/// exits 127.
 pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut, Canceled, NotAbsolute };
+
+const PathUnset = enum {
+    none,
+    use_default,
+};
+
+const EmptyPath = enum {
+    return_none,
+    search_cwd,
+};
+
+const ResultPath = enum {
+    absolute,
+    candidate,
+};
+
+const ExecutableCheck = enum {
+    regular_file,
+    not_directory,
+};
+
+const SlashName = enum {
+    reject,
+    check_direct,
+};
+
+const WhichOptions = struct {
+    unset_path: PathUnset = .none,
+    default_path: []const u8 = "",
+    empty_path: EmptyPath = .return_none,
+    result_path: ResultPath = .absolute,
+    executable_check: ExecutableCheck = .regular_file,
+    slash_name: SlashName = .reject,
+    slash_split_join: bool = false,
+};
 
 /// Search `path_env` (colon-separated, an empty entry meaning the current
 /// directory, as execvp does) for an executable regular file `name`.
 /// Returns an absolute path to it, without resolving symbolic links, or
 /// null. A name containing '/' is not looked up.
 pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.Error!?[]u8 {
-    if (std.mem.findScalar(u8, name, '/') != null or name.len == 0) return null;
-    var it = std.mem.splitScalar(u8, path_env, ':');
+    return whichWithOptions(gpa, std.Io.Dir.cwd().handle, name, path_env, .{ .empty_path = .search_cwd });
+}
+
+fn isExecutableAt(cwd_dir: fsx.fd_t, path: []const u8, check: ExecutableCheck) bool {
+    var zb: [sys.path_max:0]u8 = undefined;
+    const z = sys.z(&zb, path) catch return false;
+    if (linux.errno(linux.faccessat(cwd_dir, z.ptr, linux.X_OK, 0)) != .SUCCESS) return false;
+    const st = fsx.statAt(cwd_dir, path, true) catch return false;
+    return switch (check) {
+        .regular_file => st.isReg(),
+        .not_directory => !st.isDir(),
+    };
+}
+
+fn isExecutableFile(path: []const u8) bool {
+    return isExecutableAt(fsx.cwd, path, .regular_file);
+}
+
+fn resolveSearchPath(path_env: ?[]const u8, opts: WhichOptions) ?[]const u8 {
+    if (path_env) |path| return path;
+    return switch (opts.unset_path) {
+        .none => null,
+        .use_default => opts.default_path,
+    };
+}
+
+fn candidatePath(gpa: Allocator, dir_raw: []const u8, name: []const u8, opts: WhichOptions) Allocator.Error![]u8 {
+    if (dir_raw.len == 0 and opts.empty_path == .search_cwd) return std.fs.path.join(gpa, &.{ "", name });
+    return std.fs.path.join(gpa, &.{ dir_raw, name });
+}
+
+fn toAbsoluteAt(gpa: Allocator, cwd_dir: fsx.fd_t, candidate: []const u8, dir_raw: []const u8, opts: WhichOptions) Allocator.Error!?[]u8 {
+    if (candidate[0] == '/') return try gpa.dupe(u8, candidate);
+    const base_dir = if (dir_raw.len == 0 and opts.empty_path == .search_cwd) "." else dir_raw;
+    var rb: [sys.path_max]u8 = undefined;
+    const dir_abs = fsx.realpath(cwd_dir, base_dir, &rb) catch return null;
+    return try std.fs.path.join(gpa, &.{ dir_abs, std.fs.path.basename(candidate) });
+}
+
+fn whichWithOptions(gpa: Allocator, cwd_dir: fsx.fd_t, name: []const u8, path_env: ?[]const u8, opts: WhichOptions) Allocator.Error!?[]u8 {
+    if (name.len == 0) return null;
+    if (std.mem.findScalar(u8, name, '/') != null) return switch (opts.slash_name) {
+        .reject => null,
+        .check_direct => blk: {
+            const candidate = if (opts.slash_split_join)
+                try shutilSplitJoinPosix(gpa, name)
+            else
+                try gpa.dupe(u8, name);
+            if (!isExecutableAt(cwd_dir, candidate, opts.executable_check)) {
+                gpa.free(candidate);
+                break :blk null;
+            }
+            break :blk candidate;
+        },
+    };
+
+    const path = resolveSearchPath(path_env, opts) orelse return null;
+    if (path.len == 0 and opts.empty_path == .return_none) return null;
+    var it = std.mem.splitScalar(u8, path, ':');
     while (it.next()) |dir_raw| {
-        const cand = try std.fs.path.join(gpa, &.{ if (dir_raw.len == 0) "." else dir_raw, name });
+        const cand = try candidatePath(gpa, dir_raw, name, opts);
         defer gpa.free(cand);
-        var zb: [sys.path_max:0]u8 = undefined;
-        const zc = sys.z(&zb, cand) catch continue;
-        if (linux.errno(linux.faccessat(linux.AT.FDCWD, zc.ptr, linux.X_OK, 0)) != .SUCCESS) continue;
-        const st = fsx.statAt(fsx.cwd, cand, true) catch continue;
-        if (!st.isReg()) continue;
-        if (cand[0] == '/') return try gpa.dupe(u8, cand);
-        var rb: [sys.path_max]u8 = undefined;
-        const dir_abs = fsx.realpath(fsx.cwd, if (dir_raw.len == 0) "." else dir_raw, &rb) catch continue;
-        return try std.fs.path.join(gpa, &.{ dir_abs, name });
+        if (!isExecutableAt(cwd_dir, cand, opts.executable_check)) continue;
+        return switch (opts.result_path) {
+            .candidate => try gpa.dupe(u8, cand),
+            .absolute => (try toAbsoluteAt(gpa, cwd_dir, cand, dir_raw, opts)) orelse continue,
+        };
     }
     return null;
+}
+
+fn shutilSplitPosix(path: []const u8) struct { head: []const u8, tail: []const u8 } {
+    const cut = (std.mem.lastIndexOfScalar(u8, path, '/') orelse return .{ .head = "", .tail = path }) + 1;
+    var head = path[0..cut];
+    const tail = path[cut..];
+    if (head.len > 0) {
+        var all_slash = true;
+        for (head) |c| if (c != '/') {
+            all_slash = false;
+            break;
+        };
+        if (!all_slash) head = std.mem.trimEnd(u8, head, "/");
+    }
+    return .{ .head = head, .tail = tail };
+}
+
+fn shutilJoinPosix(gpa: Allocator, head: []const u8, tail: []const u8) Allocator.Error![]u8 {
+    if (head.len == 0 or tail.len > 0 and tail[0] == '/') return gpa.dupe(u8, tail);
+    if (head[head.len - 1] == '/') return std.fmt.allocPrint(gpa, "{s}{s}", .{ head, tail });
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ head, tail });
+}
+
+fn shutilSplitJoinPosix(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
+    const parts = shutilSplitPosix(path);
+    return shutilJoinPosix(gpa, parts.head, parts.tail);
+}
+
+/// Search an executable path with POSIX `shutil.which` behavior:
+/// an unset PATH uses "/bin:/usr/bin", an empty PATH returns null, empty
+/// PATH entries search the current directory and keep relative hits, and a
+/// name containing '/' is checked directly after split/join normalization.
+pub fn whichShutil(gpa: Allocator, name: []const u8, path_env: ?[]const u8) Allocator.Error!?[]u8 {
+    return whichWithOptions(gpa, std.Io.Dir.cwd().handle, name, path_env, .{
+        .unset_path = .use_default,
+        .default_path = "/bin:/usr/bin",
+        .empty_path = .return_none,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    });
+}
+
+/// Resolve an executable name to an absolute path. A name with '/' is treated
+/// as a path and returned as an absolute path when it names an executable
+/// regular file; other names are looked up in `path_env`, or in
+/// "/bin:/usr/bin" when `path_env` is null.
+pub fn resolveExecutable(gpa: Allocator, name: []const u8, path_env: ?[]const u8) Allocator.Error!?[]u8 {
+    if (name.len == 0) return null;
+    if (std.mem.findScalar(u8, name, '/') == null) return which(gpa, name, path_env orelse "/bin:/usr/bin");
+
+    const abs = if (std.fs.path.isAbsolute(name))
+        try gpa.dupe(u8, name)
+    else
+        try fsx.absPath(gpa, name);
+    if (!isExecutableFile(abs)) {
+        gpa.free(abs);
+        return null;
+    }
+    return abs;
 }
 
 fn nowMs() i64 {
@@ -637,6 +816,82 @@ fn shPrints(script: []const u8, stdin: ?[]const u8, want: []const u8) u8 {
     return 1;
 }
 
+const ExecFixture = struct {
+    base: []u8,
+    exe_path: []u8,
+    plain_path: []u8,
+
+    fn deinit(self: ExecFixture, gpa: Allocator) void {
+        fsx.deleteTree(gpa, fsx.cwd, self.base) catch {};
+        gpa.free(self.plain_path);
+        gpa.free(self.exe_path);
+        gpa.free(self.base);
+    }
+};
+
+fn fixtureBasePath(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)![]u8 {
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    return std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-proc-fixture-{s}-{d}", .{ here, tag, linux.getpid() });
+}
+
+fn makeExecFixtureWithCreated(gpa: Allocator, tag: []const u8, created_dir: ?*bool) (sys.Error || Allocator.Error)!ExecFixture {
+    if (created_dir) |state| state.* = false;
+    const base = try fixtureBasePath(gpa, tag);
+    errdefer gpa.free(base);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    if (created_dir) |state| state.* = true;
+    errdefer fsx.deleteTree(std.heap.page_allocator, fsx.cwd, base) catch {};
+
+    const exe_path = try std.fs.path.join(gpa, &.{ base, "tool.sh" });
+    errdefer gpa.free(exe_path);
+    const exe_fd = try sys.openat(fsx.cwd, exe_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+    defer sys.close(exe_fd);
+    try sys.writeAll(exe_fd, "#!/bin/sh\nexit 0\n");
+
+    const plain_path = try std.fs.path.join(gpa, &.{ base, "plain.txt" });
+    errdefer gpa.free(plain_path);
+    const plain_fd = try sys.openat(fsx.cwd, plain_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer sys.close(plain_fd);
+    try sys.writeAll(plain_fd, "text\n");
+    return .{ .base = base, .exe_path = exe_path, .plain_path = plain_path };
+}
+
+fn makeExecFixture(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)!ExecFixture {
+    return makeExecFixtureWithCreated(gpa, tag, null);
+}
+
+test "makeExecFixture removes scratch directories after setup failures" {
+    const gpa = std.testing.allocator;
+    var saw_success = false;
+    var saw_failure_after_dir = false;
+
+    for (0..64) |fail_index| {
+        var tag_buf: [64]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "oom-cleanup-{d}", .{fail_index});
+        const base = try fixtureBasePath(gpa, tag);
+        defer gpa.free(base);
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+
+        var created_dir = false;
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const fixture = makeExecFixtureWithCreated(failing.allocator(), tag, &created_dir) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, base, false));
+            if (created_dir) saw_failure_after_dir = true;
+            continue;
+        };
+
+        saw_success = true;
+        fixture.deinit(gpa);
+        break;
+    }
+
+    try std.testing.expect(saw_success);
+    try std.testing.expect(saw_failure_after_dir);
+}
+
 test "a closed stdout at start does not send the child's stderr to its stdout" {
     try expectChildPasses(struct {
         fn body() u8 {
@@ -673,4 +928,156 @@ test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
     defer _ = linux.sigaction(.CHLD, &old, null);
     try std.testing.expectError(error.NoChild, run(std.testing.allocator, "/bin/sh", &.{ "sh", "-c", "exit 3" }, no_env, .{}));
     try std.testing.expectEqual(linux.E.CHILD, sys.last_errno);
+}
+
+test "resolveExecutable resolves slash paths and PATH lookup" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "resolve");
+    defer fixture.deinit(gpa);
+
+    const dir_path = try std.fs.path.join(gpa, &.{ fixture.base, "dir" });
+    defer gpa.free(dir_path);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, dir_path)).ptr, 0o755);
+
+    const by_path = (try resolveExecutable(gpa, fixture.exe_path, null)).?;
+    defer gpa.free(by_path);
+    try std.testing.expectEqualStrings(fixture.exe_path, by_path);
+
+    const by_name = (try resolveExecutable(gpa, "tool.sh", fixture.base)).?;
+    defer gpa.free(by_name);
+    try std.testing.expectEqualStrings(fixture.exe_path, by_name);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, fixture.plain_path, null));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, dir_path, null));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, "not-present-tool", fixture.base));
+}
+
+test "resolveExecutable handles relative slash paths" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "resolve-relative");
+    defer fixture.deinit(gpa);
+
+    var cwd_buf: [sys.path_max:0]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const exe_rel = try std.fs.path.relativeAlloc(gpa, here, null, here, fixture.exe_path);
+    defer gpa.free(exe_rel);
+    const rel_exe = try std.fs.path.join(gpa, &.{ ".", exe_rel });
+    defer gpa.free(rel_exe);
+    const resolved = (try resolveExecutable(gpa, rel_exe, null)).?;
+    defer gpa.free(resolved);
+    try std.testing.expectEqualStrings(fixture.exe_path, resolved);
+
+    const plain_rel = try std.fs.path.relativeAlloc(gpa, here, null, here, fixture.plain_path);
+    defer gpa.free(plain_rel);
+    const rel_plain = try std.fs.path.join(gpa, &.{ ".", plain_rel });
+    defer gpa.free(rel_plain);
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, rel_plain, null));
+}
+
+test "which resolves executable candidates directly" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which");
+    defer fixture.deinit(gpa);
+
+    const found = (try which(gpa, "tool.sh", fixture.base)).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
+}
+
+test "whichShutil uses os.defpath when PATH is unset" {
+    const gpa = std.testing.allocator;
+    const found = (try whichShutil(gpa, "sh", null)).?;
+    defer gpa.free(found);
+    try std.testing.expect(found.len > 0 and found[0] == '/');
+    try std.testing.expectEqualStrings("sh", std.fs.path.basename(found));
+}
+
+test "whichShutil returns null for an empty PATH" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-empty");
+    defer fixture.deinit(gpa);
+    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", ""));
+}
+
+test "whichShutil empty entry search uses provided cwd handle" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-cwd-handle");
+    defer fixture.deinit(gpa);
+    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+    defer sys.close(dir);
+
+    const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", .{
+        .unset_path = .use_default,
+        .default_path = "/bin:/usr/bin",
+        .empty_path = .search_cwd,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    })).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings("tool.sh", found);
+}
+
+test "whichShutil slash normalization keeps //x and collapses a//x" {
+    const gpa = std.testing.allocator;
+    const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
+    defer gpa.free(collapsed);
+    try std.testing.expectEqualStrings("a/x", collapsed);
+
+    const double = try shutilSplitJoinPosix(gpa, "//x");
+    defer gpa.free(double);
+    try std.testing.expectEqualStrings("//x", double);
+
+    const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
+    defer gpa.free(dotted);
+    try std.testing.expectEqualStrings(".//a/x", dotted);
+}
+
+test "whichShutil slash paths ending in slash do not match regular files" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which-shutil-slash-tail");
+    defer fixture.deinit(gpa);
+
+    const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
+    defer gpa.free(slash);
+    const found = (try whichShutil(gpa, slash, "")).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
+    defer gpa.free(trailing);
+    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
+}
+
+test "which, groupAlive, and run cover error and boundary paths" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "a/b", "/bin:/usr/bin"));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "no-such-zig-common-tool", "/bin:/usr/bin"));
+
+    const fixture = try makeExecFixture(gpa, "which-err");
+    defer fixture.deinit(gpa);
+    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+    defer sys.close(dir);
+    _ = linux.mkdirat(dir, "sub", 0o755);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "sub", fixture.base));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
+    const found = (try which(gpa, "tool.sh", fixture.base)).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    try std.testing.expect(!groupAlive(2_000_000_000));
+    killGroup(0, .TERM);
+    stopGroup(0);
+
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/\x00sh", &.{"sh"}, no_env, .{}));
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/sh", &.{ "sh", "bad\x00arg" }, no_env, .{}));
+    try std.testing.expectError(error.StreamTooLong, run(gpa, "/bin/sh", &.{ "sh", "-c", "printf 12345678" }, no_env, .{ .stdout_limit = 4 }));
+    try std.testing.expectError(error.NotFound, run(gpa, "/no/such/zig-common-exe", &.{"x"}, no_env, .{ .exec_error = true }));
 }

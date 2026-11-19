@@ -12,6 +12,7 @@ const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// The ACL forms `atomicWrite` keeps, most native first: `fsx.acl_attributes`.
 pub const acl_attributes = fsx.acl_attributes;
 const posix_access = "system.posix_acl_access";
 
@@ -29,6 +30,9 @@ pub const Ops = struct {
     fchmod: *const fn (fd: sys.fd_t, mode: u32) usize = realChmod,
     fchown: *const fn (fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize = realChown,
     fsync: *const fn (fd: sys.fd_t) usize = realFsync,
+    openat: *const fn (dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize = realOpenat,
+    write: *const fn (fd: sys.fd_t, bytes: []const u8) usize = realWrite,
+    renameat: *const fn (old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize = realRenameat,
     geteuid: *const fn () linux.uid_t = realGeteuid,
     created: *const fn (fd: sys.fd_t) void = realCreated,
 };
@@ -65,6 +69,15 @@ fn realChown(fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize {
 fn realFsync(fd: sys.fd_t) usize {
     return linux.fsync(fd);
 }
+fn realOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
+    return linux.openat(dir, path, flags, mode);
+}
+fn realWrite(fd: sys.fd_t, bytes: []const u8) usize {
+    return linux.write(fd, bytes.ptr, bytes.len);
+}
+fn realRenameat(old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize {
+    return linux.renameat(old_dir, old_path, new_dir, new_path);
+}
 fn realGeteuid() linux.uid_t {
     return linux.geteuid();
 }
@@ -75,6 +88,29 @@ fn op(f: anytype, args: anytype) sys.Error!usize {
     while (true) {
         if (try sys.result(@call(.auto, f, args))) |r| return r;
     }
+}
+
+fn openTemp(path: []const u8, flags: sys.O, mode: linux.mode_t) sys.Error!sys.fd_t {
+    var zb: [sys.path_max:0]u8 = undefined;
+    var f = flags;
+    f.CLOEXEC = true;
+    const rc = try op(ops.openat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, f, mode });
+    return @intCast(rc);
+}
+
+fn writeTemp(fd: sys.fd_t, bytes: []const u8) sys.Error!void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try op(ops.write, .{ fd, bytes[off..] });
+        if (n == 0) return error.NoSpace;
+        off += n;
+    }
+}
+
+fn renameTemp(old_path: []const u8, new_path: []const u8) sys.Error!void {
+    var za: [sys.path_max:0]u8 = undefined;
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = try op(ops.renameat, .{ fsx.cwd, (try sys.z(&za, old_path)).ptr, fsx.cwd, (try sys.z(&zb, new_path)).ptr });
 }
 
 /// Python's OSError text for an error from one of the calls, so a message
@@ -92,14 +128,20 @@ pub fn describe(err: Error) []const u8 {
 /// message is allocated from the allocator given with `why` and belongs to
 /// the caller: `deinit` frees it.
 pub const Why = struct {
+    /// The reason for the refusal; empty until there is one.
     msg: []const u8 = "",
 
+    /// Free the message when it was allocated from `a`, and empty it. An
+    /// empty `Why` may be passed, and `deinit` may be called again.
     pub fn deinit(why: *Why, a: Allocator) void {
         if (why.msg.len > 0 and why.msg.ptr != unallocated_refusal.ptr) a.free(why.msg);
         why.* = .{};
     }
 };
 
+/// The errors of this module: `error.Refused`, with the reason in the
+/// caller's `Why`; `error.OutOfMemory`; or the `sys.Error` of a failed
+/// call, which `describe` words as Python does.
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
 /// The message of a refusal that could not allocate its own.
@@ -112,8 +154,11 @@ fn refuse(a: Allocator, why: *Why, comptime f: []const u8, args: anytype) Error 
 
 /// The value of each ACL attribute present, keyed by its name.
 pub const Acls = struct {
+    /// One slot per `acl_attributes` form, in that order: the attribute's
+    /// bytes, or null when the file does not have that form.
     present: [acl_attributes.len]?[]const u8 = .{ null, null, null },
 
+    /// True when `x` and `y` have the same forms, with the same bytes.
     pub fn eql(x: Acls, y: Acls) bool {
         for (x.present, y.present) |p, q| {
             if ((p == null) != (q == null)) return false;
@@ -128,10 +173,13 @@ pub const Acls = struct {
     }
 };
 
+/// The access metadata of a file, as `readMetadata` returns it: its stat,
+/// for the owner, group and mode, and its ACLs.
 pub const Metadata = struct {
     info: fsx.Stat,
     acls: Acls,
 
+    /// Free the ACL values, allocated from `a` by `readMetadata`.
     pub fn deinit(m: Metadata, a: Allocator) void {
         m.acls.deinit(a);
     }
@@ -283,10 +331,14 @@ fn restoreMetadata(a: Allocator, fd: sys.fd_t, metadata: ?Metadata, mode: u32, w
 /// In a replaceable build (tests, a tool's -Dtest-ops artifact) `fail_fn`
 /// can also make the step fail; in any other build it is never asked.
 pub const Faults = struct {
+    /// Passed to both functions.
     ctx: ?*anyopaque = null,
     reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
+    /// True makes the step fail. Asked only in a replaceable build.
     fail_fn: ?*const fn (?*anyopaque, []const u8) bool = null,
 
+    /// Call `reach_fn`, when there is one, with the name of the step about
+    /// to run.
     pub fn reach(f: Faults, step: []const u8) void {
         if (f.reach_fn) |r| r(f.ctx, step);
     }
@@ -350,6 +402,8 @@ pub fn fileMode(path: []const u8) u32 {
     return 0o644 & ~currentUmask();
 }
 
+/// Open `path` read-only and fsync it. For a directory, that makes a
+/// rename or a new name in it durable.
 pub fn fsyncDir(path: []const u8) sys.Error!void {
     const fd = try sys.openat(fsx.cwd, path, .{}, 0);
     defer sys.close(fd);
@@ -370,10 +424,18 @@ pub fn makedirs(path: []const u8) sys.Error!void {
     };
 }
 
+/// What `atomicWrite` gives the new file besides its bytes, and the names
+/// of its fault points.
 pub const WriteOptions = struct {
+    /// The permission bits. Null takes those of the metadata source, or,
+    /// for a new file without one, 0644 less the umask.
     mode: ?u32 = null,
+    /// A file whose owner, group, mode and ACLs the new file gets in place
+    /// of the existing file's.
     metadata_from: ?[]const u8 = null,
     faults: Faults = .{},
+    /// The first part of each fault point's name: `STEP.write`,
+    /// `STEP.fsync` and `STEP.rename`.
     step: []const u8 = "write",
 };
 
@@ -418,7 +480,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    const fd = try sys.openat(fsx.cwd, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    const fd = try openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     const created = fsx.fstat(fd) catch |err| {
         sys.close(fd);
         // Created above with O_EXCL, so it is this call's file.
@@ -429,7 +491,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     errdefer discard(tmp, created);
     {
         defer sys.close(fd);
-        try sys.writeAll(fd, data);
+        try writeTemp(fd, data);
         var inner: Why = .{};
         defer inner.deinit(a);
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
@@ -452,7 +514,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    try sys.renameat(fsx.cwd, tmp, fsx.cwd, path);
+    try renameTemp(tmp, path);
     try fsyncDir(parent);
 }
 

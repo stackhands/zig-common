@@ -9,6 +9,7 @@ const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 
 const Allocator = std.mem.Allocator;
+/// The errors of this module's calls: `sys.Error`.
 pub const Error = sys.Error;
 
 /// Regular, owned by `uid`, one link, mode & 0o077 == 0.
@@ -40,7 +41,13 @@ pub fn openPrivate(dir: fsx.fd_t, name: []const u8, create: bool) Error!?fsx.fd_
     return fd;
 }
 
+/// The errors of `lockExclusive`: the `sys.Error` of a failed flock, or
+/// `error.TimedOut` when another holder kept the lock past the timeout.
 pub const LockError = Error || error{TimedOut};
+
+/// The errors of `lockExclusiveCancel`: `LockError`, or `error.Canceled`
+/// when `cancel` is set while waiting.
+pub const LockCancelError = LockError || error{Canceled};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
 /// The deadline is read from the monotonic clock. A signal that cuts a
@@ -48,21 +55,35 @@ pub const LockError = Error || error{TimedOut};
 /// the clock again. A failure other than contention is the flock error,
 /// with its errno in `sys.last_errno`.
 pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
+    return lockExclusiveCancel(fd, timeout_ms, null) catch |err| switch (err) {
+        error.Canceled => unreachable,
+        else => |e| return e,
+    };
+}
+
+/// Like `lockExclusive`, also stopping with `error.Canceled` if `cancel`
+/// becomes true while waiting.
+pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
     const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
-    if (deadline == null) {
-        _ = try sys.call(linux.flock, .{ fd, std.posix.LOCK.EX });
+    if (deadline == null and cancel == null) {
+        _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
         return;
     }
     while (true) {
-        const rc = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        if (cancel) |c| if (c.load(.seq_cst)) return error.Canceled;
+        const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         switch (linux.errno(rc)) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
             else => return mapped(rc),
         }
-        const left = deadline.? - nowMs();
-        if (left <= 0) return error.TimedOut;
-        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(left, 20) * std.time.ns_per_ms) };
+        var sleep_ms: i64 = 20;
+        if (deadline) |dl| {
+            const left = dl - nowMs();
+            if (left <= 0) return error.TimedOut;
+            sleep_ms = @min(left, 20);
+        }
+        var ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(sleep_ms * std.time.ns_per_ms) };
         _ = linux.nanosleep(&ts, null);
     }
 }
@@ -205,14 +226,20 @@ test "a lock that fails reports its errno, with or without a timeout" {
 /// name is never opened, and the file behind a planted hard link, or a file
 /// another user owns, is never truncated.
 pub const RootLock = struct {
+    /// STATE_ROOT/.lock, with the flock held.
     gate: fsx.fd_t,
+    /// STATE_ROOT/.lock.posix, with the record lock held.
     posix: fsx.fd_t,
     /// The process that took the lock. A forked child that releases it only
     /// closes its descriptors: unlocking the shared gate would drop the
     /// parent's lock.
     owner: linux.pid_t,
 
+    /// The errors of `acquire`, beside the `sys.Error` of a failed call.
+    /// `error.OutOfMemory` stays in the set with the `gpa` argument; it is
+    /// not returned.
     pub const AcquireError = Error || error{
+        /// Another holder kept a lock past `timeout_ms`.
         Busy,
         /// STATE_ROOT/.lock.posix is not a regular file of this user with
         /// one link.
@@ -370,6 +397,8 @@ pub const LockOps = struct {
 
 var test_lock_ops: LockOps = .{};
 const real_lock_ops: LockOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`lock_ops.* = ...`); any other build points it at constant real calls.
 pub const lock_ops = if (@import("atomic.zig").replaceable) &test_lock_ops else &real_lock_ops;
 
 fn realFlock(fd: fsx.fd_t, op: i32) usize {
@@ -418,4 +447,69 @@ test "RootLock refuses a second holder and is free after release" {
     first.release();
     const again = try RootLock.acquire(gpa, base, 0);
     again.release();
+}
+
+test "lockExclusiveCancel returns Canceled when cancel is set" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const lock_path = try gpa.print("{s}/.zig-cache/zig-common-cancel-{d}.lock", .{ cwd, linux.getpid() });
+    defer {
+        _ = sys.unlinkat(fsx.cwd, lock_path, 0) catch {};
+        gpa.free(lock_path);
+    }
+    const fd1 = try sys.openat(fsx.cwd, lock_path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    defer sys.close(fd1);
+    try lockExclusive(fd1, null);
+    const fd2 = try sys.openat(fsx.cwd, lock_path, .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, lockExclusiveCancel(fd2, 60_000, &cancel));
+}
+
+test "lockExclusive covers timeout 0, bounded timeout, and unsupported flock" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try gpa.print("{s}/.zig-cache/zig-common-lockerr-{d}", .{ cwd, linux.getpid() });
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        gpa.free(base);
+    }
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(dir);
+
+    var sub_z: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(dir, (try sys.z(&sub_z, "sub")).ptr, 0o700);
+    try std.testing.expectError(error.IsDir, openPrivate(dir, "sub", true));
+    try std.testing.expectError(error.InvalidArgument, readPrivate(gpa, -1, "x", 64));
+    try std.testing.expectError(error.InvalidArgument, writePrivate(gpa, -1, "x", "y"));
+
+    const fd1 = (try openPrivate(dir, "lck", true)).?;
+    defer sys.close(fd1);
+    try lockExclusive(fd1, 0);
+
+    const fd2 = try sys.openat(dir, "lck", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    try std.testing.expectError(error.TimedOut, lockExclusive(fd2, 0));
+    try std.testing.expectError(error.TimedOut, lockExclusive(fd2, 40));
+
+    const Hooks = struct {
+        var err_code: linux.E = .OPNOTSUPP;
+        fn fail(_: fsx.fd_t, _: i32) usize {
+            return @bitCast(-@as(isize, @backingInt(err_code)));
+        }
+    };
+    defer lock_ops.* = .{};
+    lock_ops.flock = Hooks.fail;
+    for ([_]linux.E{ .OPNOTSUPP, .NOSYS }) |e| {
+        Hooks.err_code = e;
+        for ([_]?u32{ null, 0, 25 }) |timeout| {
+            sys.last_errno = .SUCCESS;
+            try std.testing.expectError(error.Unsupported, lockExclusive(fd2, timeout));
+            try std.testing.expectEqual(e, sys.last_errno);
+        }
+    }
 }

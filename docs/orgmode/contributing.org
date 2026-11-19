@@ -1,0 +1,67 @@
+#+TITLE: Contributing
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Contributing
+
+Changes come as pull requests to [[https://github.com/stackhands/zig-common][stackhands/zig-common]].
+A change to behaviour changes the page that describes it in the same pull request.
+
+** Record the change
+
+Every change adds a news fragment, =changelog.d/+SLUG.TYPE.md=, with a short slug for the change and one of the types =towncrier.toml= configures:
+
+| Type      | Section of the release notes |
+|-----------+------------------------------|
+| =feature= | Features                     |
+| =bugfix=  | Fixes                        |
+| =doc=     | Documentation                |
+| =removal= | Removals                     |
+| =misc=    | Miscellaneous                |
+
+A fragment is one paragraph in the present tense that names the declarations it is about in backticks, as the entries in the [[file:changelog.org][changelog]] do.
+=towncrier build --draft --version 0.9.1= shows the release notes the fragments make, and fails on a fragment whose type is not configured.
+The release commit gathers them into =CHANGELOG.md=; [[https://github.com/stackhands/zig-common/blob/main/RELEASING.md][RELEASING.md]] has the rest of a release.
+
+** Build the documentation
+
+The documentation toolchain is pinned in =pixi.lock=: Emacs, Sphinx, lychee, and the tools that read the code.
+With [[https://pixi.sh][pixi]] installed, from the top of the repository:
+
+#+begin_src bash
+pixi run -e docs docbld
+#+end_src
+
+The site is in =docs/build/html/=; open =docs/build/html/index.html=.
+The build fails on any Sphinx warning, any cross-reference that does not resolve, any internal link or anchor that does not exist, and, outside the changelog, any name of a real site's machines or paths.
+The first build needs the network, to fetch the other stackhands sites' inventories; later builds reuse them for 30 days.
+
+External links are checked separately, as they need the network:
+
+#+begin_src bash
+pixi run -e docs linkcheck
+#+end_src
+
+=pixi run -e docs docdel= removes everything the build generated.
+
+** Where things are
+
+| Path                       | What it holds                                      |
+|----------------------------+----------------------------------------------------|
+| =docs/orgmode/=            | the pages, in Org: edit these                      |
+| =docs/export.el=           | the Org to reStructuredText export                 |
+| =docs/source/conf.py=      | the Sphinx configuration                           |
+| =docs/source/_ext/=        | the Sphinx domain for Zig declarations             |
+| =docs/tools/zig_api.zig=   | writes the Zig API pages from the doc comments     |
+| =docs/tools/check_site.py= | checks internal links, anchors and forbidden names |
+
+The =.rst= files under =docs/source/= and everything under =docs/source/reference/api/= are generated and not committed.
+
+** Write a page
+
+A page belongs to exactly one quadrant: a tutorial teaches by doing, a how-to guide gets one task done, an explanation says why, and a reference page lists what there is.
+Start from the skeleton for its quadrant in =docs-kit/skeletons/= of [[https://github.com/stackhands/.github][stackhands/.github]], add it to the =toctree= of the quadrant's =index.org=, and follow =docs-kit/STYLE.md= there.
+Examples use the neutral example site (=example.org=, =/opt/site=, =/home/alice=), never a real one.
+
+API documentation is written in the code, and the first sentence of each comment is the summary shown in lists.
+In Zig it is a =///= comment above each =pub= declaration and a =//!= comment at the top of each file.

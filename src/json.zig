@@ -15,6 +15,10 @@ const text = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// One parsed JSON value. Strings and numbers are their JSON text, sliced
+/// from the text given to `parse`, which must outlive the value; the codecs
+/// and `toPy` decode them. Arrays and objects are allocated from the arena
+/// given to `parse`.
 pub const Value = union(enum) {
     null,
     bool: bool,
@@ -26,6 +30,10 @@ pub const Value = union(enum) {
     /// Members in order; a later duplicate key wins, as json.loads keeps it.
     object: []const Member,
 
+    /// The value of `key` in an object, or null when `v` is not an object
+    /// or has no such key. A key that appears twice gives its last value,
+    /// as json.loads does. A stored key is compared with its escapes
+    /// decoded, so `"\u006bind"` matches `kind`.
     pub fn get(v: Value, key: []const u8) ?Value {
         if (v != .object) return null;
         var found: ?Value = null;
@@ -36,35 +44,54 @@ pub const Value = union(enum) {
     }
 };
 
+/// One member of an object: the key's JSON text between the quotes, escapes
+/// not yet decoded, and its value.
 pub const Member = struct { key: []const u8, value: Value };
 
-/// A raw JSON key equals `want` (ASCII, as every key the guard looks up
-/// is) once its escapes are decoded.
+/// A raw JSON key equals `want` (UTF-8 or surrogateescape cache bytes) once
+/// its escapes and UTF-16 surrogate pairs are decoded.
 fn keyEql(raw: []const u8, want: []const u8) bool {
     var i: usize = 0;
     var j: usize = 0;
     while (i < raw.len) {
-        var c: u21 = raw[i];
-        if (c == '\\') {
+        var cp: u21 = undefined;
+        if (raw[i] != '\\') {
+            const ch = text.nextChar(raw[i..]);
+            cp = ch.cp orelse return false;
+            i += ch.len;
+        } else {
             if (i + 1 >= raw.len) return false;
             const e = raw[i + 1];
+            i += 2;
             if (e == 'u') {
-                c = hex4(raw, i + 2) catch return false;
-                i += 6;
+                cp = hex4(raw, i) catch return false;
+                i += 4;
+                if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= raw.len and raw[i] == '\\' and raw[i + 1] == 'u') {
+                    const lo = hex4(raw, i + 2) catch return false;
+                    if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+                }
             } else {
-                c = switch (e) {
+                cp = switch (e) {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
                     'b' => 0x08,
                     'f' => 0x0c,
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
-                    else => e,
+                    else => return false,
                 };
-                i += 2;
             }
-        } else i += 1;
-        if (j >= want.len or c != want[j]) return false;
-        j += 1;
+        }
+        if (j >= want.len) return false;
+        const wch = text.nextChar(want[j..]);
+        const wcp: u21 = wch.cp orelse (0xDC00 + @as(u21, want[j]));
+        if (cp != wcp) return false;
+        j += wch.len;
     }
     return j == want.len;
 }
@@ -82,6 +109,8 @@ fn hex4(raw: []const u8, i: usize) error{Encoding}!u16 {
     return std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch unreachable;
 }
 
+/// The errors of `parse`: `error.Syntax` for text that is not one JSON
+/// document nested at most `max_depth` deep, or `error.OutOfMemory`.
 pub const ParseError = Allocator.Error || error{Syntax};
 
 /// Arrays and objects nest at most this deep. The parser recurses once per
@@ -238,6 +267,8 @@ pub fn parse(arena: Allocator, s: []const u8) ParseError!Value {
     return v;
 }
 
+/// The errors of the decoders and `toPy`: `error.Encoding` for a string
+/// or number the codec cannot represent, or `error.OutOfMemory`.
 pub const DecodeError = Allocator.Error || error{Encoding};
 
 /// Code points of a raw JSON string, surrogate pairs joined; a lone
@@ -324,47 +355,57 @@ pub fn decodeWire(arena: Allocator, raw: []const u8) DecodeError![]u8 {
     return out;
 }
 
-fn escapeCp(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) Allocator.Error!void {
+fn writeEscapedCpTo(w: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
     switch (cp) {
-        '"' => try out.appendSlice(gpa, "\\\""),
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        0x08 => try out.appendSlice(gpa, "\\b"),
-        0x0c => try out.appendSlice(gpa, "\\f"),
-        ' '...'!', '#'...'[', ']'...'~' => try out.append(gpa, @intCast(cp)),
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0c => try w.writeAll("\\f"),
+        ' '...'!', '#'...'[', ']'...'~' => try w.writeByte(@intCast(cp)),
         else => {
             var b: [12]u8 = undefined;
             if (cp >= 0x10000) {
                 const v = cp - 0x10000;
                 const s = std.mem.print(&b, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) }) catch unreachable;
-                try out.appendSlice(gpa, s);
+                try w.writeAll(s);
             } else {
                 const s = std.mem.print(&b, "\\u{x:0>4}", .{cp}) catch unreachable;
-                try out.appendSlice(gpa, s);
+                try w.writeAll(s);
             }
         },
     }
 }
 
-/// A JSON string of `bytes` as the Python guard wrote cache text.
-pub fn writeCacheString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
-    try out.append(gpa, '"');
+/// A JSON string of `bytes` as the Python guard wrote cache text, written to
+/// `w` without allocating.
+pub fn writeCacheStringTo(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
     var i: usize = 0;
     while (i < bytes.len) {
         const ch = text.nextChar(bytes[i..]);
-        if (ch.cp) |cp| try escapeCp(out, gpa, cp) else try escapeCp(out, gpa, 0xDC00 + @as(u21, bytes[i]));
+        if (ch.cp) |cp| try writeEscapedCpTo(w, cp) else try writeEscapedCpTo(w, 0xDC00 + @as(u21, bytes[i]));
         i += ch.len;
     }
-    try out.append(gpa, '"');
+    try w.writeByte('"');
+}
+
+/// A JSON string of `bytes` as the Python guard wrote cache text.
+pub fn writeCacheString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = aw.toArrayList();
+    writeCacheStringTo(&aw.writer, bytes) catch return error.OutOfMemory;
 }
 
 /// A JSON string of `bytes` as wire text: one code point per byte.
 pub fn writeWireString(out: *std.ArrayList(u8), gpa: Allocator, bytes: []const u8) Allocator.Error!void {
-    try out.append(gpa, '"');
-    for (bytes) |b| try escapeCp(out, gpa, b);
-    try out.append(gpa, '"');
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = aw.toArrayList();
+    aw.writer.writeByte('"') catch return error.OutOfMemory;
+    for (bytes) |b| writeEscapedCpTo(&aw.writer, b) catch return error.OutOfMemory;
+    aw.writer.writeByte('"') catch return error.OutOfMemory;
 }
 
 test "cache strings round-trip bytes that are not UTF-8" {
@@ -390,12 +431,40 @@ test "wire strings are one byte per code point" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    try writeWireString(&out, a, "x\xff\xc3\xa9");
-    try std.testing.expectEqualStrings("\"x\\u00ff\\u00c3\\u00a9\"", out.items);
-    const v = try parse(a, out.items);
-    try std.testing.expectEqualStrings("x\xff\xc3\xa9", try decodeWire(a, v.string));
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "x\xff\xc3\xa9", .want = "\"x\\u00ff\\u00c3\\u00a9\"" },
+        .{ .in = "\x00\x1fA", .want = "\"\\u0000\\u001fA\"" },
+    };
+    for (cases) |tc| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try writeWireString(&out, a, tc.in);
+        try std.testing.expectEqualStrings(tc.want, out.items);
+        const v = try parse(a, out.items);
+        try std.testing.expectEqualStrings(tc.in, try decodeWire(a, v.string));
+    }
     try std.testing.expectError(error.Encoding, decodeWire(a, "\\u0100"));
+}
+
+test "writeCacheStringTo matches writeCacheString over invalid, astral, and control bytes" {
+    const gpa = std.testing.allocator;
+    const sample = "a\"\xff\u{1F600}\n\x01";
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try writeCacheString(&list, gpa, sample);
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCacheStringTo(&w, sample);
+    try std.testing.expectEqualStrings(list.items, buf[0..w.end]);
+}
+
+test "writeCacheStringTo reports WriteFailed for a 64-byte fixed writer" {
+    const long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.WriteFailed, writeCacheStringTo(&w, long));
 }
 
 test "a truncated or malformed escape is an encoding error" {
@@ -421,6 +490,25 @@ test "parse objects, duplicates and nesting" {
     const e = try parse(a, "{\"\\u006bind\": \"x\"}");
     try std.testing.expect(e.get("kind") != null);
     try std.testing.expectError(error.Syntax, parse(a, "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"));
+}
+
+test "Value.get matches escaped UTF-8, surrogate pairs, and cache-escaped keys" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const v1 = try parse(a, "{\"\\u00e9\": 1, \"caf\\u00e9\": 2}");
+    try std.testing.expectEqualStrings("1", v1.get("é").?.number);
+    try std.testing.expectEqualStrings("2", v1.get("café").?.number);
+
+    const v2 = try parse(a, "{\"\\uD83D\\uDE00\": 42}");
+    try std.testing.expectEqualStrings("42", v2.get("😀").?.number);
+
+    const v3 = try parse(a, "{\"café\": \"raw\"}");
+    try std.testing.expectEqualStrings("raw", v3.get("café").?.string);
+
+    const v4 = try parse(a, "{\"\\udce9\": \"byte\"}");
+    try std.testing.expectEqualStrings("byte", v4.get("\xe9").?.string);
 }
 
 /// `inner` inside `n` arrays, or objects when `open` opens one.
@@ -457,12 +545,16 @@ pub const Py = union(enum) {
     list: []const Py,
     dict: []const Entry,
 
+    /// One key and its value in a `Py.dict`. `dumps` writes them in this
+    /// order unless it sorts the keys.
     pub const Entry = struct { key: []const u8, value: Py };
 
+    /// `v` as a Python string.
     pub fn s(v: []const u8) Py {
         return .{ .str = v };
     }
 
+    /// `v` as a Python string, or `null` (Python's None) when `v` is null.
     pub fn opt(v: ?[]const u8) Py {
         return if (v) |x| .{ .str = x } else .null;
     }

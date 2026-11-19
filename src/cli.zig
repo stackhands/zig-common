@@ -13,6 +13,9 @@ pub fn put(fd: sys.fd_t, bytes: []const u8) void {
     sys.writeAll(fd, bytes) catch {};
 }
 
+/// Format `args` with `fmt` and `put` the text to `fd`. A text longer than
+/// 8 KiB is formatted on the heap; when that allocation fails, nothing is
+/// written.
 pub fn print(fd: sys.fd_t, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
     const s = std.mem.print(&buf, fmt, args) catch {
@@ -25,10 +28,12 @@ pub fn print(fd: sys.fd_t, comptime fmt: []const u8, args: anytype) void {
     put(fd, s);
 }
 
+/// `print` to stdout. No newline is added.
 pub fn out(comptime fmt: []const u8, args: anytype) void {
     print(1, fmt, args);
 }
 
+/// `print` to stderr. No newline is added.
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     print(2, fmt, args);
 }
@@ -44,4 +49,17 @@ pub fn die(comptime tool: []const u8, comptime fmt: []const u8, args: anytype) n
 pub fn versionLine(comptime tool: []const u8, comptime version: []const u8, comptime commit: []const u8) []const u8 {
     return tool ++ " " ++ version ++ " (" ++ @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++
         @tagName(builtin.abi) ++ ", " ++ @tagName(builtin.mode) ++ ", zig " ++ builtin.zig_version_string ++ ", " ++ commit ++ ")\n";
+}
+
+test "put and print ignore write errors and versionLine formats tool and version" {
+    put(-1, "ignored\n");
+    print(-1, "ignored {d}\n", .{42});
+
+    var big: [9000]u8 = undefined;
+    @memset(&big, 'x');
+    print(-1, "{s}", .{big[0..]});
+
+    const line = versionLine("demo", "1.2.3", "abc1234");
+    try std.testing.expect(std.mem.startsWith(u8, line, "demo 1.2.3 ("));
+    try std.testing.expect(std.mem.endsWith(u8, line, ", abc1234)\n"));
 }

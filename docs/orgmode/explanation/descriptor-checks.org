@@ -1,0 +1,42 @@
+#+TITLE: Checks on the descriptor, not the path
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Checks on the descriptor, not the path
+
+Why does [[zig:zig_common.fsx]] open a file first and check it afterwards, when the obvious order is the other way round?
+
+** The problem
+
+The stackhands tools work in directories other users can write: a shared =/tmp=, a project's installation tree, a build's scratch space.
+A tool that checks a path and then opens it asks the file system the same question twice, and the answer can change in between.
+Another user who replaces =/tmp/state= with a symbolic link to =/home/alice/.ssh/id_ed25519= after the check and before the open gets the tool to read or overwrite a file it never checked.
+This is a time-of-check to time-of-use race.
+
+** How zig-common handles it
+
+Every check is made on the open descriptor.
+[[zig:zig_common.fsx.openRegular]] opens the file once, with =O_NOFOLLOW= unless the caller asks to follow a final link and with =O_NONBLOCK= so a named pipe cannot stall it, and then calls [[man:fstat(2)]] on what it opened.
+Whatever the path names a moment later, the descriptor still refers to the file that was checked.
+
+[[zig:zig_common.state]] builds on this for private files in a shared directory: a file is trusted only when the open descriptor is a regular file owned by this user, with one link and no group or other permission bits.
+A write goes to a new file beside it, which is renamed over the old one.
+
+** What was considered and turned down
+
+- /Checking with =stat= and opening after./
+  This is the race above.
+- /Opening with =O_PATH= and checking that./
+  An =O_PATH= descriptor cannot be read, so the file would be opened a second time by name.
+- /Holding a lock while checking./
+  Advisory locks bind only programs that take them; an attacker does not.
+
+** Limits
+
+The checks see the file as it is when opened.
+A file that is still being written can change after the check; [[zig:zig_common.atomic]] covers the case where the bytes, owner, mode and access control lists (ACLs) must all survive a replacement.
+
+** Further reading
+
+- [[man:open(2)]], the =O_NOFOLLOW= and =O_NONBLOCK= flags.
+- [[file:../reference/api/zig/zig_common.fsx.md][The fsx module's API]].

@@ -1,0 +1,64 @@
+# Build the documentation the way `pixi run -e docs docbld` does: Org export,
+# API pages from the code, Sphinx with warnings and unresolved references as
+# errors, the Zig autodoc site, and the internal link check. External links
+# are checked in their own step. On main the site is published to
+# https://stackhands.github.io/zig-common/.
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so a link that went dead elsewhere is noticed.
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
+        with:
+          environments: docs
+          cache: true
+          locked: true
+
+      - name: Build
+        run: pixi run -e docs docbld
+        env:
+          DOCS_SOURCE_REF: ${{ github.sha }}
+
+      - name: External links
+        run: pixi run -e docs linkcheck
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/build/html
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,31 @@
+# External links in the built site (pixi run -e docs linkcheck). Internal
+# links and anchors are checked offline by docs/tools/check_site.py.
+max_retries = 3
+retry_wait_time = 2
+timeout = 20
+max_concurrency = 16
+accept = ["200..=299", "429"]
+include_fragments = "none"
+cache = true
+max_cache_age = "1d"
+no_progress = true
+
+exclude_path = [
+  # The Zig autodoc site links only within itself.
+  "docs/build/html/api/",
+]
+
+exclude = [
+  # This site: every page names its published URL as canonical, and a new
+  # page is not published until this build deploys. check_site.py checks the
+  # site's own links.
+  '^https://stackhands\.github\.io/zig\-common/',
+  # Source links name the commit being built, which a pull request build
+  # may not have pushed anywhere yet; check_site.py checks the pages.
+  '^https://github\.com/stackhands/[^/]+/(blob|edit|tree)/',
+  # A Cloudflare challenge answers automated clients with 403.
+  '^https://eb-stack\.rgoswami\.me/',
+  # The repository's own, each with its reason; apply.py keeps this block.
+  # local:begin
+  # local:end
+]
