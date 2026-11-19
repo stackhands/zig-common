@@ -519,7 +519,7 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     } else if (src.isLink()) {
         try copyLinkAt(src_dir, src_name, dst_dir, tmp);
     } else {
-        return error.InvalidArgument;
+        return error.NotRegularFile;
     }
 
     try moveFaultsStep(faults, "move.publish");
@@ -1140,4 +1140,24 @@ test "moveAcross keeps the source when publish fails before rename" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings("payload\n", text);
     try std.testing.expectError(error.NotFound, statAt(d, "dst", false));
+}
+
+test "moveAcross reports not a regular file for a FIFO source on EXDEV fallback" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-fifo-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+    try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "pipe", d, "dst", .{ .policy = .strict }, .{
+        .force_cross_device_rename = true,
+    }));
+    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
