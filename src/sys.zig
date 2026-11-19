@@ -262,6 +262,17 @@ fn describeNamed(comptime e: linux.E) []const u8 {
         std.fmt.comptimePrint("[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) });
 }
 
+/// The strerror text for `e`, the Zig enum tag name when `errnoText` does not
+/// name a known tag, or `"Unknown error N"` for an unnamed errno value.
+pub fn strerror(e: linux.E) []const u8 {
+    if (errnoText(e)) |text| return text;
+    if (std.enums.tagName(linux.E, e)) |name| return name;
+    const S = struct {
+        threadlocal var buf: [32]u8 = undefined;
+    };
+    return std.mem.print(&S.buf, "Unknown error {d}", .{@backingInt(e)}) catch "Unknown error";
+}
+
 /// Map a raw result. EINTR is returned as `null` so callers can retry.
 fn map(rc: usize) Error!?usize {
     const e = linux.errno(rc);
@@ -409,6 +420,8 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     try std.testing.expectEqual(@as(?Error, null), asError(error.OutOfMemory));
     try std.testing.expectEqualStrings("[Errno 133] Memory page has hardware error", describeErrno(.HWPOISON));
     try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
+    try std.testing.expectEqualStrings("No such file or directory", strerror(.NOENT));
+    try std.testing.expectEqualStrings("File name too long", strerror(.NAMETOOLONG));
     const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
     defer close(compat_fd);
     var compat: std.ArrayList(u8) = .empty;
@@ -421,4 +434,45 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     }
     try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
     try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
+}
+
+test "strerror formats unnamed errno values instead of panicking" {
+    var raw: u16 = 134;
+    const unknown_134: linux.E = @fromBackingInt(raw);
+    try std.testing.expectEqualStrings("Unknown error 134", strerror(unknown_134));
+    raw = 999;
+    const unknown_999: linux.E = @fromBackingInt(raw);
+    try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
+}
+
+test "errnoText returns null for unknown errnos and sys wrappers surface expected errors" {
+    try std.testing.expectEqual(@as(?[]const u8, null), errnoText(.SUCCESS));
+    var raw: u16 = 134;
+    try std.testing.expectEqual(@as(?[]const u8, null), errnoText(@fromBackingInt(raw)));
+    raw = 999;
+    try std.testing.expectEqual(@as(?[]const u8, null), errnoText(@fromBackingInt(raw)));
+    try std.testing.expectEqualStrings("Operation not supported", errnoText(.OPNOTSUPP).?);
+
+    var zb: [path_max:0]u8 = undefined;
+    var too_long: [path_max]u8 = undefined;
+    @memset(&too_long, 'a');
+    try std.testing.expectError(error.NameTooLong, z(&zb, &too_long));
+    try std.testing.expectError(error.InvalidArgument, z(&zb, "bad\x00path"));
+
+    try std.testing.expectError(error.NotFound, openat(linux.AT.FDCWD, "/no/such/zig-common-path", .{}, 0));
+    try std.testing.expectError(error.InvalidArgument, openat(linux.AT.FDCWD, "bad\x00path", .{}, 0));
+
+    var rbuf: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidArgument, read(-1, &rbuf));
+    try std.testing.expectError(error.InvalidArgument, writeAll(-1, "x"));
+    try std.testing.expectError(error.InvalidArgument, fchmod(-1, 0o600));
+    try std.testing.expectError(error.InvalidArgument, fchown(-1, 0, 0));
+    try std.testing.expectError(error.InvalidArgument, fsync(-1));
+    try std.testing.expectError(error.NotFound, unlinkat(linux.AT.FDCWD, "/no/such/zig-common-path", 0));
+    try std.testing.expectError(error.NotFound, renameat(linux.AT.FDCWD, "/no/such/zig-common-src", linux.AT.FDCWD, "/no/such/zig-common-dst"));
+
+    if (openat(linux.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0)) |full_fd| {
+        defer close(full_fd);
+        try std.testing.expectError(error.NoSpace, writeAll(full_fd, "x"));
+    } else |_| {}
 }
