@@ -47,6 +47,18 @@ pub const JournalField = struct {
     value: []const u8,
 };
 
+/// Who an event is from: the program name of the syslog header and of
+/// journald's SYSLOG_IDENTIFIER, and the name in front of the enterprise
+/// number in the structured-data identifier (`ebKeepLogs@32473`).
+pub const Identity = struct {
+    app: []const u8,
+    sd_name: []const u8,
+};
+
+/// The identity the functions without an `Identity` argument write. They
+/// predate `Identity` and are removed in 0.13.0; a caller names its own.
+pub const legacy_identity: Identity = .{ .app = "eb-keep-logs", .sd_name = "ebKeepLogs" };
+
 fn trimWs(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
 }
@@ -167,8 +179,23 @@ fn utcTimestamp(arena: Allocator) []const u8 {
     }) catch "1970-01-01T00:00:00.000000Z";
 }
 
+/// `formatRfc5424For` with `legacy_identity`. Removed in 0.13.0.
 pub fn formatRfc5424(
     arena: Allocator,
+    severity: u8,
+    msgid: []const u8,
+    params: []const Param,
+    msg: []const u8,
+    pen: []const u8,
+) Allocator.Error![]u8 {
+    return formatRfc5424For(arena, legacy_identity, severity, msgid, params, msg, pen);
+}
+
+/// One RFC 5424 message from `id`: header, one structured-data element
+/// `[<sd_name>@<pen> key="value"...]`, and `msg` on one line.
+pub fn formatRfc5424For(
+    arena: Allocator,
+    id: Identity,
     severity: u8,
     msgid: []const u8,
     params: []const Param,
@@ -180,8 +207,8 @@ pub fn formatRfc5424(
     const ts = utcTimestamp(arena);
     const host = hostname(arena);
     const pid = linux.getpid();
-    try out.print(arena, "<{d}>1 {s} {s} eb-keep-logs {d} {s} [ebKeepLogs@{s}", .{
-        pri, ts, host, pid, msgid, pen,
+    try out.print(arena, "<{d}>1 {s} {s} {s} {d} {s} [{s}@{s}", .{
+        pri, ts, host, id.app, pid, msgid, id.sd_name, pen,
     });
     for (params) |p| {
         const esc = try sdEscape(arena, p.value);
@@ -206,8 +233,22 @@ fn journalKv(arena: Allocator, out: *std.ArrayList(u8), key: []const u8, value: 
     }
 }
 
+/// `formatJournaldFor` with `legacy_identity`. Removed in 0.13.0.
 pub fn formatJournald(
     arena: Allocator,
+    severity: u8,
+    msgid: []const u8,
+    fields: []const JournalField,
+    msg: []const u8,
+) Allocator.Error![]u8 {
+    return formatJournaldFor(arena, legacy_identity, severity, msgid, fields, msg);
+}
+
+/// One native journald datagram from `id`: MESSAGE, PRIORITY,
+/// SYSLOG_IDENTIFIER, SYSLOG_FACILITY, MSGID, then `fields` with a value.
+pub fn formatJournaldFor(
+    arena: Allocator,
+    id: Identity,
     severity: u8,
     msgid: []const u8,
     fields: []const JournalField,
@@ -218,7 +259,7 @@ pub fn formatJournald(
     const sev_s = std.fmt.bufPrint(&sev_buf, "{d}", .{severity}) catch "6";
     try journalKv(arena, &out, "MESSAGE", try oneLine(arena, msg, 500));
     try journalKv(arena, &out, "PRIORITY", sev_s);
-    try journalKv(arena, &out, "SYSLOG_IDENTIFIER", "eb-keep-logs");
+    try journalKv(arena, &out, "SYSLOG_IDENTIFIER", id.app);
     try journalKv(arena, &out, "SYSLOG_FACILITY", "1");
     try journalKv(arena, &out, "MSGID", msgid);
     for (fields) |f| {
@@ -401,6 +442,21 @@ fn sendInet(arena: Allocator, host: []const u8, port: u16, tcp: bool, payload: [
     return false;
 }
 
+/// Send one already formatted payload to `target`: a journald datagram to a
+/// `journal_unix` target, an RFC 5424 message to the others. A unix syslog
+/// socket is tried as a datagram, then as a stream with a newline; TCP uses
+/// octet counting. False when nothing was delivered. A caller with its own
+/// formatting uses this for the transport alone.
+pub fn send(arena: Allocator, target: Target, payload: []const u8) bool {
+    return switch (target.scheme) {
+        .journal_unix => sendUnix(arena, target.host_or_path, payload, false),
+        .rfc5424_unix => sendUnix(arena, target.host_or_path, payload, true),
+        .rfc5424_udp => sendInet(arena, target.host_or_path, target.port, false, payload),
+        .rfc5424_tcp => sendInet(arena, target.host_or_path, target.port, true, payload),
+    };
+}
+
+/// `emitFor` with `legacy_identity`. Removed in 0.13.0.
 pub fn emit(
     arena: Allocator,
     target: Target,
@@ -410,24 +466,26 @@ pub fn emit(
     jfields: []const JournalField,
     msg: []const u8,
 ) bool {
-    switch (target.scheme) {
-        .journal_unix => {
-            const payload = formatJournald(arena, severity, msgid, jfields, msg) catch return false;
-            return sendUnix(arena, target.host_or_path, payload, false);
-        },
-        .rfc5424_unix => {
-            const payload = formatRfc5424(arena, severity, msgid, params, msg, target.pen) catch return false;
-            return sendUnix(arena, target.host_or_path, payload, true);
-        },
-        .rfc5424_udp => {
-            const payload = formatRfc5424(arena, severity, msgid, params, msg, target.pen) catch return false;
-            return sendInet(arena, target.host_or_path, target.port, false, payload);
-        },
-        .rfc5424_tcp => {
-            const payload = formatRfc5424(arena, severity, msgid, params, msg, target.pen) catch return false;
-            return sendInet(arena, target.host_or_path, target.port, true, payload);
-        },
-    }
+    return emitFor(arena, legacy_identity, target, severity, msgid, params, jfields, msg);
+}
+
+/// Format one event from `id` for `target` and send it. Best effort: false
+/// when it could not be formatted or delivered, and never an error.
+pub fn emitFor(
+    arena: Allocator,
+    id: Identity,
+    target: Target,
+    severity: u8,
+    msgid: []const u8,
+    params: []const Param,
+    jfields: []const JournalField,
+    msg: []const u8,
+) bool {
+    const payload = switch (target.scheme) {
+        .journal_unix => formatJournaldFor(arena, id, severity, msgid, jfields, msg),
+        else => formatRfc5424For(arena, id, severity, msgid, params, msg, target.pen),
+    } catch return false;
+    return send(arena, target, payload);
 }
 
 test "parseTarget accepts unix, journald, udp and tcp" {
@@ -455,4 +513,29 @@ test "formatRfc5424 escapes structured data values and uses configured PEN" {
     try std.testing.expect(parsePen("0") == null);
     try std.testing.expect(parsePen("abc") == null);
     try std.testing.expectEqualStrings("49152", parsePen("049152").?);
+}
+
+test "the formatters write the identity they are given" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const id: Identity = .{ .app = "some-tool", .sd_name = "someTool" };
+    const line = try formatRfc5424For(a, id, 6, "EVENT", &.{.{ .key = "k", .value = "v" }}, "hello", "32473");
+    try std.testing.expect(std.mem.find(u8, line, " some-tool ") != null);
+    try std.testing.expect(std.mem.find(u8, line, "[someTool@32473 k=\"v\"] hello") != null);
+    try std.testing.expect(std.mem.find(u8, line, "eb-keep-logs") == null);
+    const datagram = try formatJournaldFor(a, id, 6, "EVENT", &.{}, "hello");
+    try std.testing.expect(std.mem.find(u8, datagram, "SYSLOG_IDENTIFIER=some-tool\n") != null);
+    // The entry points without an identity keep writing the one they always did.
+    const legacy = try formatRfc5424(a, 6, "EVENT", &.{}, "hello", "32473");
+    try std.testing.expect(std.mem.find(u8, legacy, " eb-keep-logs ") != null);
+    try std.testing.expect(std.mem.find(u8, legacy, "[ebKeepLogs@32473] hello") != null);
+}
+
+test "send reports false for a target nobody listens on" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expect(!send(a, .{ .scheme = .rfc5424_unix, .host_or_path = "/nonexistent/zig-common/syslog.sock" }, "x"));
+    try std.testing.expect(!send(a, .{ .scheme = .journal_unix, .host_or_path = "/nonexistent/zig-common/journal.sock" }, "x"));
 }
