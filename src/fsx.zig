@@ -215,7 +215,7 @@ fn regularTypeError(st: Stat) ?Error {
     if (st.isReg()) return null;
     if (st.isLink()) return error.SymLink;
     if (st.isDir()) return error.IsDir;
-    return error.InvalidArgument;
+    return error.NotRegularFile;
 }
 
 /// Open the directory `dir/path` for reading with `O_DIRECTORY`. `follow`
@@ -921,6 +921,24 @@ test "openRegular reports IsDir for a directory" {
     _ = linux.mkdirat(d, "subdir", 0o700);
     try std.testing.expectError(error.IsDir, openRegular(d, "subdir", false));
     try std.testing.expectEqualStrings("[Errno 21] Is a directory", sys.describe(error.IsDir));
+}
+
+test "openRegular reports not a regular file for a FIFO" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-open-regular-fifo-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+    try std.testing.expectError(error.NotRegularFile, openRegular(d, "pipe", false));
+    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
 /// A filesystem's answer to each ACL form, GPFS native, generic NFSv4 and
