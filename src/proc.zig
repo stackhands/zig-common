@@ -124,17 +124,21 @@ pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.E
     while (it.next()) |dir_raw| {
         const cand = try std.fs.path.join(gpa, &.{ if (dir_raw.len == 0) "." else dir_raw, name });
         defer gpa.free(cand);
-        var zb: [sys.path_max:0]u8 = undefined;
-        const zc = sys.z(&zb, cand) catch continue;
-        if (linux.errno(linux.faccessat(linux.AT.FDCWD, zc.ptr, linux.X_OK, 0)) != .SUCCESS) continue;
-        const st = fsx.statAt(fsx.cwd, cand, true) catch continue;
-        if (!st.isReg()) continue;
+        if (!isExecutableFile(cand)) continue;
         if (cand[0] == '/') return try gpa.dupe(u8, cand);
         var rb: [sys.path_max]u8 = undefined;
         const dir_abs = fsx.realpath(fsx.cwd, if (dir_raw.len == 0) "." else dir_raw, &rb) catch continue;
         return try std.fs.path.join(gpa, &.{ dir_abs, name });
     }
     return null;
+}
+
+fn isExecutableFile(path: []const u8) bool {
+    var zb: [sys.path_max:0]u8 = undefined;
+    const z = sys.z(&zb, path) catch return false;
+    if (linux.errno(linux.faccessat(linux.AT.FDCWD, z.ptr, linux.X_OK, 0)) != .SUCCESS) return false;
+    const st = fsx.statAt(fsx.cwd, path, true) catch return false;
+    return st.isReg();
 }
 
 fn nowMs() i64 {
