@@ -114,31 +114,104 @@ pub const Result = struct {
 /// exits 127.
 pub const Error = sys.Error || Allocator.Error || error{ StreamTooLong, TimedOut, Canceled, NotAbsolute };
 
+const PathUnset = enum {
+    none,
+    use_default,
+};
+
+const EmptyPath = enum {
+    return_none,
+    search_cwd,
+};
+
+const ResultPath = enum {
+    absolute,
+    candidate,
+};
+
+const ExecutableCheck = enum {
+    regular_file,
+    not_directory,
+};
+
+const SlashName = enum {
+    reject,
+    check_direct,
+};
+
+const WhichOptions = struct {
+    unset_path: PathUnset = .none,
+    default_path: []const u8 = "",
+    empty_path: EmptyPath = .return_none,
+    result_path: ResultPath = .absolute,
+    executable_check: ExecutableCheck = .regular_file,
+    slash_name: SlashName = .reject,
+};
+
 /// Search `path_env` (colon-separated, an empty entry meaning the current
 /// directory, as execvp does) for an executable regular file `name`.
 /// Returns an absolute path to it, without resolving symbolic links, or
 /// null. A name containing '/' is not looked up.
 pub fn which(gpa: Allocator, name: []const u8, path_env: []const u8) Allocator.Error!?[]u8 {
-    if (std.mem.findScalar(u8, name, '/') != null or name.len == 0) return null;
-    var it = std.mem.splitScalar(u8, path_env, ':');
-    while (it.next()) |dir_raw| {
-        const cand = try std.fs.path.join(gpa, &.{ if (dir_raw.len == 0) "." else dir_raw, name });
-        defer gpa.free(cand);
-        if (!isExecutableFile(cand)) continue;
-        if (cand[0] == '/') return try gpa.dupe(u8, cand);
-        var rb: [sys.path_max]u8 = undefined;
-        const dir_abs = fsx.realpath(fsx.cwd, if (dir_raw.len == 0) "." else dir_raw, &rb) catch continue;
-        return try std.fs.path.join(gpa, &.{ dir_abs, name });
-    }
-    return null;
+    return whichWithOptions(gpa, std.Io.Dir.cwd().handle, name, path_env, .{ .empty_path = .search_cwd });
+}
+
+fn isExecutableAt(cwd_dir: fsx.fd_t, path: []const u8, check: ExecutableCheck) bool {
+    var zb: [sys.path_max:0]u8 = undefined;
+    const z = sys.z(&zb, path) catch return false;
+    if (linux.errno(linux.faccessat(cwd_dir, z.ptr, linux.X_OK, 0)) != .SUCCESS) return false;
+    const st = fsx.statAt(cwd_dir, path, true) catch return false;
+    return switch (check) {
+        .regular_file => st.isReg(),
+        .not_directory => !st.isDir(),
+    };
 }
 
 fn isExecutableFile(path: []const u8) bool {
-    var zb: [sys.path_max:0]u8 = undefined;
-    const z = sys.z(&zb, path) catch return false;
-    if (linux.errno(linux.faccessat(linux.AT.FDCWD, z.ptr, linux.X_OK, 0)) != .SUCCESS) return false;
-    const st = fsx.statAt(fsx.cwd, path, true) catch return false;
-    return st.isReg();
+    return isExecutableAt(fsx.cwd, path, .regular_file);
+}
+
+fn resolveSearchPath(path_env: ?[]const u8, opts: WhichOptions) ?[]const u8 {
+    if (path_env) |path| return path;
+    return switch (opts.unset_path) {
+        .none => null,
+        .use_default => opts.default_path,
+    };
+}
+
+fn candidatePath(gpa: Allocator, dir_raw: []const u8, name: []const u8, opts: WhichOptions) Allocator.Error![]u8 {
+    if (dir_raw.len == 0 and opts.empty_path == .search_cwd) return std.fs.path.join(gpa, &.{ ".", name });
+    return std.fs.path.join(gpa, &.{ dir_raw, name });
+}
+
+fn toAbsoluteAt(gpa: Allocator, cwd_dir: fsx.fd_t, candidate: []const u8, dir_raw: []const u8, opts: WhichOptions) Allocator.Error!?[]u8 {
+    if (candidate[0] == '/') return try gpa.dupe(u8, candidate);
+    const base_dir = if (dir_raw.len == 0 and opts.empty_path == .search_cwd) "." else dir_raw;
+    var rb: [sys.path_max]u8 = undefined;
+    const dir_abs = fsx.realpath(cwd_dir, base_dir, &rb) catch return null;
+    return try std.fs.path.join(gpa, &.{ dir_abs, std.fs.path.basename(candidate) });
+}
+
+fn whichWithOptions(gpa: Allocator, cwd_dir: fsx.fd_t, name: []const u8, path_env: ?[]const u8, opts: WhichOptions) Allocator.Error!?[]u8 {
+    if (name.len == 0) return null;
+    if (std.mem.findScalar(u8, name, '/') != null) return switch (opts.slash_name) {
+        .reject => null,
+        .check_direct => if (isExecutableAt(cwd_dir, name, opts.executable_check)) try gpa.dupe(u8, name) else null,
+    };
+
+    const path = resolveSearchPath(path_env, opts) orelse return null;
+    if (path.len == 0 and opts.empty_path == .return_none) return null;
+    var it = std.mem.splitScalar(u8, path, ':');
+    while (it.next()) |dir_raw| {
+        const cand = try candidatePath(gpa, dir_raw, name, opts);
+        defer gpa.free(cand);
+        if (!isExecutableAt(cwd_dir, cand, opts.executable_check)) continue;
+        return switch (opts.result_path) {
+            .candidate => try gpa.dupe(u8, cand),
+            .absolute => (try toAbsoluteAt(gpa, cwd_dir, cand, dir_raw, opts)) orelse continue,
+        };
+    }
+    return null;
 }
 
 /// Resolve an executable name to an absolute path. A name with '/' is treated
