@@ -290,6 +290,11 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
 /// with mode 0666 less the umask. A symbolic link or non-regular file at the
 /// name is refused.
 pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8) (Error || Allocator.Error)!void {
+    const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
+        error.NotFound => null,
+        else => |e| return e,
+    };
+    if (existing) |st| if (regularTypeError(st)) |err| return err;
     const fd = try sys.openat(dir, name, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -299,7 +304,7 @@ pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8)
     }, 0o666);
     defer sys.close(fd);
     const st = try fstat(fd);
-    if (!st.isReg()) return error.InvalidArgument;
+    if (regularTypeError(st)) |err| return err;
     const bytes = try std.mem.concat(gpa, u8, &.{ line, "\n" });
     defer gpa.free(bytes);
     // One write is atomic on Linux only when it completes. A short write
@@ -874,6 +879,24 @@ test "appendLine does not leave a partial line when the write cannot finish" {
     const text = try readAll(gpa, got.fd, 200);
     defer gpa.free(text);
     try std.testing.expectEqualStrings("hi\n", text);
+}
+
+test "appendLine reports not a regular file for a FIFO target" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-append-fifo-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+    try std.testing.expectError(error.NotRegularFile, appendLine(gpa, d, "pipe", "x"));
+    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
 test "copyTo copies the whole source and leaves its offset" {
