@@ -147,7 +147,111 @@ pub const Builder = struct {
         }
         return block.ptr;
     }
+
+    /// The difference from this builder to `to`.
+    /// `Diff.patch` of the result onto this builder sets the names and
+    /// values `to` has. `Diff.reverse` of the result, patched onto `to`,
+    /// restores the names and values here.
+    pub fn diff(from: *const Builder, gpa: Allocator, to: *const Builder) Allocator.Error!Diff {
+        var d = Diff{
+            .gpa = gpa,
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .prev = &.{},
+            .next = &.{},
+        };
+        errdefer d.deinit();
+        const a = d.arena.allocator();
+        var prev: std.ArrayList(Change) = .empty;
+        var next: std.ArrayList(Change) = .empty;
+        for (from.names.items) |name| {
+            const old = from.values.get(name).?;
+            const fresh = to.get(name);
+            if (fresh == null or !std.mem.eql(u8, old, fresh.?)) {
+                try prev.append(a, .{
+                    .name = try a.dupe(u8, name),
+                    .value = try a.dupe(u8, old),
+                });
+            }
+        }
+        for (to.names.items) |name| {
+            const fresh = to.values.get(name).?;
+            const old = from.get(name);
+            if (old == null or !std.mem.eql(u8, old.?, fresh)) {
+                try next.append(a, .{
+                    .name = try a.dupe(u8, name),
+                    .value = try a.dupe(u8, fresh),
+                });
+            }
+        }
+        d.prev = try prev.toOwnedSlice(a);
+        d.next = try next.toOwnedSlice(a);
+        return d;
+    }
 };
+
+/// One name and the bytes it held on one side of a diff.
+pub const Change = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// The names whose values differ between two builders.
+/// `prev` holds the starting value. `next` holds the resulting value.
+/// A name only the start had is in `prev` alone. A name only the result
+/// had is in `next` alone. A name both set to the same bytes is in neither.
+pub const Diff = struct {
+    gpa: Allocator,
+    arena: std.heap.ArenaAllocator,
+    prev: []const Change,
+    next: []const Change,
+
+    /// Free the copies this diff made.
+    pub fn deinit(d: *Diff) void {
+        d.arena.deinit();
+    }
+
+    /// The same change read the other way: `prev` and `next` exchange places.
+    pub fn reverse(d: *const Diff) Allocator.Error!Diff {
+        var out = Diff{
+            .gpa = d.gpa,
+            .arena = std.heap.ArenaAllocator.init(d.gpa),
+            .prev = &.{},
+            .next = &.{},
+        };
+        errdefer out.deinit();
+        const a = out.arena.allocator();
+        var prev: std.ArrayList(Change) = .empty;
+        var next: std.ArrayList(Change) = .empty;
+        for (d.next) |c| try prev.append(a, .{ .name = try a.dupe(u8, c.name), .value = try a.dupe(u8, c.value) });
+        for (d.prev) |c| try next.append(a, .{ .name = try a.dupe(u8, c.name), .value = try a.dupe(u8, c.value) });
+        out.prev = try prev.toOwnedSlice(a);
+        out.next = try next.toOwnedSlice(a);
+        return out;
+    }
+
+    /// Apply this diff to `b`. A name in `prev` that `next` omits is
+    /// removed. Every name in `next` is set, and one already present keeps
+    /// its place.
+    pub fn patch(d: *const Diff, b: *Builder) Allocator.Error!void {
+        for (d.prev) |c| {
+            var kept = false;
+            for (d.next) |n| if (std.mem.eql(u8, n.name, c.name)) {
+                kept = true;
+                break;
+            };
+            if (!kept) b.unset(c.name);
+        }
+        for (d.next) |c| try b.set(c.name, c.value);
+    }
+};
+
+fn sameValues(a: *const Builder, b: *const Builder) !void {
+    try std.testing.expectEqual(a.names.items.len, b.names.items.len);
+    for (a.names.items) |n| {
+        try std.testing.expect(b.get(n) != null);
+        try std.testing.expectEqualSlices(u8, a.get(n).?, b.get(n).?);
+    }
+}
 
 test "first entry wins and later duplicates are dropped" {
     const gpa = std.testing.allocator;
@@ -178,6 +282,82 @@ test "validName" {
     try std.testing.expect(!validName("1A"));
     try std.testing.expect(!validName("A-B"));
     try std.testing.expect(!validName(""));
+}
+
+test "patch applies a diff and reverse restores the other side" {
+    const gpa = std.testing.allocator;
+    var from = Builder.init(gpa);
+    defer from.deinit();
+    try from.set("A", "1");
+    try from.set("B", "x\xff");
+    var to = Builder.init(gpa);
+    defer to.deinit();
+    try to.set("B", "3");
+    try to.set("C", "4");
+
+    var forward = try from.diff(gpa, &to);
+    defer forward.deinit();
+    try std.testing.expectEqual(@as(usize, 2), forward.prev.len);
+    try std.testing.expectEqualStrings("A", forward.prev[0].name);
+    try std.testing.expectEqualStrings("1", forward.prev[0].value);
+    try std.testing.expectEqualStrings("B", forward.prev[1].name);
+    try std.testing.expectEqualSlices(u8, "x\xff", forward.prev[1].value);
+    try std.testing.expectEqual(@as(usize, 2), forward.next.len);
+    try std.testing.expectEqualStrings("B", forward.next[0].name);
+    try std.testing.expectEqualStrings("3", forward.next[0].value);
+    try std.testing.expectEqualStrings("C", forward.next[1].name);
+
+    var applied = Builder.init(gpa);
+    defer applied.deinit();
+    try applied.set("A", "1");
+    try applied.set("B", "x\xff");
+    try forward.patch(&applied);
+    try sameValues(&to, &applied);
+    try std.testing.expectEqualStrings("B", applied.names.items[0]);
+    try std.testing.expectEqualStrings("C", applied.names.items[1]);
+
+    var backward = try forward.reverse();
+    defer backward.deinit();
+    var restored = Builder.init(gpa);
+    defer restored.deinit();
+    try restored.set("B", "3");
+    try restored.set("C", "4");
+    try backward.patch(&restored);
+    try sameValues(&from, &restored);
+    try std.testing.expectEqualStrings("B", restored.names.items[0]);
+    try std.testing.expectEqualStrings("A", restored.names.items[1]);
+}
+
+test "a diff of two equal builders is empty and an update keeps its place" {
+    const gpa = std.testing.allocator;
+    var from = Builder.init(gpa);
+    defer from.deinit();
+    try from.set("A", "");
+    try from.set("B", "2");
+    var same = try from.diff(gpa, &from);
+    defer same.deinit();
+    try std.testing.expectEqual(@as(usize, 0), same.prev.len);
+    try std.testing.expectEqual(@as(usize, 0), same.next.len);
+    try same.patch(&from);
+    try std.testing.expectEqualStrings("", from.get("A").?);
+
+    var to = Builder.init(gpa);
+    defer to.deinit();
+    try to.set("A", "9");
+    try to.set("B", "2");
+    var forward = try from.diff(gpa, &to);
+    defer forward.deinit();
+    try forward.patch(&from);
+    try std.testing.expectEqualStrings("A", from.names.items[0]);
+    try std.testing.expectEqualStrings("9", from.get("A").?);
+    try std.testing.expectEqualStrings("2", from.get("B").?);
+
+    var back = try forward.reverse();
+    defer back.deinit();
+    try back.patch(&to);
+    try std.testing.expectEqualStrings("", to.get("A").?);
+    try std.testing.expectEqualStrings("2", to.get("B").?);
+    try std.testing.expectEqualStrings("A", to.names.items[0]);
 }
 
 test "a name the execve block cannot carry is refused" {
