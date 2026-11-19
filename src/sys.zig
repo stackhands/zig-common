@@ -24,6 +24,7 @@ pub const path_max = 4096;
 /// - `Busy`: EBUSY and ETXTBSY
 /// - `InvalidArgument`: EINVAL and EBADF
 /// - `Unsupported`: EOPNOTSUPP and ENOSYS
+/// - `NotRegularFile`: no one errno; returned by higher-level checks
 /// - `Unexpected`: any errno not named here
 ///
 /// Each other error has one errno: `NotFound` ENOENT, `Exists` EEXIST,
@@ -48,6 +49,7 @@ pub const Error = error{
     TooManyLinks,
     ReadOnly,
     Unsupported,
+    NotRegularFile,
     NoData,
     Range,
     NoChild,
@@ -206,6 +208,7 @@ pub fn errnoText(e: linux.E) ?[]const u8 {
 /// the usual errno for `err`.
 pub fn describe(err: Error) []const u8 {
     const recorded = last_errno != .SUCCESS and last_errno != .INTR and errorFor(last_errno) == err;
+    if (err == error.NotRegularFile) return "not a regular file";
     const e: linux.E = if (recorded) last_errno else switch (err) {
         error.NotFound => .NOENT,
         error.Exists => .EXIST,
@@ -222,6 +225,7 @@ pub fn describe(err: Error) []const u8 {
         error.TooManyLinks => .MLINK,
         error.ReadOnly => .ROFS,
         error.Unsupported => .OPNOTSUPP,
+        error.NotRegularFile => unreachable,
         error.NoData => .NODATA,
         error.Range => .RANGE,
         error.NoChild => .CHILD,
