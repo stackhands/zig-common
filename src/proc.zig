@@ -690,6 +690,34 @@ fn shPrints(script: []const u8, stdin: ?[]const u8, want: []const u8) u8 {
     return 1;
 }
 
+const ExecFixture = struct {
+    base: []u8,
+    exe_path: []u8,
+    plain_path: []u8,
+};
+
+fn makeExecFixture(gpa: Allocator, tag: []const u8) (sys.Error || Allocator.Error)!ExecFixture {
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-proc-fixture-{s}-{d}", .{ here, tag, linux.getpid() });
+    errdefer gpa.free(base);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+
+    const exe_path = try std.fs.path.join(gpa, &.{ base, "tool.sh" });
+    errdefer gpa.free(exe_path);
+    const exe_fd = try sys.openat(fsx.cwd, exe_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+    defer sys.close(exe_fd);
+    try sys.writeAll(exe_fd, "#!/bin/sh\nexit 0\n");
+
+    const plain_path = try std.fs.path.join(gpa, &.{ base, "plain.txt" });
+    errdefer gpa.free(plain_path);
+    const plain_fd = try sys.openat(fsx.cwd, plain_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer sys.close(plain_fd);
+    try sys.writeAll(plain_fd, "text\n");
+    return .{ .base = base, .exe_path = exe_path, .plain_path = plain_path };
+}
+
 test "a closed stdout at start does not send the child's stderr to its stdout" {
     try expectChildPasses(struct {
         fn body() u8 {
@@ -730,39 +758,26 @@ test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
 
 test "resolveExecutable resolves slash paths and PATH lookup" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-resolve-exe-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    const fixture = try makeExecFixture(gpa, "resolve");
+    defer gpa.free(fixture.plain_path);
+    defer gpa.free(fixture.exe_path);
+    defer gpa.free(fixture.base);
+    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
 
-    const exe_path = try std.fs.path.join(gpa, &.{ base, "tool.sh" });
-    defer gpa.free(exe_path);
-    const exe_fd = try sys.openat(fsx.cwd, exe_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
-    defer sys.close(exe_fd);
-    try sys.writeAll(exe_fd, "#!/bin/sh\nexit 0\n");
-
-    const nonexec_path = try std.fs.path.join(gpa, &.{ base, "plain.txt" });
-    defer gpa.free(nonexec_path);
-    const nonexec_fd = try sys.openat(fsx.cwd, nonexec_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    defer sys.close(nonexec_fd);
-    try sys.writeAll(nonexec_fd, "text\n");
-
-    const dir_path = try std.fs.path.join(gpa, &.{ base, "dir" });
+    const dir_path = try std.fs.path.join(gpa, &.{ fixture.base, "dir" });
     defer gpa.free(dir_path);
+    var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, dir_path)).ptr, 0o755);
 
-    const by_path = (try resolveExecutable(gpa, exe_path, null)).?;
+    const by_path = (try resolveExecutable(gpa, fixture.exe_path, null)).?;
     defer gpa.free(by_path);
-    try std.testing.expectEqualStrings(exe_path, by_path);
+    try std.testing.expectEqualStrings(fixture.exe_path, by_path);
 
-    const by_name = (try resolveExecutable(gpa, "tool.sh", base)).?;
+    const by_name = (try resolveExecutable(gpa, "tool.sh", fixture.base)).?;
     defer gpa.free(by_name);
-    try std.testing.expectEqualStrings(exe_path, by_name);
+    try std.testing.expectEqualStrings(fixture.exe_path, by_name);
 
-    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, nonexec_path, null));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, fixture.plain_path, null));
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, dir_path, null));
-    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, "not-present-tool", base));
+    try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, "not-present-tool", fixture.base));
 }
