@@ -806,3 +806,19 @@ test "resolveExecutable handles relative slash paths" {
     defer gpa.free(rel_plain);
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, rel_plain, null));
 }
+
+test "which resolves executable candidates directly" {
+    const gpa = std.testing.allocator;
+    const fixture = try makeExecFixture(gpa, "which");
+    defer gpa.free(fixture.plain_path);
+    defer gpa.free(fixture.exe_path);
+    defer gpa.free(fixture.base);
+    defer fsx.deleteTree(gpa, fsx.cwd, fixture.base) catch {};
+
+    const found = (try which(gpa, "tool.sh", fixture.base)).?;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(fixture.exe_path, found);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
+    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
+}
