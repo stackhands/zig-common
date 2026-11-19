@@ -207,8 +207,15 @@ pub fn openRegular(dir: fd_t, path: []const u8, follow: bool) Error!struct { fd:
     const fd = try sys.openat(dir, path, .{ .NOFOLLOW = !follow, .NONBLOCK = true }, 0);
     errdefer sys.close(fd);
     const st = try fstat(fd);
-    if (!st.isReg()) return error.InvalidArgument;
+    if (regularTypeError(st)) |err| return err;
     return .{ .fd = fd, .stat = st };
+}
+
+fn regularTypeError(st: Stat) ?Error {
+    if (st.isReg()) return null;
+    if (st.isLink()) return error.SymLink;
+    if (st.isDir()) return error.IsDir;
+    return error.InvalidArgument;
 }
 
 /// Open the directory `dir/path` for reading with `O_DIRECTORY`. `follow`
@@ -246,11 +253,7 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
         error.NotFound => null,
         else => |e| return e,
     };
-    if (existing) |st| {
-        if (st.isLink()) return error.SymLink;
-        if (st.isDir()) return error.IsDir;
-        if (!st.isReg()) return error.InvalidArgument;
-    }
+    if (existing) |st| if (regularTypeError(st)) |err| return err;
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
     var tmp_buf: [sys.path_max]u8 = undefined;
@@ -900,6 +903,24 @@ test "copyTo copies the whole source and leaves its offset" {
     defer gpa.free(got);
     try std.testing.expectEqualStrings("header\nbody\n", got);
     try std.testing.expectEqual(@as(u64, 7), linux.lseek(src.fd, 0, linux.SEEK.CUR));
+}
+
+test "openRegular reports IsDir for a directory" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-open-regular-dir-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try openDir(cwd, base, false);
+    defer {
+        deleteTree(gpa, cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = linux.mkdirat(d, "subdir", 0o700);
+    try std.testing.expectError(error.IsDir, openRegular(d, "subdir", false));
+    try std.testing.expectEqualStrings("[Errno 21] Is a directory", sys.describe(error.IsDir));
 }
 
 /// A filesystem's answer to each ACL form, GPFS native, generic NFSv4 and
