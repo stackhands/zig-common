@@ -52,7 +52,7 @@ the entry and its hash.
 | `json` | a JSON reader with Python's two string encodings (surrogateescape text, one byte per code point), Python values, and `json.dumps(indent=N, sort_keys=True)` byte for byte, float repr included |
 | `pytext` | byte strings as Python text: the surrogateescape character, the 'replace' decoder, str.isspace, strip and split, shlex.quote |
 | `atomic` | `atomic_write`: replace a file only after its bytes, owner, mode and every ACL form (GPFS NFSv4, NFSv4, POSIX access) are durable and read back; fault points before write, fsync and rename |
-| `syslog` | events to a collector: a `unix:`, `journal:`, `udp:` or `tcp:` target, RFC 5424 and native journald framing, and one send with a timeout that never fails the caller |
+| `syslog` | events to a collector: a `unix:`, `journal:`, `udp:` or `tcp:` target, RFC 5424 and native journald framing for the `Identity` the caller names, and `send`, the transport alone, with a timeout; nothing here fails the caller |
 | `cli` | messages to stdout and stderr that ignore a closed stream, exit code 2 for a refused invocation, the version line |
 
 ## Test
