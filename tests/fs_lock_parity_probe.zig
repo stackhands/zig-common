@@ -28,6 +28,7 @@ const proc = common.proc;
 const pytext = common.pytext;
 const logs = common.logs;
 const flate = std.compress.flate;
+const json = common.json;
 const env = common.env;
 const cli = common.cli;
 
@@ -615,6 +616,202 @@ fn gzMember(data: []const u8, extra: ?[]const u8, fname: ?[]const u8, comment: ?
     return out.items;
 }
 
+fn jsonFuzzMode() void {
+    var prng = std.Random.DefaultPrng.init(0xC0DE_5EED);
+    const rand = prng.random();
+
+    const edges = [_][]const u8{
+        "{\"k\": \"\\ud83d\\ude00\"}",
+        "{\"k\": \"\\ud800\"}",
+        "{\"k\": \"\\udc80\"}",
+        "{\"k\": \"\\ud800\\ud800\"}",
+        "{\"k\": \"\\udbff\\udfff\"}",
+        "{\"k\": \"a\x80b\"}",
+        "{\"k\": \"caf\xe9\"}",
+        "{\"k\": \"caf\xc3\xa9\"}",
+        "{\"a\": 9223372036854775807, \"k\": \"x\"}",
+        "{\"a\": 9223372036854775808, \"k\": \"x\"}",
+        "{\"a\": -9223372036854775808, \"k\": \"x\"}",
+        "{\"a\": -9223372036854775809, \"k\": \"x\"}",
+        "{\"a\": -0, \"k\": \"x\"}",
+        "{\"a\": -0.0, \"k\": \"x\"}",
+        "{\"a\": 0e0, \"k\": \"x\"}",
+        "{\"a\": 1e999, \"k\": \"x\"}",
+        "{\"a\": 1E+5, \"k\": \"x\"}",
+        "{\"k\": 1, \"k\": 2}",
+        "{\"k\": \"first\", \"k\": \"second\"}",
+        "[1, 2, 3]",
+        "{}",
+        "[]",
+        "\"bare\"",
+        "123",
+        "null",
+        "true",
+        "false",
+        "{\"a\": NaN, \"k\": \"x\"}",
+        "{\"a\": Infinity, \"k\": \"x\"}",
+        "{\"a\": -Infinity, \"k\": \"x\"}",
+        "NaN",
+        "\xef\xbb\xbf{}",
+        "{} trailing",
+        "{}{}",
+        "{\"k\":}",
+        "{\"k\" \"x\"}",
+        "{\"k\": \"a\x00b\"}",
+        "\"\\u12\"",
+        "\"raw\x01ctl\"",
+        "01",
+        "1.",
+        ".5",
+        "+1",
+        "1e",
+    };
+    for (edges) |doc| jsonFuzzCase(doc);
+
+    // the nesting limit: 31 and 32 levels parse, 33 and deeper do not
+    for ([_]usize{ 31, 32, 33, 2000 }) |depth| {
+        var doc: std.ArrayList(u8) = .empty;
+        for (0..depth) |_| doc.append(A, '[') catch unreachable;
+        doc.append(A, '1') catch unreachable;
+        for (0..depth) |_| doc.append(A, ']') catch unreachable;
+        jsonFuzzCase(doc.items);
+    }
+
+    for (0..150) |_| jsonFuzzCase(randomJsonDoc(rand));
+}
+
+fn jsonFuzzCase(doc: []const u8) void {
+    const name = std.fmt.allocPrint(A, "{x}", .{doc}) catch unreachable;
+    const parsed = json.parse(A, doc);
+    if (parsed) |v| {
+        emit(&.{ "json-parse", name, "OK" });
+        if (json.toPy(A, v)) |py| {
+            const out = json.dumps(A, py, 0, false) catch unreachable;
+            emit(&.{ "json-topy", name, "OK", hexOf(out) });
+            // the strict reader reads the writer's own output back;
+            // the Infinity the writer gives a float past the range is
+            // the one literal the reader refuses by contract
+            const reparsed = json.parse(A, out) catch {
+                emit(&.{ "json-roundtrip", name, "ERR:Syntax" });
+                return;
+            };
+            const again = json.toPy(A, reparsed) catch {
+                emit(&.{ "json-roundtrip", name, "ERR:Encoding" });
+                return;
+            };
+            const second = json.dumps(A, again, 0, false) catch unreachable;
+            if (std.mem.eql(u8, out, second)) {
+                emit(&.{ "json-roundtrip", name, "OK" });
+            } else {
+                emit(&.{ "json-roundtrip", name, "CHANGED" });
+            }
+        } else |e| {
+            emit(&.{ "json-topy", name, std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable });
+        }
+        const got = v.get("k");
+        if (got == null) {
+            emit(&.{ "json-get", name, "MISSING" });
+        } else switch (got.?) {
+            .string => |raw| {
+                if (json.decodeCache(A, raw)) |value| {
+                    emit(&.{ "json-get", name, "OK", hexOf(value) });
+                } else |e| {
+                    emit(&.{ "json-get", name, std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable });
+                }
+            },
+            else => emit(&.{ "json-get", name, "OTHER" }),
+        }
+    } else |e| {
+        emit(&.{ "json-parse", name, std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable });
+    }
+}
+
+/// A seeded random JSON object whose "k" member is a string, with raw
+/// invalid bytes, escapes, surrogate pairs and lone halves, numbers with
+/// exponents and fractions, and some nesting.
+fn randomJsonDoc(rand: std.Random) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.append(A, '{') catch unreachable;
+    out.appendSlice(A, "\"k\":") catch unreachable;
+    randomJsonString(rand, &out);
+    var members = rand.uintLessThan(usize, 3);
+    while (members > 0) : (members -= 1) {
+        out.append(A, ',') catch unreachable;
+        const key = "abz"[rand.uintLessThan(usize, 3)];
+        out.append(A, '"') catch unreachable;
+        out.append(A, key) catch unreachable;
+        out.appendSlice(A, "\":") catch unreachable;
+        const kind = rand.uintLessThan(usize, 5);
+        switch (kind) {
+            0 => randomJsonString(rand, &out),
+            1 => randomJsonNumber(rand, &out),
+            2 => out.appendSlice(A, "true") catch unreachable,
+            3 => out.appendSlice(A, "null") catch unreachable,
+            else => {
+                out.append(A, '[') catch unreachable;
+                var inner = rand.uintLessThan(usize, 4);
+                while (inner > 0) : (inner -= 1) {
+                    if (inner < 3) out.append(A, ',') catch unreachable;
+                    randomJsonNumber(rand, &out);
+                }
+                out.append(A, ']') catch unreachable;
+            },
+        }
+    }
+    out.append(A, '}') catch unreachable;
+    return out.items;
+}
+
+fn randomJsonString(rand: std.Random, out: *std.ArrayList(u8)) void {
+    out.append(A, '"') catch unreachable;
+    var n = rand.uintLessThan(usize, 13);
+    while (n > 0) : (n -= 1) {
+        const kind = rand.uintLessThan(usize, 7);
+        switch (kind) {
+            0 => out.append(A, 'a' + @as(u8, @intCast(rand.uintLessThan(u8, 26)))) catch unreachable,
+            1 => out.append(A, 0x80 + @as(u8, @intCast(rand.uintLessThan(u8, 0x80)))) catch unreachable,
+            2 => out.appendSlice(A, "\\\"") catch unreachable,
+            3 => out.appendSlice(A, "\\n") catch unreachable,
+            4 => {
+                out.appendSlice(A, "\\u") catch unreachable;
+                const cp = rand.uintLessThan(u32, 0x10000);
+                var hex: [4]u8 = undefined;
+                _ = std.fmt.bufPrint(&hex, "{x:0>4}", .{cp}) catch unreachable;
+                out.appendSlice(A, &hex) catch unreachable;
+            },
+            5 => {
+                out.appendSlice(A, "\\ud83d\\ude00") catch unreachable;
+            },
+            else => out.appendSlice(A, "\\ud800") catch unreachable,
+        }
+    }
+    out.append(A, '"') catch unreachable;
+}
+
+fn randomJsonNumber(rand: std.Random, out: *std.ArrayList(u8)) void {
+    if (rand.boolean()) out.append(A, '-') catch unreachable;
+    const digits = 1 + rand.uintLessThan(usize, 9);
+    var i: usize = 0;
+    while (i < digits) : (i += 1) {
+        out.append(A, '0' + @as(u8, @intCast(rand.uintLessThan(u8, 10)))) catch unreachable;
+    }
+    if (rand.boolean()) {
+        out.append(A, '.') catch unreachable;
+        var frac = 1 + rand.uintLessThan(usize, 3);
+        while (frac > 0) : (frac -= 1) {
+            out.append(A, '0' + @as(u8, @intCast(rand.uintLessThan(u8, 10)))) catch unreachable;
+        }
+    }
+    if (rand.boolean()) {
+        out.append(A, 'e') catch unreachable;
+        if (rand.boolean()) out.append(A, '+') catch unreachable;
+        var exp = 1 + rand.uintLessThan(usize, 3);
+        while (exp > 0) : (exp -= 1) {
+            out.append(A, '0' + @as(u8, @intCast(rand.uintLessThan(u8, 10)))) catch unreachable;
+        }
+    }
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -697,6 +894,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         copyEdgesMode();
     } else if (std.mem.eql(u8, mode, "gunzip")) {
         gunzipMode();
+    } else if (std.mem.eql(u8, mode, "jsonfuzz")) {
+        jsonFuzzMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {

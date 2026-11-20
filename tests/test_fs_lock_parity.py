@@ -17,6 +17,7 @@ is missing. ZIG_COMMON_PARITY_PROBE names another binary.
 import errno
 import fcntl
 import gzip
+import json
 import os
 import shutil
 import stat
@@ -340,6 +341,67 @@ def make_gzip_fixture(root):
         os.path.join(root_b, b"run.1234.log"),
         ns=(1600000000 * 10 ** 9 + 123456789,) * 2,
     )
+
+
+class _Literal(Exception):
+    pass
+
+
+def _raise_constant(_name):
+    raise _Literal()
+
+
+def _depth(obj):
+    """Container levels of the parsed structure, without recursion: the
+    library refuses a document whose nesting passes 32."""
+    deepest = 0
+    stack = [(obj, 0)]
+    while stack:
+        node, level = stack.pop()
+        if isinstance(node, dict):
+            deepest = max(deepest, level + 1)
+            stack.extend((v, level + 1) for v in node.values())
+        elif isinstance(node, list):
+            deepest = max(deepest, level + 1)
+            stack.extend((v, level + 1) for v in node)
+    return deepest
+
+
+def _bad_lone(text):
+    """A lone surrogate outside the surrogateescape range, which the
+    library cannot put in the environment."""
+    return any(
+        0xD800 <= ord(c) <= 0xDFFF and not (0xDC80 <= ord(c) <= 0xDCFF)
+        for c in text
+    )
+
+
+def _bad_doc(obj):
+    """A document toPy refuses: an integer past i64, which json.loads
+    keeps exact, or a string the environment cannot carry."""
+    if isinstance(obj, bool) or obj is None:
+        return False
+    if isinstance(obj, int):
+        return not (-(2 ** 63) <= obj < 2 ** 63)
+    if isinstance(obj, str):
+        return _bad_lone(obj)
+    if isinstance(obj, dict):
+        return any(_bad_lone(k) or _bad_doc(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_bad_doc(v) for v in obj)
+    return False
+
+
+def _has_inf(obj):
+    """A float out of range, which the writer emits as Infinity, the
+    one literal the strict reader refuses by contract."""
+    if isinstance(obj, float):
+        return obj in (float("inf"), float("-inf"))
+    if isinstance(obj, dict):
+        return any(_has_inf(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_inf(v) for v in obj)
+    return False
 
 
 class FsLockParity(unittest.TestCase):
@@ -890,6 +952,111 @@ class FsLockParity(unittest.TestCase):
             checked += 1
         self.assertGreaterEqual(checked, 16, "too few gunzip cases")
         self.assertGreaterEqual(ok_cases, 8, "too few accepted gunzip cases")
+
+    def test_json_fuzz(self):
+        """parse, toPy and Value.get over an edge corpus and a seeded
+        random one, against Python's json.loads on strictly decoded
+        text, the way the consumers read it: arch-guard decodes with
+        blob.decode("utf-8") before json.loads, and eb-staged-rebuild
+        decodes strict UTF-8 in engine, journal, metrics and outbox. A
+        raw byte that is not UTF-8 is a refusal that must match."""
+        out = run_probe("jsonfuzz")
+        parse_ok = refusal_ok = topy_ok = get_ok = roundtrip_ok = 0
+
+        for line in out.splitlines():
+            parts = line.split("\t")
+            doc = bytes.fromhex(parts[1])
+            try:
+                text = doc.decode("utf-8")
+            except UnicodeDecodeError:
+                # the consumers decode strict UTF-8 and refuse the
+                # whole document; the library must refuse it too, and
+                # the byte parser accepts it, toPy carries the refusal
+                if parts[0] == "json-topy":
+                    self.assertEqual(
+                        parts[2],
+                        "ERR:Encoding",
+                        "toPy of raw non-UTF-8 %r" % doc[:60],
+                    )
+                    refusal_ok += 1
+                continue
+
+            if parts[0] == "json-parse":
+                try:
+                    obj = json.loads(text, parse_constant=_raise_constant)
+                except _Literal:
+                    continue
+                except ValueError:
+                    continue
+                if _depth(obj) > 32:
+                    continue
+                self.assertEqual(parts[2], "OK", "parse of %r" % text[:60])
+                parse_ok += 1
+                continue
+
+            try:
+                state = json.loads(text, parse_constant=_raise_constant)
+            except (_Literal, ValueError):
+                continue
+            if _depth(state) > 32:
+                continue
+
+            if parts[0] == "json-topy":
+                if _bad_doc(state):
+                    self.assertEqual(
+                        parts[2], "ERR:Encoding", "toPy of %r" % text[:60]
+                    )
+                else:
+                    self.assertEqual(parts[2], "OK", "toPy of %r" % text[:60])
+                    self.assertEqual(
+                        bytes.fromhex(parts[3]).decode(),
+                        json.dumps(state, indent=0),
+                        "toPy value of %r" % text[:60],
+                    )
+                    topy_ok += 1
+            elif parts[0] == "json-get":
+                if not isinstance(state, dict) or "k" not in state:
+                    self.assertEqual(parts[2], "MISSING", "get of %r" % text[:60])
+                elif not isinstance(state["k"], str):
+                    self.assertEqual(parts[2], "OTHER", "get of %r" % text[:60])
+                elif _bad_lone(state["k"]):
+                    self.assertEqual(
+                        parts[2], "ERR:Encoding", "get of %r" % text[:60]
+                    )
+                else:
+                    self.assertEqual(parts[2], "OK", "get of %r" % text[:60])
+                    self.assertEqual(
+                        bytes.fromhex(parts[3]),
+                        os.fsencode(state["k"]),
+                        "get value of %r" % text[:60],
+                    )
+                    get_ok += 1
+            elif parts[0] == "json-roundtrip":
+                if _has_inf(state):
+                    self.assertEqual(
+                        parts[2],
+                        "ERR:Syntax",
+                        "the Infinity literal round trip of %r" % text[:60],
+                    )
+                else:
+                    self.assertEqual(
+                        parts[2], "OK", "round trip of %r" % text[:60]
+                    )
+                    roundtrip_ok += 1
+
+        # every raw non-UTF-8 document must be refused somewhere, which
+        # the toPy lines carry for the ones the byte parser accepts
+        refusals = sum(
+            1
+            for line in out.splitlines()
+            if line.split("\t")[0] == "json-topy"
+            and line.split("\t")[2] == "ERR:Encoding"
+        )
+        self.assertGreaterEqual(refusals, 10, "too few non-UTF-8 refusals")
+        self.assertGreaterEqual(parse_ok, 40, "too few accepted documents")
+        self.assertGreaterEqual(topy_ok, 25, "too few toPy values")
+        self.assertGreaterEqual(get_ok, 25, "too few get values")
+        self.assertGreaterEqual(roundtrip_ok, 25, "too few round trips")
 
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
