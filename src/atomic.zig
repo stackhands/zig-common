@@ -132,24 +132,33 @@ pub fn describe(err: Error) []const u8 {
 fn failOs(a: Allocator, why: *Why, err: sys.Error, path: ?[]const u8, path2: ?[]const u8) Error {
     const text = sys.describe(err);
     if (path2) |second| {
-        const q1 = pytext.reprStrAlloc(a, path orelse "") catch return error.OutOfMemory;
+        const q1 = pytext.reprStrAlloc(a, path orelse "") catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
         defer a.free(q1);
-        const q2 = pytext.reprStrAlloc(a, second) catch return error.OutOfMemory;
+        const q2 = pytext.reprStrAlloc(a, second) catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
         defer a.free(q2);
         why.msg = a.print("{s}: {s} -> {s}", .{ text, q1, q2 }) catch unallocated_refusal;
     } else if (path) |one| {
-        const q1 = pytext.reprStrAlloc(a, one) catch return error.OutOfMemory;
+        const q1 = pytext.reprStrAlloc(a, one) catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
         defer a.free(q1);
         why.msg = a.print("{s}: {s}", .{ text, q1 }) catch unallocated_refusal;
     } else why.msg = a.print("{s}", .{text}) catch unallocated_refusal;
     return err;
 }
 
-/// Why a replacement was refused; filled in when an error is returned. The
-/// message is allocated from the allocator given with `why` and belongs to
-/// the caller: `deinit` frees it.
+/// Why a replacement failed; filled in when an error is returned. The
+/// message may be allocated from the allocator given with `why` and belongs
+/// to the caller: call `deinit` after any error.
 pub const Why = struct {
-    /// The reason for the refusal; empty until there is one.
+    /// The reason for the failure; empty until there is one.
     msg: []const u8 = "",
 
     /// Free the message when it was allocated from `a`, and empty it. An
@@ -160,9 +169,9 @@ pub const Why = struct {
     }
 };
 
-/// The errors of this module: `error.Refused`, with the reason in the
-/// caller's `Why`; `error.OutOfMemory`; or the `sys.Error` of a failed
-/// call, which `describe` words as Python does.
+/// The errors of this module: `error.Refused`, `error.OutOfMemory`, or the
+/// `sys.Error` of a failed call, which `describe` words as Python does.
+/// `atomicWrite` callers deinitialize `Why` after any error.
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
 /// The message of a refusal that could not allocate its own.
@@ -558,8 +567,8 @@ pub const WriteOptions = struct {
 /// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
 /// precede those operations, and in a replaceable build can fail them
 /// (Faults.fails); the destination is never unlinked first. Everything it
-/// allocates from `a` is freed before it returns, except the message of a
-/// refusal (see `Why`).
+/// allocates from `a` is freed before it returns, except the failure message
+/// in `why`. Call `why.deinit(a)` after any error.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
@@ -712,6 +721,26 @@ test "Why.deinit frees a refusal's message only when it was allocated" {
     try std.testing.expectEqualStrings("", why.msg);
 }
 
+test "an OOM while formatting any OSError path keeps the system error" {
+    const gpa = std.testing.allocator;
+    var why: Why = .{};
+    try std.testing.expectEqual(error.NoSpace, failOs(std.testing.failing_allocator, &why, error.NoSpace, "path", null));
+    try std.testing.expectEqualStrings("refused", why.msg);
+    why.deinit(gpa);
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    try std.testing.expectEqual(error.NoSpace, failOs(failing.allocator(), &why, error.NoSpace, "path", null));
+    try std.testing.expectEqualStrings("refused", why.msg);
+    why.deinit(gpa);
+
+    for (0..3) |fail_index| {
+        var two_path_failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        try std.testing.expectEqual(error.NoSpace, failOs(two_path_failing.allocator(), &why, error.NoSpace, "old", "new"));
+        try std.testing.expectEqualStrings("refused", why.msg);
+        why.deinit(gpa);
+    }
+}
+
 test "atomicWrite keeps the mode and refuses a symlink" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -724,6 +753,7 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     defer fsx.deleteTree(a, fsx.cwd, base) catch {};
     const p = try a.print("{s}/j.json", .{base});
     var why: Why = .{};
+    defer why.deinit(a);
     try atomicWrite(a, p, "one\n", .{ .mode = 0o640 }, &why);
     try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(fsx.cwd, p, false)).perm());
     try atomicWrite(a, p, "two\n", .{}, &why);
@@ -756,6 +786,7 @@ test "a step a test makes fail leaves the destination and no temporary file" {
     defer fsx.deleteTree(a, fsx.cwd, dir) catch {};
     const path = try a.print("{s}/f", .{dir});
     var why: Why = .{};
+    defer why.deinit(a);
     try atomicWrite(a, path, "old\n", .{}, &why);
     for ([_][]const u8{ "j.write", "j.fsync", "j.rename" }) |step| {
         var want: []const u8 = step;
@@ -766,6 +797,7 @@ test "a step a test makes fail leaves the destination and no temporary file" {
         defer sys.close(f.fd);
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
         try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try a.print("{s}/.f.new", .{dir}), false));
+        why.deinit(a);
     }
 }
 
