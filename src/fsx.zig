@@ -612,6 +612,18 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
     done = true;
 }
 
+/// Eight random characters from `a-z`, `0-9` and `_`, the alphabet of
+/// Python's `tempfile`.
+fn randomName() Error![8]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    var rnd: [8]u8 = undefined;
+    // A name from bytes getrandom did not fill would not be random.
+    const got = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    if (got != rnd.len) return error.Unexpected;
+    for (&rnd) |*b| b.* = alphabet[b.* % alphabet.len];
+    return rnd;
+}
+
 /// Create a private 0700 directory `{dir}/{prefix}XXXXXXXX` with a random
 /// suffix, retrying on `error.Exists`, and return its path allocated from
 /// `gpa`. The caller owns the returned slice.
@@ -640,14 +652,9 @@ fn reportMkError(gpa: Allocator, why: *atomic.Why, err: anyerror, dir: []const u
 }
 
 fn mkdtempReportInner(gpa: Allocator, dir: []const u8, prefix: []const u8, why: *atomic.Why) (Error || Allocator.Error)![]u8 {
-    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
-        var rnd: [8]u8 = undefined;
-        // A name from bytes getrandom did not fill would not be random.
-        const got = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-        if (got != rnd.len) return error.Unexpected;
-        for (&rnd) |*b| b.* = alphabet[b.* % alphabet.len];
+        const rnd = try randomName();
         const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, rnd });
         defer gpa.free(name);
         const path = try std.fs.path.join(gpa, &.{ dir, name });
@@ -764,6 +771,260 @@ test "mkdtemp creates private 0700 directories with distinct names" {
     const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
     defer gpa.free(missing);
     try std.testing.expectError(error.NotFound, mkdtemp(gpa, missing, "pre-"));
+}
+
+/// The directories `tempfile.gettempdir` tries, in its order: the values of
+/// TMPDIR, TEMP and TMP that are set and not empty, then `/tmp`,
+/// `/var/tmp` and `/usr/tmp`, then the working directory, or "." when that
+/// cannot be read. `env` is anything with `get(name) ?[]const u8`, such as
+/// `Env` or a string map. The strings are as given, not made absolute. The
+/// last one, the working directory, is a copy allocated from `gpa`;
+/// `freeTempDirCandidates` frees it with the list.
+pub fn tempDirCandidates(gpa: Allocator, env: anytype) Allocator.Error![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(gpa);
+    for ([_][]const u8{ "TMPDIR", "TEMP", "TMP" }) |name| {
+        const v = env.get(name) orelse continue;
+        if (v.len > 0) try list.append(gpa, v);
+    }
+    try list.appendSlice(gpa, &.{ "/tmp", "/var/tmp", "/usr/tmp" });
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try gpa.dupe(u8, getcwd(&buf) catch ".");
+    errdefer gpa.free(here);
+    try list.append(gpa, here);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Free a list `tempDirCandidates` returned, with the copy at its end.
+pub fn freeTempDirCandidates(gpa: Allocator, candidates: []const []const u8) void {
+    gpa.free(candidates[candidates.len - 1]);
+    gpa.free(candidates);
+}
+
+/// `os.getcwd()`: the working directory as the kernel names it, which is an
+/// error when the directory has been removed.
+fn getcwd(buf: *[sys.path_max]u8) Error![]const u8 {
+    const n = try sys.call(linux.getcwd, .{ buf, buf.len });
+    return buf[0..n -| 1];
+}
+
+/// `tempfile._get_default_tempdir`'s probe of one directory: a new file with
+/// a random name, `blat` written to it, closed and removed. Python tries
+/// 100 names, goes on only after a name that exists, and gives up on the
+/// directory at any other error. A short write is not an error there.
+fn tempDirUsable(gpa: Allocator, dir: []const u8) bool {
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        const rnd = randomName() catch return false;
+        const path = std.fs.path.join(gpa, &.{ dir, &rnd }) catch return false;
+        defer gpa.free(path);
+        const fd = sys.openat(cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600) catch |err| switch (err) {
+            error.Exists => continue,
+            else => return false,
+        };
+        const wrote = if (sys.call(linux.write, .{ fd, "blat", 4 })) |_| true else |_| false;
+        sys.close(fd);
+        sys.unlinkat(cwd, path, 0) catch return false;
+        return wrote;
+    }
+    return false;
+}
+
+/// The directory `_get_default_tempdir` probes for `candidate`, as a copy
+/// allocated from `gpa`: "." as it is, any other value made absolute and
+/// normalized like `os.path.abspath`. A relative value needs `os.getcwd()`,
+/// and Python lets its error out of gettempdir.
+fn tempDirPath(gpa: Allocator, candidate: []const u8) (Error || Allocator.Error)![]u8 {
+    if (std.mem.eql(u8, candidate, ".")) return gpa.dupe(u8, candidate);
+    if (candidate[0] == '/') return normPath(gpa, candidate);
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try getcwd(&buf);
+    const joined = try std.mem.concat(gpa, u8, &.{ here, "/", candidate });
+    defer gpa.free(joined);
+    return normPath(gpa, joined);
+}
+
+/// `tempfile.gettempdir`: the first of `tempDirCandidates` that takes the
+/// probe file, made absolute and normalized like `os.path.abspath`. Python
+/// keeps the answer for the life of the process, and so does `path` here:
+/// a later call returns it without looking at the environment or the
+/// directory again. A failure is not kept; each call tries again.
+///
+/// `path` and `message` are allocated from the `gpa` given to `get` and
+/// owned by the `TempDir`; `deinit` frees them. Nothing else a call
+/// allocates outlives it.
+pub const TempDir = struct {
+    /// The directory once one has been found.
+    path: ?[]const u8 = null,
+    /// After `error.NoTempDir`, `str()` of the FileNotFoundError Python
+    /// raises, "[Errno 2] No usable temporary directory found in [...]",
+    /// with the candidates as repr writes them, or "[Errno 2] No such file
+    /// or directory" when a relative value needed a working directory that
+    /// was removed. Each failed call replaces it.
+    message: []const u8 = "",
+
+    /// Free `path` and `message` and reset `td`.
+    pub fn deinit(td: *TempDir, gpa: Allocator) void {
+        if (td.path) |p| gpa.free(p);
+        if (td.message.len > 0) gpa.free(td.message);
+        td.* = .{};
+    }
+
+    /// The directory, from the cache or by trying the candidates.
+    pub fn get(td: *TempDir, gpa: Allocator, env: anytype) error{ NoTempDir, OutOfMemory }![]const u8 {
+        if (td.path) |p| return p;
+        const candidates = try tempDirCandidates(gpa, env);
+        defer freeTempDirCandidates(gpa, candidates);
+        for (candidates) |candidate| {
+            const dir = tempDirPath(gpa, candidate) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |e| {
+                    td.setMessage(gpa, try gpa.dupe(u8, sys.describe(e)));
+                    return error.NoTempDir;
+                },
+            };
+            if (tempDirUsable(gpa, dir)) {
+                td.path = dir;
+                return dir;
+            }
+            gpa.free(dir);
+        }
+        td.setMessage(gpa, try noTempDirMessage(gpa, candidates));
+        return error.NoTempDir;
+    }
+
+    fn setMessage(td: *TempDir, gpa: Allocator, message: []const u8) void {
+        if (td.message.len > 0) gpa.free(td.message);
+        td.message = message;
+    }
+};
+
+fn noTempDirMessage(gpa: Allocator, candidates: []const []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "[Errno 2] No usable temporary directory found in [");
+    for (candidates, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try pytext.reprStr(&out, gpa, c);
+    }
+    try out.append(gpa, ']');
+    return out.toOwnedSlice(gpa);
+}
+
+test "tempDirCandidates follows tempfile's order and skips empty values" {
+    const gpa = std.testing.allocator;
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMP", "/m");
+    try env.put(gpa, "TMPDIR", "rel/./dir/");
+    try env.put(gpa, "TEMP", "");
+    const got = try tempDirCandidates(gpa, env);
+    defer freeTempDirCandidates(gpa, got);
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &buf);
+    const want = [_][]const u8{ "rel/./dir/", "/m", "/tmp", "/var/tmp", "/usr/tmp", here };
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+    const bare = try tempDirCandidates(gpa, std.StringHashMapUnmanaged([]const u8).empty);
+    defer freeTempDirCandidates(gpa, bare);
+    try std.testing.expectEqual(@as(usize, 4), bare.len);
+}
+
+test "TempDir takes the first usable candidate and keeps it" {
+    const gpa = std.testing.allocator;
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-tempdir-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, base) catch {};
+
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    const unnormalized = try std.fmt.allocPrint(gpa, "{s}/./sub/..//", .{base});
+    defer gpa.free(unnormalized);
+    try env.put(gpa, "TMPDIR", "/nonexistent-zig-common-dir");
+    try env.put(gpa, "TEMP", unnormalized);
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+    try std.testing.expectEqualStrings(base, try td.get(gpa, env));
+
+    try env.put(gpa, "TEMP", "/nonexistent-zig-common-dir");
+    try std.testing.expectEqualStrings(base, try td.get(gpa, env));
+
+    var fresh: TempDir = .{};
+    defer fresh.deinit(gpa);
+    const system = try fresh.get(gpa, env);
+    try std.testing.expect(!std.mem.eql(u8, system, base));
+    try std.testing.expect(system[0] == '/');
+}
+
+test "TempDir frees what its failed calls allocate" {
+    // std.testing.allocator fails the test on a leak, so each candidate
+    // that fails, each join of a relative value and each replaced message
+    // must be freed, and deinit must free what the TempDir keeps.
+    const gpa = std.testing.allocator;
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMPDIR", "/nonexistent-zig-common-dir/./x/..");
+    try env.put(gpa, "TEMP", "relative-zig-common-missing");
+    try env.put(gpa, "TMP", "it's");
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+
+    {
+        // Under a file size limit of 0 with SIGXFSZ ignored, every probe
+        // write fails with EFBIG, so every candidate fails, twice over.
+        var lim: linux.rlimit = undefined;
+        try std.testing.expectEqual(@as(usize, 0), linux.getrlimit(.FSIZE, &lim));
+        const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+        var old: linux.Sigaction = undefined;
+        _ = linux.sigaction(linux.SIG.XFSZ, &ignore, &old);
+        defer _ = linux.sigaction(linux.SIG.XFSZ, &old, null);
+        const zero: linux.rlimit = .{ .cur = 0, .max = lim.max };
+        try std.testing.expectEqual(@as(usize, 0), linux.setrlimit(.FSIZE, &zero));
+        defer _ = linux.setrlimit(.FSIZE, &lim);
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+    }
+    try std.testing.expect(td.path == null);
+    try std.testing.expect(std.mem.startsWith(u8, td.message, "[Errno 2] No usable temporary directory found in ['/nonexistent-zig-common-dir/./x/..', 'relative-zig-common-missing', \"it's\", '/tmp', "));
+
+    {
+        // A relative value under a removed working directory replaces the
+        // message with the error of os.getcwd().
+        var here_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &here_buf);
+        var hz: [sys.path_max:0]u8 = undefined;
+        const here_z = try sys.z(&hz, here);
+        var gb: [sys.path_max]u8 = undefined;
+        const gone = try std.fmt.bufPrint(&gb, "{s}/.zig-cache/zig-common-tempdir-gone-{d}", .{ here, linux.getpid() });
+        var gz: [sys.path_max:0]u8 = undefined;
+        const gone_z = try sys.z(&gz, gone);
+        try std.testing.expectEqual(@as(usize, 0), linux.mkdirat(cwd, gone_z.ptr, 0o700));
+        try std.testing.expectEqual(@as(usize, 0), linux.chdir(gone_z.ptr));
+        defer _ = linux.chdir(here_z.ptr);
+        try sys.unlinkat(cwd, gone, linux.AT.REMOVEDIR);
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+        try std.testing.expectEqualStrings("[Errno 2] No such file or directory", td.message);
+    }
+
+    try env.put(gpa, "TMPDIR", "/tmp/./");
+    const dir = try td.get(gpa, env);
+    try std.testing.expectEqualStrings("/tmp", dir);
+    try std.testing.expectEqual(dir.ptr, (try td.get(gpa, env)).ptr);
+}
+
+test "the temporary directory message quotes candidates as repr does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const msg = try noTempDirMessage(a, &.{ "/tmp", "it's", "a\"b'c\n", "\xff" });
+    try std.testing.expectEqualStrings(
+        "[Errno 2] No usable temporary directory found in ['/tmp', \"it's\", 'a\"b\\'c\\n', '\\udcff']",
+        msg,
+    );
 }
 
 /// The `d_type` values of a directory entry, as `std.os.linux.DT`:

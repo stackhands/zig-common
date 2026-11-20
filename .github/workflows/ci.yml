@@ -48,6 +48,14 @@ jobs:
           fi
           zig build fs-lock-parity-probe
           python3 tests/test_fs_lock_parity.py
+      - name: parity with python's tempfile.gettempdir
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found, skipping the parity test"
+            exit 0
+          fi
+          zig build tempdir-probe
+          python3 tests/test_gettempdir_parity.py
       - name: no site names in the tree
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'

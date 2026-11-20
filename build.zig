@@ -66,6 +66,18 @@ pub fn build(b: *std.Build) void {
     update_nd.addCopyFileToSource(gen_nd.captureStdOut(.{}), "src/pytext_nd.zig");
     b.step("gen-pytext-nd", "Regenerate src/pytext_nd.zig from unicodedata").dependOn(&update_nd.step);
 
+    // The temporary directory probe, whose output
+    // tests/test_gettempdir_parity.py compares with tempfile.gettempdir.
+    const tempdir_mod = b.createModule(.{
+        .root_source_file = b.path("tests/tempdir_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tempdir_mod.addImport("zig_common", mod);
+    const tempdir_probe = b.addExecutable(.{ .name = "tempdir_probe", .root_module = tempdir_mod });
+    const install_tempdir = b.addInstallArtifact(tempdir_probe, .{});
+    b.step("tempdir-probe", "Build the tempfile parity probe").dependOn(&install_tempdir.step);
+
     // The API reference from the doc comments, into <prefix>/docs.
     const lib = b.addLibrary(.{ .name = "zig_common", .root_module = mod });
     const docs = b.addInstallDirectory(.{
