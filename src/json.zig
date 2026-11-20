@@ -477,6 +477,21 @@ test "a truncated or malformed escape is an encoding error" {
     try std.testing.expect(obj.get("a") == null);
 }
 
+test "an earlier duplicate that cannot decode is dropped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // json.loads keeps the last value of a duplicate key, so the
+    // earlier member the last one replaces is never part of the result
+    // and cannot fail the document
+    const v = try parse(a, "{\"k\": \"\\ud800\", \"k\": \"kept\"}");
+    const py = try toPy(a, v);
+    try std.testing.expectEqual(@as(usize, 1), py.dict.len);
+    try std.testing.expectEqualStrings("k", py.dict[0].key);
+    try std.testing.expectEqualStrings("kept", py.dict[0].value.str);
+}
+
 test "parse objects, duplicates and nesting" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -585,9 +600,29 @@ pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
             break :blk .{ .list = out };
         },
         .object => |members| blk: {
-            // A later duplicate key replaces the earlier one, in its place.
+            // A later duplicate key replaces the earlier one, in its
+            // place, as json.loads keeps the last value; the earlier
+            // member the last one replaces is never decoded, so a
+            // value the document drops cannot fail it.
+            const keys = try arena.alloc([]const u8, members.len);
+            const kept = try arena.alloc(bool, members.len);
+            for (members, 0..) |mem, i| {
+                keys[i] = try decodeCache(arena, mem.key);
+                kept[i] = true;
+            }
+            for (0..members.len) |i| {
+                for (i + 1..members.len) |j| {
+                    if (std.mem.eql(u8, keys[i], keys[j])) {
+                        kept[i] = false;
+                        break;
+                    }
+                }
+            }
             var m: std.StringArrayHashMapUnmanaged(Py) = .empty;
-            for (members) |mem| try m.put(arena, try decodeCache(arena, mem.key), try toPy(arena, mem.value));
+            for (members, 0..) |mem, i| {
+                if (!kept[i]) continue;
+                try m.put(arena, keys[i], try toPy(arena, mem.value));
+            }
             const out = try arena.alloc(Py.Entry, m.count());
             for (m.keys(), m.values(), 0..) |k, val, i| out[i] = .{ .key = k, .value = val };
             break :blk .{ .dict = out };
