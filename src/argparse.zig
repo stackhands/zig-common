@@ -306,3 +306,617 @@ pub fn optionLike(arg: []const u8, mode: NegativeNumberMode) bool {
 pub fn reprToken(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
     return pytext.reprStrAlloc(gpa, s);
 }
+
+// ---- pure parser implementation -------------------------------------------
+
+fn makeError(gpa: Allocator, spec: *const CommandSpec, comptime fmt: []const u8, args: anytype) Allocator.Error!ParseOutcome {
+    const msg = try std.fmt.allocPrint(gpa, fmt, args);
+    return .{ .usage_error = .{
+        .usage = spec.usage,
+        .prog = spec.prog,
+        .message = msg,
+    } };
+}
+
+fn formatOptionDisplay(gpa: Allocator, opt: OptionSpec) Allocator.Error![]u8 {
+    if (opt.short) |s| {
+        return std.fmt.allocPrint(gpa, "-{c}/--{s}", .{ s, opt.name });
+    }
+    return std.fmt.allocPrint(gpa, "--{s}", .{opt.name});
+}
+
+fn formatAmbiguous(gpa: Allocator, spec: *const CommandSpec, prefix: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (spec.add_help and std.mem.startsWith(u8, "help", prefix)) {
+        try out.appendSlice(gpa, "--help");
+    }
+    if (spec.version != null and std.mem.startsWith(u8, "version", prefix)) {
+        if (out.items.len > 0) try out.appendSlice(gpa, ", ");
+        try out.appendSlice(gpa, "--version");
+    }
+    for (spec.options) |o| {
+        if (std.mem.startsWith(u8, o.name, prefix)) {
+            if (out.items.len > 0) try out.appendSlice(gpa, ", ");
+            try out.print(gpa, "--{s}", .{o.name});
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+const LongMatch = union(enum) {
+    none,
+    help,
+    version,
+    option: usize,
+    ambiguous,
+};
+
+fn matchLong(spec: *const CommandSpec, name: []const u8) LongMatch {
+    const abbrev = spec.policy.allow_abbrev;
+    var match_help = false;
+    var match_ver = false;
+    var hit: ?usize = null;
+    var count: usize = 0;
+
+    if (spec.add_help and std.mem.eql(u8, "help", name)) return .help;
+    if (spec.version != null and std.mem.eql(u8, "version", name)) return .version;
+    for (spec.options, 0..) |o, idx| {
+        if (std.mem.eql(u8, o.name, name)) return .{ .option = idx };
+    }
+    if (!abbrev) return .none;
+
+    if (spec.add_help and std.mem.startsWith(u8, "help", name)) {
+        match_help = true;
+        count += 1;
+    }
+    if (spec.version != null and std.mem.startsWith(u8, "version", name)) {
+        match_ver = true;
+        count += 1;
+    }
+    for (spec.options, 0..) |o, idx| {
+        if (std.mem.startsWith(u8, o.name, name)) {
+            hit = idx;
+            count += 1;
+        }
+    }
+    if (count > 1) return .ambiguous;
+    if (match_help) return .help;
+    if (match_ver) return .version;
+    if (hit) |k| return .{ .option = k };
+    return .none;
+}
+
+const ShortTarget = union(enum) {
+    help,
+    option: usize,
+};
+
+fn matchShortChar(spec: *const CommandSpec, c: u8) ?ShortTarget {
+    if (spec.add_help and c == 'h') return .help;
+    for (spec.options, 0..) |o, idx| {
+        if (o.short) |s| if (s == c) return .{ .option = idx };
+    }
+    return null;
+}
+
+const ClusterItem = struct {
+    target: ShortTarget,
+    explicit: ?[]const u8 = null,
+};
+
+fn hasRemainder(spec: *const CommandSpec) bool {
+    for (spec.positionals) |p| if (p.arity == .remainder) return true;
+    return false;
+}
+
+fn nonRemainderPositionals(spec: *const CommandSpec) usize {
+    var n: usize = 0;
+    for (spec.positionals) |p| if (p.arity != .remainder) {
+        n += 1;
+    };
+    return n;
+}
+
+fn checkUnrecognized(
+    gpa: Allocator,
+    top_spec: *const CommandSpec,
+    top_extra: []const []const u8,
+    leftovers: []const Leftover,
+    consumed_positionals: usize,
+    keep_separator: bool,
+) Allocator.Error!?ParseOutcome {
+    var all: std.ArrayList([]const u8) = .empty;
+    defer all.deinit(gpa);
+    try all.appendSlice(gpa, top_extra);
+
+    var consumed = consumed_positionals;
+    var last_consumed: ?usize = null;
+    var dropped = keep_separator;
+    for (leftovers, 0..) |item, idx| {
+        if (item.is_positional and consumed > 0) {
+            consumed -= 1;
+            last_consumed = idx;
+            continue;
+        }
+        if (item.is_separator and !dropped) {
+            const adjacent_after = last_consumed != null and idx == last_consumed.? + 1;
+            const optional_empty = consumed_positionals == 0 and !keep_separator and last_consumed == null;
+            if (consumed > 0 or adjacent_after or optional_empty) {
+                dropped = true;
+                continue;
+            }
+        }
+        try all.append(gpa, item.token);
+    }
+    if (all.items.len == 0) return null;
+    const joined = try std.mem.join(gpa, " ", all.items);
+    defer gpa.free(joined);
+    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{joined});
+}
+
+fn buildParsedState(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    opt_seen: []bool,
+    opt_values: []?[]const u8,
+    opt_lists: []std.ArrayList([]const u8),
+    pos: *std.ArrayList([]const u8),
+    remainder: []const []const u8,
+    help_requested: bool,
+    version_requested: bool,
+) Allocator.Error!Parsed {
+    const owned_lists = try gpa.alloc([]const []const u8, opt_lists.len);
+    var built: usize = 0;
+    errdefer {
+        for (owned_lists[0..built]) |lst| {
+            if (lst.len > 0) gpa.free(lst);
+        }
+        gpa.free(owned_lists);
+    }
+    for (opt_lists, 0..) |*lst, idx| {
+        owned_lists[idx] = if (lst.items.len > 0) try lst.toOwnedSlice(gpa) else &.{};
+        built += 1;
+    }
+    const owned_pos: []const []const u8 = if (pos.items.len > 0) try pos.toOwnedSlice(gpa) else &.{};
+    return .{
+        .spec = spec,
+        .opt_seen = opt_seen,
+        .opt_values = opt_values,
+        .opt_lists = owned_lists,
+        .positionals = owned_pos,
+        .remainder = remainder,
+        .leftovers = &.{},
+        .help_requested = help_requested,
+        .version_requested = version_requested,
+    };
+}
+
+fn parseCommand(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    top_spec: *const CommandSpec,
+    argv: []const []const u8,
+    top_extra: []const []const u8,
+) Allocator.Error!ParseOutcome {
+    const n_opts = spec.options.len;
+    const opt_seen = try gpa.alloc(bool, n_opts);
+    var own_state = true;
+    errdefer if (own_state) gpa.free(opt_seen);
+    @memset(opt_seen, false);
+
+    const opt_values = try gpa.alloc(?[]const u8, n_opts);
+    errdefer if (own_state) gpa.free(opt_values);
+    @memset(opt_values, null);
+
+    const opt_lists = try gpa.alloc(std.ArrayList([]const u8), n_opts);
+    defer {
+        for (opt_lists) |*lst| lst.deinit(gpa);
+        gpa.free(opt_lists);
+    }
+    for (opt_lists) |*lst| lst.* = .empty;
+
+    var pos: std.ArrayList([]const u8) = .empty;
+    defer pos.deinit(gpa);
+
+    var leftovers: std.ArrayList(Leftover) = .empty;
+    defer leftovers.deinit(gpa);
+
+    var scratch: std.ArrayList([]u8) = .empty;
+    defer {
+        for (scratch.items) |s| gpa.free(s);
+        scratch.deinit(gpa);
+    }
+
+    var remainder: []const []const u8 = &.{};
+    var help_requested = false;
+    var version_requested = false;
+
+    const is_remainder = hasRemainder(spec);
+    const has_subs = spec.subcommands.len > 0;
+    var sub_index: ?usize = null;
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+
+        // 1. Handle "--" separator when policy terminates on "--".
+        if (spec.policy.double_dash == .terminate and std.mem.eql(u8, arg, "--")) {
+            if (has_subs) {
+                sub_index = i + 1;
+                break;
+            }
+            if (is_remainder) {
+                remainder = argv[i..];
+                break;
+            }
+            try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true });
+            for (argv[i + 1 ..]) |p| {
+                try pos.append(gpa, p);
+                try leftovers.append(gpa, .{ .token = p, .is_positional = true });
+            }
+            break;
+        }
+
+        // 2. Short options and short-option clusters ("-x", "-xy", "-h=1", "-ao=val").
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            if (spec.policy.short_clusters) {
+                var items: std.ArrayList(ClusterItem) = .empty;
+                defer items.deinit(gpa);
+                var unknown_tail: ?[]u8 = null;
+                errdefer if (unknown_tail) |t| gpa.free(t);
+
+                var cur_slice: []const u8 = arg;
+                var cluster_err: ?ParseOutcome = null;
+                while (cur_slice.len >= 2) {
+                    const target = matchShortChar(spec, cur_slice[1]) orelse {
+                        if (items.items.len > 0) {
+                            const tail = try gpa.alloc(u8, cur_slice.len);
+                            tail[0] = '-';
+                            @memcpy(tail[1..], cur_slice[1..]);
+                            unknown_tail = tail;
+                        }
+                        break;
+                    };
+                    const rest = cur_slice[2..];
+                    const takes_value = switch (target) {
+                        .help => false,
+                        .option => |k| spec.options[k].kind != .flag,
+                    };
+                    if (takes_value) {
+                        const explicit: ?[]const u8 = if (rest.len > 0)
+                            (if (rest[0] == '=') rest[1..] else rest)
+                        else
+                            null;
+                        try items.append(gpa, .{ .target = target, .explicit = explicit });
+                        break;
+                    }
+                    if (rest.len == 0) {
+                        try items.append(gpa, .{ .target = target });
+                        break;
+                    }
+                    if (rest[0] == '=' or rest[0] == '-') {
+                        const bad_val = if (rest[0] == '=') rest[1..] else rest;
+                        const q = try reprToken(gpa, bad_val);
+                        defer gpa.free(q);
+                        const disp = switch (target) {
+                            .help => try gpa.dupe(u8, "-h/--help"),
+                            .option => |k| try formatOptionDisplay(gpa, spec.options[k]),
+                        };
+                        defer gpa.free(disp);
+                        cluster_err = try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                        break;
+                    }
+                    try items.append(gpa, .{ .target = target });
+                    // Advance to next short flag in cluster: slice starting 1 byte before `rest`
+                    // has cur_slice[1] == rest[0] because `arg` is contiguous.
+                    cur_slice = cur_slice[1..];
+                }
+                if (cluster_err) |err_out| {
+                    if (unknown_tail) |t| gpa.free(t);
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return err_out;
+                }
+                if (items.items.len > 0) {
+                    for (items.items) |it| {
+                        switch (it.target) {
+                            .help => {
+                                if (spec.policy.special_action == .immediate_exit) {
+                                    if (unknown_tail) |t| gpa.free(t);
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
+                                }
+                                help_requested = true;
+                            },
+                            .option => |k| {
+                                const o = spec.options[k];
+                                opt_seen[k] = true;
+                                if (o.kind == .flag) continue;
+                                var val: []const u8 = undefined;
+                                if (it.explicit) |ev| {
+                                    val = ev;
+                                } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                                    i += 1;
+                                    val = argv[i];
+                                } else {
+                                    if (unknown_tail) |t| gpa.free(t);
+                                    const disp = try formatOptionDisplay(gpa, o);
+                                    defer gpa.free(disp);
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                                }
+                                if (o.kind == .append) {
+                                    try opt_lists[k].append(gpa, val);
+                                } else {
+                                    opt_values[k] = val;
+                                }
+                            },
+                        }
+                    }
+                    if (unknown_tail) |t| {
+                        try scratch.append(gpa, t);
+                        try leftovers.append(gpa, .{ .token = t, .is_positional = false });
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // 3. Long options ("--name", "--name=val", unique prefixes when allow_abbrev).
+        if (std.mem.startsWith(u8, arg, "--") and (arg.len > 2)) {
+            const eq = std.mem.findScalar(u8, arg, '=');
+            const name = arg[2 .. eq orelse arg.len];
+            switch (matchLong(spec, name)) {
+                .ambiguous => {
+                    const amb = try formatAmbiguous(gpa, spec, name);
+                    defer gpa.free(amb);
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return try makeError(gpa, spec, "ambiguous option: {s} could match {s}", .{ arg, amb });
+                },
+                .help => {
+                    if (eq) |e| {
+                        const q = try reprToken(gpa, arg[e + 1 ..]);
+                        defer gpa.free(q);
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return try makeError(gpa, spec, "argument -h/--help: ignored explicit argument {s}", .{q});
+                    }
+                    if (spec.policy.special_action == .immediate_exit) {
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
+                    }
+                    help_requested = true;
+                    continue;
+                },
+                .version => {
+                    if (eq) |e| {
+                        const q = try reprToken(gpa, arg[e + 1 ..]);
+                        defer gpa.free(q);
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return try makeError(gpa, spec, "argument --version: ignored explicit argument {s}", .{q});
+                    }
+                    if (spec.policy.special_action == .immediate_exit) {
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.version.? } };
+                    }
+                    version_requested = true;
+                    continue;
+                },
+                .option => |k| {
+                    const o = spec.options[k];
+                    opt_seen[k] = true;
+                    if (o.kind == .flag) {
+                        if (eq) |e| {
+                            const disp = try formatOptionDisplay(gpa, o);
+                            defer gpa.free(disp);
+                            const q = try reprToken(gpa, arg[e + 1 ..]);
+                            defer gpa.free(q);
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                        }
+                        continue;
+                    }
+                    var val: []const u8 = undefined;
+                    if (eq) |e| {
+                        val = arg[e + 1 ..];
+                    } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                        i += 1;
+                        val = argv[i];
+                    } else {
+                        const disp = try formatOptionDisplay(gpa, o);
+                        defer gpa.free(disp);
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                    }
+                    if (o.kind == .append) {
+                        try opt_lists[k].append(gpa, val);
+                    } else {
+                        opt_values[k] = val;
+                    }
+                    continue;
+                },
+                .none => {},
+            }
+        }
+
+        // 4. Non-option token: subcommand, remainder start, or positional.
+        if (!optionLike(arg, spec.policy.negative_numbers)) {
+            if (has_subs) {
+                sub_index = i;
+                break;
+            }
+            if (is_remainder) {
+                remainder = argv[i..];
+                break;
+            }
+            try pos.append(gpa, arg);
+            try leftovers.append(gpa, .{ .token = arg, .is_positional = true });
+            continue;
+        }
+
+        // 5. Unrecognized option-like token.
+        try leftovers.append(gpa, .{ .token = arg, .is_positional = false });
+    }
+
+    // Subcommand dispatch when this parser defines subcommands.
+    if (has_subs) {
+        const idx = sub_index orelse argv.len;
+        if (idx >= argv.len) {
+            gpa.free(opt_seen);
+            gpa.free(opt_values);
+            own_state = false;
+            return try makeError(gpa, spec, "the following arguments are required: {s}", .{spec.subcommand_dest});
+        }
+        const cmd_name = argv[idx];
+        var matched_sub: ?SubcommandSpec = null;
+        for (spec.subcommands) |sub| {
+            if (std.mem.eql(u8, sub.name, cmd_name)) {
+                matched_sub = sub;
+                break;
+            }
+        }
+        const sub = matched_sub orelse {
+            var choices_buf: std.ArrayList(u8) = .empty;
+            defer choices_buf.deinit(gpa);
+            for (spec.subcommands, 0..) |s, si| {
+                if (si > 0) try choices_buf.appendSlice(gpa, ", ");
+                const q = try reprToken(gpa, s.name);
+                defer gpa.free(q);
+                try choices_buf.appendSlice(gpa, q);
+            }
+            const qcmd = try reprToken(gpa, cmd_name);
+            defer gpa.free(qcmd);
+            gpa.free(opt_seen);
+            gpa.free(opt_values);
+            own_state = false;
+            return try makeError(gpa, spec, "argument {s}: invalid choice: {s} (choose from {s})", .{ spec.subcommand_dest, qcmd, choices_buf.items });
+        };
+
+        var top_unknowns: std.ArrayList([]const u8) = .empty;
+        defer top_unknowns.deinit(gpa);
+        for (leftovers.items) |l| try top_unknowns.append(gpa, l.token);
+
+        const sub_outcome = try parseCommand(gpa, sub.command, top_spec, argv[idx + 1 ..], top_unknowns.items);
+        switch (sub_outcome) {
+            .ok => |sub_parsed| {
+                const sub_ptr = try gpa.create(Parsed);
+                errdefer {
+                    var tmp = sub_parsed;
+                    tmp.deinit(gpa);
+                    gpa.destroy(sub_ptr);
+                }
+                sub_ptr.* = sub_parsed;
+                var parsed = try buildParsedState(gpa, spec, opt_seen, opt_values, opt_lists, &pos, remainder, help_requested, version_requested);
+                own_state = false;
+                parsed.subcommand_name = sub.name;
+                parsed.subcommand_parsed = sub_ptr;
+                return .{ .ok = parsed };
+            },
+            .action_done, .usage_error => {
+                gpa.free(opt_seen);
+                gpa.free(opt_values);
+                own_state = false;
+                return sub_outcome;
+            },
+        }
+    }
+
+    // Check required options and required positionals (in registration order).
+    var missing_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (missing_names.items) |m| gpa.free(m);
+        missing_names.deinit(gpa);
+    }
+    for (spec.options, 0..) |o, idx| {
+        if (o.required and !o.has_default and !opt_seen[idx]) {
+            try missing_names.append(gpa, try formatOptionDisplay(gpa, o));
+        }
+    }
+    var req_pos_count: usize = 0;
+    for (spec.positionals) |p| {
+        if (p.arity == .required_one) {
+            if (pos.items.len <= req_pos_count) {
+                try missing_names.append(gpa, try gpa.dupe(u8, p.name));
+            }
+            req_pos_count += 1;
+        }
+    }
+    if (missing_names.items.len > 0) {
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(gpa);
+        for (missing_names.items, 0..) |m, mi| {
+            if (mi > 0) try joined.appendSlice(gpa, ", ");
+            try joined.appendSlice(gpa, m);
+        }
+        gpa.free(opt_seen);
+        gpa.free(opt_values);
+        own_state = false;
+        return try makeError(gpa, spec, "the following arguments are required: {s}", .{joined.items});
+    }
+
+    // Check merged unrecognized arguments.
+    const pos_slots = nonRemainderPositionals(spec);
+    const consumed_pos = @min(pos.items.len, pos_slots);
+    const keep_sep = pos_slots == 0 and !is_remainder;
+    if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep)) |err_out| {
+        gpa.free(opt_seen);
+        gpa.free(opt_values);
+        own_state = false;
+        return err_out;
+    }
+
+    const parsed = try buildParsedState(gpa, spec, opt_seen, opt_values, opt_lists, &pos, remainder, help_requested, version_requested);
+    own_state = false;
+    return .{ .ok = parsed };
+}
+
+/// Pure, non-exiting argument parser. Caller owns the returned `ParseOutcome`
+/// and should release it with `deinit(gpa)`.
+pub fn parse(gpa: Allocator, spec: *const CommandSpec, argv: []const []const u8) Allocator.Error!ParseOutcome {
+    return parseCommand(gpa, spec, spec, argv, &.{});
+}
+
+/// Parse `argv` according to `spec`, writing help/version text to stdout and
+/// exiting 0, or writing usage + error to stderr and exiting 2 on failure.
+pub fn parseOrExit(gpa: Allocator, spec: *const CommandSpec, argv: []const []const u8) Parsed {
+    var outcome = parse(gpa, spec, argv) catch {
+        spec.policy.write_stderr("out of memory\n");
+        std.process.exit(cli.usage_exit);
+    };
+    switch (outcome) {
+        .ok => |p| return p,
+        .action_done => |done| {
+            spec.policy.write_stdout(done.stdout_text);
+            std.process.exit(done.exit_code);
+        },
+        .usage_error => |*uerr| {
+            defer uerr.deinit(gpa);
+            if (uerr.formatStderr(gpa)) |txt| {
+                defer gpa.free(txt);
+                spec.policy.write_stderr(txt);
+            } else |_| {
+                spec.policy.write_stderr(uerr.usage);
+            }
+            std.process.exit(uerr.exit_code);
+        },
+    }
+}
