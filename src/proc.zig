@@ -9,6 +9,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
 /// The child's environment block, as execve(2) takes it; `env.Builder.envp`
@@ -800,17 +801,6 @@ test "run rejects an empty argv" {
     try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/true", &.{}, no_env, .{}));
 }
 
-/// Run `body` in a forked child, which may close the descriptors the test
-/// runner talks over, and expect it to exit 0.
-fn expectChildPasses(comptime body: fn () u8) !void {
-    const pid: isize = @bitCast(linux.fork());
-    if (pid < 0) return error.Unexpected;
-    if (pid == 0) linux.exit_group(body());
-    var status: i32 = 0;
-    while (linux.errno(linux.wait4(@intCast(pid), &status, 0, null)) == .INTR) {}
-    try std.testing.expectEqual(Term{ .exited = 0 }, decode(@bitCast(status)));
-}
-
 /// 0 when `script` under /bin/sh prints `want`, 1 when it prints something
 /// else, 2 when it cannot be run.
 fn shPrints(script: []const u8, stdin: ?[]const u8, want: []const u8) u8 {
@@ -897,7 +887,7 @@ test "makeExecFixture removes scratch directories after setup failures" {
 }
 
 test "a closed stdout at start does not send the child's stderr to its stdout" {
-    try expectChildPasses(struct {
+    try test_support.expectChildPasses(struct {
         fn body() u8 {
             sys.close(1);
             return shPrints("echo out; echo err >&2", null, "out\n");
@@ -906,7 +896,7 @@ test "a closed stdout at start does not send the child's stderr to its stdout" {
 }
 
 test "a closed stdin at start leaves the child's stdin and stderr on their files" {
-    try expectChildPasses(struct {
+    try test_support.expectChildPasses(struct {
         fn body() u8 {
             sys.close(0);
             const r = shPrints("readlink /proc/self/fd/0 || echo closed", null, "/dev/null\n");
@@ -917,7 +907,7 @@ test "a closed stdin at start leaves the child's stdin and stderr on their files
 }
 
 test "a closed stderr at start leaves the child's stderr on /dev/null" {
-    try expectChildPasses(struct {
+    try test_support.expectChildPasses(struct {
         fn body() u8 {
             sys.close(2);
             return shPrints("readlink /proc/self/fd/2 || echo closed", null, "/dev/null\n");
