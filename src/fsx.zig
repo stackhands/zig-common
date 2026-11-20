@@ -773,6 +773,115 @@ test "mkdtemp creates private 0700 directories with distinct names" {
     try std.testing.expectError(error.NotFound, mkdtemp(gpa, missing, "pre-"));
 }
 
+/// A file `mkstemp` made.
+pub const TempFile = struct {
+    /// Open for reading and writing, close-on-exec.
+    fd: fd_t,
+    /// The path, allocated from the `gpa` given to `mkstemp`.
+    path: []u8,
+};
+
+/// `tempfile.mkstemp(prefix=prefix, dir=dir)`: a new file
+/// `{dir}/{prefix}XXXXXXXX` with a random suffix, mode 0600, opened for
+/// reading and writing without following a link. Like Python, it makes
+/// `dir` absolute with `absPath` first, so the path is absolute for a
+/// relative `dir` too. Python tries 10000 names and goes on only after a
+/// name that exists. When the open fails with another error, `failed`
+/// receives the path that was refused, for the caller to format with
+/// `pytext.osError`, as Python's error names it. It is null when no name
+/// was tried or when every name existed.
+pub fn mkstemp(gpa: Allocator, dir: []const u8, prefix: []const u8, failed: *?[]u8) (Error || Allocator.Error)!TempFile {
+    failed.* = null;
+    const abs = try absPath(gpa, dir);
+    defer gpa.free(abs);
+    var tries: usize = 0;
+    while (tries < 10000) : (tries += 1) {
+        const rnd = try randomName();
+        const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, rnd });
+        defer gpa.free(name);
+        const path = try std.fs.path.join(gpa, &.{ abs, name });
+        const fd = sys.openat(cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600) catch |err| switch (err) {
+            error.Exists => {
+                gpa.free(path);
+                continue;
+            },
+            else => {
+                failed.* = path;
+                return err;
+            },
+        };
+        return .{ .fd = fd, .path = path };
+    }
+    return error.Exists;
+}
+
+test "mkstemp makes a private file and names the path it was refused" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-mkstemp-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, base) catch {};
+
+    var failed: ?[]u8 = null;
+    const made = try mkstemp(gpa, base, "pre-", &failed);
+    defer gpa.free(made.path);
+    defer sys.close(made.fd);
+    try std.testing.expect(failed == null);
+    const expected_prefix = try std.fmt.allocPrint(gpa, "{s}/pre-", .{base});
+    defer gpa.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, made.path, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, made.path.len);
+    const st = try fstat(made.fd);
+    try std.testing.expect(st.isReg());
+    try std.testing.expectEqual(@as(u32, 0o600), st.perm());
+    try sys.writeAll(made.fd, "x");
+
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkstemp(gpa, missing, "pre-", &failed));
+    defer if (failed) |p| gpa.free(p);
+    const path = failed orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, path, missing));
+    try std.testing.expectEqual(missing.len + "/pre-".len + 8, path.len);
+}
+
+test "mkstemp makes a relative directory absolute as Python does" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var rb: [sys.path_max]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rb, ".zig-cache/zig-common-mkstemp-rel-{d}", .{linux.getpid()});
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, rel)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, rel) catch {};
+    const abs = try std.fs.path.join(gpa, &.{ here, rel });
+    defer gpa.free(abs);
+
+    var failed: ?[]u8 = null;
+    const dotted = try std.fmt.allocPrint(gpa, "./{s}/../{s}", .{ rel, std.fs.path.basename(rel) });
+    defer gpa.free(dotted);
+    const made = try mkstemp(gpa, dotted, "pre-", &failed);
+    defer gpa.free(made.path);
+    defer sys.close(made.fd);
+    const expected_prefix = try std.fmt.allocPrint(gpa, "{s}/pre-", .{abs});
+    defer gpa.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, made.path, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, made.path.len);
+
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{rel});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkstemp(gpa, missing, "pre-", &failed));
+    defer if (failed) |p| gpa.free(p);
+    const refused = failed orelse return error.TestUnexpectedResult;
+    const missing_prefix = try std.fmt.allocPrint(gpa, "{s}/missing/pre-", .{abs});
+    defer gpa.free(missing_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, refused, missing_prefix));
+    try std.testing.expectEqual(missing_prefix.len + 8, refused.len);
+}
+
 /// The directories `tempfile.gettempdir` tries, in its order: the values of
 /// TMPDIR, TEMP and TMP that are set and not empty, then `/tmp`,
 /// `/var/tmp` and `/usr/tmp`, then the working directory, or "." when that
