@@ -27,6 +27,7 @@ const sys = common.sys;
 const proc = common.proc;
 const pytext = common.pytext;
 const logs = common.logs;
+const flate = std.compress.flate;
 const env = common.env;
 const cli = common.cli;
 
@@ -484,6 +485,136 @@ fn copyEdgesMode() void {
     }
 }
 
+/// `gunzip` mode: the reader over a corpus built at run time, compared
+/// with Python's gzip module and GNU gzip.
+fn gunzipMode() void {
+    const window = A.alloc(u8, flate.max_window_len) catch unreachable;
+    var data: [320]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast((i * 7) % 251);
+
+    // a member the library's own writer made
+    var aw: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(A, 64) catch unreachable;
+    {
+        var c = flate.Compress.init(&aw.writer, window, .gzip, .best) catch unreachable;
+        c.writer.writeAll(&data) catch unreachable;
+        c.finish() catch unreachable;
+    }
+    const written = aw.written();
+    gzCase("plain", written, 1 << 30);
+    gzCase("limit", written, 8);
+
+    // members with each header flag, built by hand over raw deflate
+    const flag_sets = [_]struct { name: []const u8, extra: ?[]const u8 = null, fname: ?[]const u8 = null, comment: ?[]const u8 = null, fhcrc: bool = false, break_fhcrc: bool = false }{
+        .{ .name = "fname", .fname = "log.txt" },
+        .{ .name = "extra", .extra = "EX" },
+        .{ .name = "comment", .comment = "a note" },
+        .{ .name = "fhcrc", .fhcrc = true },
+        .{ .name = "allflags", .extra = "ab", .fname = "f", .comment = "c", .fhcrc = true },
+        .{ .name = "bad-fhcrc", .fhcrc = true, .break_fhcrc = true },
+    };
+    for (flag_sets) |fs| {
+        const member = gzMember(&data, fs.extra, fs.fname, fs.comment, fs.fhcrc, fs.break_fhcrc, window);
+        gzCase(fs.name, member, 1 << 30);
+    }
+
+    // damaged and edge shapes over the writer's member
+    const plain_member = written;
+    {
+        const multi = std.mem.concat(A, u8, &.{ plain_member, plain_member }) catch unreachable;
+        gzCase("multi", multi, 1 << 30);
+        const zeros16: [16]u8 = @splat(0);
+        const padded = std.mem.concat(A, u8, &.{ multi, &zeros16 }) catch unreachable;
+        gzCase("padded-multi", padded, 1 << 30);
+        const empty_tail = gzMember(&([_]u8{}), null, null, null, false, false, window);
+        const with_empty = std.mem.concat(A, u8, &.{ plain_member, empty_tail }) catch unreachable;
+        gzCase("empty-member", with_empty, 1 << 30);
+    }
+    {
+        const bad = A.dupe(u8, plain_member) catch unreachable;
+        bad[bad.len - 6] ^= 0xff;
+        gzCase("bad-crc", bad, 1 << 30);
+    }
+    {
+        const bad = A.dupe(u8, plain_member) catch unreachable;
+        bad[bad.len - 1] ^= 0x01;
+        gzCase("bad-isize", bad, 1 << 30);
+    }
+    gzCase("truncated-half", plain_member[0 .. plain_member.len / 2], 1 << 30);
+    gzCase("truncated-header", plain_member[0..6], 1 << 30);
+    gzCase("not-gzip", "not gzip at all", 1 << 30);
+    {
+        const zeros16b: [16]u8 = @splat(0);
+        const zeros = std.mem.concat(A, u8, &.{ plain_member, &zeros16b }) catch unreachable;
+        gzCase("trailing-zeros", zeros, 1 << 30);
+    }
+    {
+        const junk = std.mem.concat(A, u8, &.{ plain_member, "junkjunk" }) catch unreachable;
+        gzCase("trailing-junk", junk, 1 << 30);
+    }
+    {
+        const second = gzMember("second\n", null, null, null, false, false, window);
+        const multi = std.mem.concat(A, u8, &.{ plain_member, second }) catch unreachable;
+        const bad = A.dupe(u8, multi) catch unreachable;
+        bad[bad.len - 6] ^= 0xff;
+        gzCase("second-bad-crc", bad, 1 << 30);
+    }
+}
+
+fn gzCase(name: []const u8, blob: []const u8, limit: usize) void {
+    const num = std.fmt.allocPrint(A, "{d}", .{limit}) catch unreachable;
+    if (logs.gunzip(A, blob, limit)) |out| {
+        emit(&.{ "gunzip", hexOf(name), num, hexOf(blob), "OK", hexOf(out) });
+    } else |e| {
+        emit(&.{ "gunzip", hexOf(name), num, hexOf(blob), std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable });
+    }
+}
+
+/// One gzip member over `data` with the given header parts, built by
+/// hand over a raw deflate stream so every flag can appear; with
+/// `break_fhcrc` the FHCRC value is wrong on purpose.
+fn gzMember(data: []const u8, extra: ?[]const u8, fname: ?[]const u8, comment: ?[]const u8, fhcrc: bool, break_fhcrc: bool, window: []u8) []const u8 {
+    var body_aw: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(A, 64) catch unreachable;
+    var c = flate.Compress.init(&body_aw.writer, window, .raw, .best) catch unreachable;
+    c.writer.writeAll(data) catch unreachable;
+    c.finish() catch unreachable;
+
+    var flags: u8 = 0;
+    if (extra != null) flags |= 0x04;
+    if (fname != null) flags |= 0x08;
+    if (comment != null) flags |= 0x10;
+    if (fhcrc) flags |= 0x02;
+
+    var hdr: std.ArrayList(u8) = .empty;
+    hdr.appendSlice(A, &[_]u8{ 0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 2, 3 }) catch unreachable;
+    if (extra) |e| {
+        hdr.append(A, @intCast(e.len)) catch unreachable;
+        hdr.append(A, 0) catch unreachable;
+        hdr.appendSlice(A, e) catch unreachable;
+    }
+    if (fname) |f| {
+        hdr.appendSlice(A, f) catch unreachable;
+        hdr.append(A, 0) catch unreachable;
+    }
+    if (comment) |cm| {
+        hdr.appendSlice(A, cm) catch unreachable;
+        hdr.append(A, 0) catch unreachable;
+    }
+    if (fhcrc) {
+        const crc16: u16 = if (break_fhcrc) 0xbeef else @truncate(std.hash.Crc32.hash(hdr.items));
+        hdr.append(A, @intCast(crc16 & 0xff)) catch unreachable;
+        hdr.append(A, @intCast(crc16 >> 8)) catch unreachable;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(A, hdr.items) catch unreachable;
+    out.appendSlice(A, body_aw.written()) catch unreachable;
+    var tail: [8]u8 = undefined;
+    std.mem.writeInt(u32, tail[0..4], std.hash.Crc32.hash(data), .little);
+    std.mem.writeInt(u32, tail[4..8], @truncate(data.len), .little);
+    out.appendSlice(A, &tail) catch unreachable;
+    return out.items;
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -564,6 +695,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         errnoMode();
     } else if (std.mem.eql(u8, mode, "copyedges")) {
         copyEdgesMode();
+    } else if (std.mem.eql(u8, mode, "gunzip")) {
+        gunzipMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {
