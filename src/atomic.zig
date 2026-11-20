@@ -573,6 +573,41 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     try fsyncDir(parent);
 }
 
+/// atomic_write pinned to an open directory: replace `dir/name` with
+/// `bytes` at exactly `mode`, whatever the process umask leaves, as
+/// the tools' metrics writer does with the descriptor it holds. The
+/// bytes go to a temporary file in the same directory, made durable,
+/// and only then renamed over the destination; a failure leaves the
+/// destination as it was and removes the temporary file. Shares
+/// atomicWrite's write, sync and rename steps, through the same ops a
+/// replaceable build may fail. Everything it allocates from `a` is
+/// freed before it returns.
+pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []const u8, mode: u32) (Allocator.Error || sys.Error)!void {
+    sys.last_errno = .SUCCESS;
+    var rnd: [4]u8 = undefined;
+    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    const tmp = try a.print(".{s}.{d}.{x:0>8}.tmp", .{ name, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
+    defer a.free(tmp);
+    var zb: [sys.path_max:0]u8 = undefined;
+    const ztmp = try sys.z(&zb, tmp);
+    const flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const fd: sys.fd_t = @intCast(try op(ops.openat, .{ dir, ztmp.ptr, flags, @as(linux.mode_t, 0o600) }));
+    var done = false;
+    defer {
+        sys.close(fd);
+        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+    }
+    // openat applies the umask to the create, so the exact mode the
+    // caller names is set on the descriptor before anything is written
+    _ = try op(ops.fchmod, .{ fd, mode });
+    try writeTemp(fd, data);
+    _ = try op(ops.fsync, .{fd});
+    var zn: [sys.path_max:0]u8 = undefined;
+    _ = try op(ops.renameat, .{ dir, ztmp.ptr, dir, (try sys.z(&zn, name)).ptr });
+    done = true;
+    try sys.fsync(dir);
+}
+
 fn discard(tmp: []const u8, created: fsx.Stat) void {
     const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
     if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
@@ -696,6 +731,63 @@ test "an interrupted ACL read is retried" {
     var why: Why = .{};
     const acls = try readAcls(gpa, fd, &why);
     defer acls.deinit(gpa);
+}
+
+test "atomicWriteAt publishes the exact mode under any umask" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-atomic-at-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+
+    // the umask bites the create but not the published mode, which is
+    // exactly what the caller names, as the metrics writer's chmod does
+    const old: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old);
+    try atomicWriteAt(gpa, dir, "metrics", "first\n", 0o644);
+    const first = try fsx.statAt(dir, "metrics", false);
+    try std.testing.expectEqual(@as(u32, 0o644), first.perm());
+
+    // an existing destination is replaced with the mode it is given and
+    // keeps its bytes when a step fails, with no temporary left behind
+    try atomicWriteAt(gpa, dir, "metrics", "second\n", 0o640);
+    const second = try fsx.statAt(dir, "metrics", false);
+    try std.testing.expectEqual(@as(u32, 0o640), second.perm());
+    const f = try fsx.openRegular(dir, "metrics", false);
+    defer sys.close(f.fd);
+    const second_text = try fsx.readAll(gpa, f.fd, 100);
+    defer gpa.free(second_text);
+    try std.testing.expectEqualStrings("second\n", second_text);
+
+    const S = struct {
+        var fail_fsync = false;
+        fn fsync(fd_: sys.fd_t) usize {
+            if (fail_fsync) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+            return linux.fsync(fd_);
+        }
+    };
+    defer ops.* = .{};
+    S.fail_fsync = true;
+    ops.fsync = S.fsync;
+    try std.testing.expectError(error.Unexpected, atomicWriteAt(gpa, dir, "metrics", "broken\n", 0o644));
+    S.fail_fsync = false;
+    const after = try fsx.openRegular(dir, "metrics", false);
+    defer sys.close(after.fd);
+    const after_text = try fsx.readAll(gpa, after.fd, 100);
+    defer gpa.free(after_text);
+    try std.testing.expectEqualStrings("second\n", after_text);
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.name, ".tmp") == null);
+    }
 }
 
 test "the umask is read without changing it" {
