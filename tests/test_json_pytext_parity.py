@@ -10,6 +10,7 @@ Run with `python3 tests/test_json_pytext_parity.py` from a checkout
 that has the probe built; the test builds it when zig is on PATH and
 the binary is missing. ZIG_COMMON_PARITY_PROBE names another binary.
 """
+import importlib.util
 import json
 import os
 import random
@@ -17,14 +18,18 @@ import shlex
 import struct
 import subprocess
 import sys
+import tempfile
+import unicodedata
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROBE = os.path.join(REPO, "zig-out", "bin", "parity_probe")
+DIGIT_TABLE = os.path.join(REPO, "src", "pytext_nd.zig")
+DIGIT_TOOL = os.path.join(REPO, "tools", "gen_pytext_nd.py")
 
 # The kinds the probe must cover. A kind with no cases means the parity
 # is silently unchecked, so the counts are asserted, not just the lines.
-KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "float", "dumps", "strerror", "oserror", "dumpscompact")
+KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "digits", "float", "dumps", "strerror", "oserror", "dumpscompact")
 MIN_CASES = {
     "cache": 1500,
     "wire": 1500,
@@ -32,6 +37,7 @@ MIN_CASES = {
     "strip": 1500,
     "split": 1500,
     "replace": 1500,
+    "digits": 1000,
     "float": 2000,
     "dumps": 90,
     "strerror": 300,
@@ -80,6 +86,52 @@ def split_expected(data):
 
 def replace_expected(data):
     return data.decode("utf-8", "replace").encode("utf-8")
+
+
+def digits_expected(data):
+    text = data.decode("utf-8", "surrogateescape")
+    out = []
+    for char in text:
+        value = unicodedata.decimal(char, None)
+        out.append(char if value is None else str(value))
+    return "".join(out).encode("utf-8", "surrogateescape")
+
+
+def digit_tool():
+    """tools/gen_pytext_nd.py as a module, loaded without writing bytecode."""
+    spec = importlib.util.spec_from_file_location("gen_pytext_nd", DIGIT_TOOL)
+    module = importlib.util.module_from_spec(spec)
+    writes, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = writes
+    return module
+
+
+def pinned_unicode():
+    """The Unicode version the checked-in digit table names in its header."""
+    with open(DIGIT_TABLE, encoding="utf-8") as handle:
+        pin = digit_tool().pinned_unicode(handle.read())
+    if pin is None:
+        raise AssertionError("%s names no Unicode version" % DIGIT_TABLE)
+    return pin
+
+
+def skip_unless_pinned_unicode(case):
+    """Skip a comparison with unicodedata under another Unicode version.
+
+    The table in src/pytext_nd.zig is pinned to one Unicode version, and
+    unicodedata of another version has other digits. CI runs Python 3.14,
+    whose unicodedata is the pinned version, so it never skips.
+    """
+    pin = pinned_unicode()
+    if unicodedata.unidata_version != pin:
+        case.skipTest(
+            "the decimal digit table is pinned to Unicode %s and this Python's "
+            "unicodedata is Unicode %s; run with Python 3.14 to compare them"
+            % (pin, unicodedata.unidata_version)
+        )
 
 
 def float_expected(data):
@@ -160,6 +212,44 @@ class JsonPytextParity(unittest.TestCase):
 
     def test_decode_replace(self):
         self.assert_parity("replace", replace_expected)
+
+    def test_decimal_digits(self):
+        skip_unless_pinned_unicode(self)
+        self.assert_parity("digits", digits_expected)
+
+    def test_decimal_digit_table_is_generated_from_unicodedata(self):
+        skip_unless_pinned_unicode(self)
+        result = subprocess.run(
+            [sys.executable, DIGIT_TOOL, "--check", DIGIT_TABLE],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_decimal_digit_check_compares_nothing_under_another_unicode(self):
+        with open(DIGIT_TABLE, encoding="utf-8") as handle:
+            table = handle.read()
+        pin = pinned_unicode()
+        other = "1.1.0"
+        self.assertNotEqual(other, unicodedata.unidata_version)
+        with tempfile.TemporaryDirectory() as tmp:
+            moved = os.path.join(tmp, "pytext_nd.zig")
+            with open(moved, "w", encoding="utf-8") as handle:
+                handle.write(table.replace(", Unicode %s," % pin, ", Unicode %s," % other, 1))
+            result = subprocess.run(
+                [sys.executable, DIGIT_TOOL, "--check", moved],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(
+            result.stderr,
+            "%s is pinned to Unicode %s, and this Python's unicodedata is Unicode %s; "
+            "nothing was compared. Run the check with a Python whose unicodedata is "
+            "Unicode %s.\n" % (moved, other, unicodedata.unidata_version, other),
+        )
 
     def test_float_repr(self):
         self.assert_parity("float", float_expected)

@@ -25,6 +25,11 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+      # The decimal digit table is pinned to Unicode 16.0.0, the unicodedata
+      # of Python 3.14; the parity test skips its comparison under another.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
       - run: zig fmt --check build.zig build.zig.zon src tests
       - run: zig build test --summary all
       - name: parity with python's json and text calls

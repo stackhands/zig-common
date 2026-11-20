@@ -57,6 +57,15 @@ pub fn build(b: *std.Build) void {
     const install_ap_probe = b.addInstallArtifact(ap_probe, .{});
     b.step("argparse-parity-probe", "Build the argparse parity probe").dependOn(&install_ap_probe.step);
 
+    // Rewrite src/pytext_nd.zig from the Python on PATH, which moves the
+    // table's Unicode pin to that Python's. The library never needs Python
+    // to build; tests/test_json_pytext_parity.py fails when the file no
+    // longer matches unicodedata of the Unicode version it is pinned to.
+    const gen_nd = b.addSystemCommand(&.{ "python3", "tools/gen_pytext_nd.py" });
+    const update_nd = b.addUpdateSourceFiles();
+    update_nd.addCopyFileToSource(gen_nd.captureStdOut(.{}), "src/pytext_nd.zig");
+    b.step("gen-pytext-nd", "Regenerate src/pytext_nd.zig from unicodedata").dependOn(&update_nd.step);
+
     // The API reference from the doc comments, into <prefix>/docs.
     const lib = b.addLibrary(.{ .name = "zig_common", .root_module = mod });
     const docs = b.addInstallDirectory(.{

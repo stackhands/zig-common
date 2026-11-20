@@ -157,6 +157,8 @@ Error sets: [[zig:zig_common.json.ParseError]], [[zig:zig_common.json.DecodeErro
 | [[zig:zig_common.pytext.decodeReplace]]| =Allocator.Error= |
 | [[zig:zig_common.pytext.pyWhitespace]] | none              |
 | [[zig:zig_common.pytext.pyStrip]]      | none              |
+| [[zig:zig_common.pytext.decimalDigit]] | none              |
+| [[zig:zig_common.pytext.decimalToAscii]]| =Allocator.Error= |
 | [[zig:zig_common.pytext.pySplit]]      | =Allocator.Error= |
 | [[zig:zig_common.pytext.shellQuote]]   | =Allocator.Error= |
 | [[zig:zig_common.pytext.reprStr]]      | =Allocator.Error= |
