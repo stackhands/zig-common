@@ -410,18 +410,73 @@ pub fn fsyncDir(path: []const u8) sys.Error!void {
     try sys.fsync(fd);
 }
 
-/// os.makedirs(path, exist_ok=True).
+/// os.makedirs(path, exist_ok=True): a name that exists as something
+/// other than a directory is EEXIST, as Python re-raises FileExistsError,
+/// a name under a file is ENOTDIR, as its mkdir call reports, and a name
+/// under a dangling link is ENOENT. The recursion below a name only runs
+/// when that name is absent, as Python checks `exists(head)` first and
+/// swallows the recursion's FileExistsError.
 pub fn makedirs(path: []const u8) sys.Error!void {
     if (fsx.statAt(fsx.cwd, path, true)) |st| {
         if (st.isDir()) return;
-        return error.NotDir;
+        return error.Exists;
     } else |_| {}
-    if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) try makedirs(parent);
+    if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) {
+        if (fsx.statAt(fsx.cwd, parent, true)) |_| {} else |_| {
+            makedirs(parent) catch |err| switch (err) {
+                error.Exists => {},
+                else => return err,
+            };
+        }
+    };
     var zb: [sys.path_max:0]u8 = undefined;
     _ = sys.call(linux.mkdirat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
-        error.Exists => {},
+        error.Exists => {
+            // A name another process created meanwhile passes only when
+            // it is a directory; anything else keeps Python's EEXIST.
+            const st = fsx.statAt(fsx.cwd, path, true) catch return error.Exists;
+            if (!st.isDir()) return error.Exists;
+        },
         else => return err,
     };
+}
+
+test "makedirs surfaces the errnos of os.makedirs with exist_ok" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-makedirs-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(base);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+
+    // an existing directory passes, as Python's isdir branch does
+    try makedirs(base);
+
+    const file = try std.fmt.allocPrint(gpa, "{s}/f", .{base});
+    defer gpa.free(file);
+    const fd = try sys.openat(fsx.cwd, file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    sys.close(fd);
+    try std.testing.expectError(error.Exists, makedirs(file));
+    try std.testing.expectEqualStrings("[Errno 17] File exists", sys.describe(error.Exists));
+
+    const below_file = try std.fmt.allocPrint(gpa, "{s}/f/child", .{base});
+    defer gpa.free(below_file);
+    try std.testing.expectError(error.NotDir, makedirs(below_file));
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", sys.describe(error.NotDir));
+
+    // a dangling link at the final name also raises EEXIST in Python
+    const dangling = try std.fmt.allocPrint(gpa, "{s}/dangling", .{base});
+    defer gpa.free(dangling);
+    _ = linux.symlinkat("nowhere", fsx.cwd, (try sys.z(&zb, dangling)).ptr);
+    try std.testing.expectError(error.Exists, makedirs(dangling));
+
+    // and with the dangling link above it, the missing parent is ENOENT
+    const below_dangling = try std.fmt.allocPrint(gpa, "{s}/dangling/child", .{base});
+    defer gpa.free(below_dangling);
+    try std.testing.expectError(error.NotFound, makedirs(below_dangling));
+    try std.testing.expectEqualStrings("[Errno 2] No such file or directory", sys.describe(error.NotFound));
 }
 
 /// What `atomicWrite` gives the new file besides its bytes, and the names
