@@ -25,8 +25,16 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
-      - run: zig fmt --check build.zig build.zig.zon src
+      - run: zig fmt --check build.zig build.zig.zon src tests
       - run: zig build test --summary all
+      - name: parity with python's json and text calls
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found, skipping the parity test"
+            exit 0
+          fi
+          zig build parity-probe
+          python3 tests/test_json_pytext_parity.py
       - name: no site names in the tree
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'
