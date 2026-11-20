@@ -25,6 +25,9 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
       - run: zig fmt --check build.zig build.zig.zon src tests
       - run: zig build test --summary all
       - name: parity with python's json and text calls
@@ -43,6 +46,11 @@ jobs:
           fi
           zig build fs-lock-parity-probe
           python3 tests/test_fs_lock_parity.py
+      - name: parity with python 3.14 argparse calls
+        run: |
+          python3 -c "import sys; assert sys.version_info >= (3, 14), 'argparse parity needs Python 3.14+; found ' + sys.version.split()[0]"
+          zig build argparse-parity-probe
+          python3 tests/test_argparse_parity.py
       - name: no site names in the tree
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'
