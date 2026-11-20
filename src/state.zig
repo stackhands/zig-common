@@ -104,7 +104,9 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const tmp = try gpa.print(".{s}.{d}.{x}.tmp", .{ name, linux.getpid(), rnd });
+    const parent = std.fs.path.dirname(name) orelse ".";
+    const base = std.fs.path.basename(name);
+    const tmp = try gpa.print("{s}/.{s}.{d}.{x}.tmp", .{ parent, base, linux.getpid(), rnd });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     var done = false;
@@ -146,6 +148,27 @@ test "a file that is not private is not read" {
     const lk = (try openPrivate(d, "c.json.lock", true)).?;
     defer sys.close(lk);
     try lockExclusive(lk, 100);
+}
+
+test "writePrivate handles nested names under the opened directory" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-state-nested-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = linux.mkdirat(d, (try sys.z(&zb, "sub")).ptr, 0o700);
+
+    try writePrivate(gpa, d, "sub/c.json", "{\"v\":2}\n");
+    const got = (try readPrivate(gpa, d, "sub/c.json", 1024)).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("{\"v\":2}\n", got);
 }
 
 fn onUsr1(_: linux.SIG) callconv(.c) void {}
