@@ -516,7 +516,8 @@ pub const RootLock = struct {
         // a link, as the root is opened without following it.
         clearOsFailure();
         preflightRoot(root) catch |err| return noted(err, root);
-        atomic.makedirs(root) catch |err| return noted(err, root);
+        var failed_path: ?[]const u8 = null;
+        atomic.makedirsTracked(root, &failed_path) catch |err| return noted(err, failed_path orelse root);
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
         const dir = fsx.openDir(fsx.cwd, root, false) catch |err| return noted(err, root);
         defer sys.close(dir);
@@ -728,6 +729,16 @@ test "RootLock refuses a non-directory state root with NotDir" {
     failure = osFailure() orelse unreachable;
     try std.testing.expectEqualStrings(dangling_root, failure.path);
     try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+
+    // Recursive creation names the ancestor at which mkdir failed.
+    const nested_root = try std.fmt.allocPrint(gpa, "{s}/child/grandchild", .{dangling_root});
+    defer gpa.free(nested_root);
+    const failed_ancestor = try std.fmt.allocPrint(gpa, "{s}/child", .{dangling_root});
+    defer gpa.free(failed_ancestor);
+    try std.testing.expectError(error.NotFound, RootLock.acquire(gpa, nested_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(failed_ancestor, failure.path);
+    try std.testing.expectEqualStrings("[Errno 2] No such file or directory", failure.text);
 
     // a symbolic-link loop as the root
     const loop_root = try std.fmt.allocPrint(gpa, "{s}/loop-root", .{base});

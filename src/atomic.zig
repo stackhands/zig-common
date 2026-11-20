@@ -438,27 +438,49 @@ pub fn fsyncDir(path: []const u8) sys.Error!void {
 /// when that name is absent, as Python checks `exists(head)` first and
 /// swallows the recursion's FileExistsError.
 pub fn makedirs(path: []const u8) sys.Error!void {
+    var failed_path: ?[]const u8 = null;
+    return makedirsTracked(path, &failed_path);
+}
+
+/// `makedirs`, also returning the path passed to the system call that
+/// failed. The slice points into `path` and remains null on success.
+pub fn makedirsTracked(path: []const u8, failed_path: *?[]const u8) sys.Error!void {
+    failed_path.* = null;
     if (fsx.statAt(fsx.cwd, path, true)) |st| {
         if (st.isDir()) return;
+        failed_path.* = path;
         return error.Exists;
     } else |_| {}
     if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) {
         if (fsx.statAt(fsx.cwd, parent, true)) |_| {} else |_| {
-            makedirs(parent) catch |err| switch (err) {
-                error.Exists => {},
+            makedirsTracked(parent, failed_path) catch |err| switch (err) {
+                error.Exists => failed_path.* = null,
                 else => return err,
             };
         }
     };
     var zb: [sys.path_max:0]u8 = undefined;
-    _ = sys.call(linux.mkdirat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
+    const zpath = sys.z(&zb, path) catch |err| {
+        failed_path.* = path;
+        return err;
+    };
+    _ = sys.call(linux.mkdirat, .{ fsx.cwd, zpath.ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
         error.Exists => {
             // A name another process created meanwhile passes only when
             // it is a directory; anything else keeps Python's EEXIST.
-            const st = fsx.statAt(fsx.cwd, path, true) catch return error.Exists;
-            if (!st.isDir()) return error.Exists;
+            const st = fsx.statAt(fsx.cwd, path, true) catch {
+                failed_path.* = path;
+                return error.Exists;
+            };
+            if (!st.isDir()) {
+                failed_path.* = path;
+                return error.Exists;
+            }
         },
-        else => return err,
+        else => {
+            failed_path.* = path;
+            return err;
+        },
     };
 }
 
@@ -498,6 +520,21 @@ test "makedirs surfaces the errnos of os.makedirs with exist_ok" {
     defer gpa.free(below_dangling);
     try std.testing.expectError(error.NotFound, makedirs(below_dangling));
     try std.testing.expectEqualStrings("[Errno 2] No such file or directory", sys.describe(error.NotFound));
+
+    // A caller receives the ancestor passed to the mkdir that failed, not
+    // the deeper leaf whose recursive creation was requested.
+    const nested_target = try std.fmt.allocPrint(gpa, "{s}/dangling/child/grandchild/file", .{base});
+    defer gpa.free(nested_target);
+    const failed_ancestor = try std.fmt.allocPrint(gpa, "{s}/dangling/child", .{base});
+    defer gpa.free(failed_ancestor);
+    var why: Why = .{};
+    defer why.deinit(gpa);
+    try std.testing.expectError(error.NotFound, atomicWrite(gpa, nested_target, "x", .{}, &why));
+    const quoted = try pytext.reprStrAlloc(gpa, failed_ancestor);
+    defer gpa.free(quoted);
+    const want = try std.fmt.allocPrint(gpa, "[Errno 2] No such file or directory: {s}", .{quoted});
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, why.msg);
 }
 
 /// What `atomicWrite` gives the new file besides its bytes, and the names
@@ -526,7 +563,8 @@ pub const WriteOptions = struct {
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
-    makedirs(parent) catch |err| return failOs(a, why, err, parent, null);
+    var failed_path: ?[]const u8 = null;
+    makedirsTracked(parent, &failed_path) catch |err| return failOs(a, why, err, failed_path orelse parent, null);
     if (fsx.statAt(fsx.cwd, path, false)) |st| {
         if (st.isLink()) return refuse(a, why, "refusing to replace a symlink: {s}", .{path});
     } else |_| {}
