@@ -267,11 +267,10 @@ fn describeNamed(comptime e: linux.E) []const u8 {
         std.fmt.comptimePrint("[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) });
 }
 
-/// The strerror text for `e`, the Zig enum tag name when `errnoText` does not
-/// name a known tag, or `"Unknown error N"` for an unnamed errno value.
+/// The strerror text for `e`, or `"Unknown error N"` when `errnoText` does
+/// not name it, matching glibc's `strerror` and Python's `os.strerror`.
 pub fn strerror(e: linux.E) []const u8 {
     if (errnoText(e)) |text| return text;
-    if (std.enums.tagName(linux.E, e)) |name| return name;
     const S = struct {
         threadlocal var buf: [32]u8 = undefined;
     };
@@ -448,6 +447,12 @@ test "strerror formats unnamed errno values instead of panicking" {
     raw = 999;
     const unknown_999: linux.E = @fromBackingInt(raw);
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
+}
+
+test "strerror returns Unknown error for non-Linux linux.E tags" {
+    try std.testing.expectEqualStrings("Unknown error 160", strerror(.NSRNODATA));
+    try std.testing.expectEqualStrings("Unknown error 177", strerror(.NSRCNAMELOOP));
+    try std.testing.expectEqualStrings("[Errno 160] Unknown error 160", describeErrno(.NSRNODATA));
 }
 
 test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {

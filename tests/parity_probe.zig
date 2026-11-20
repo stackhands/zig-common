@@ -14,6 +14,7 @@ const common = @import("zig_common");
 
 const json = common.json;
 const pytext = common.pytext;
+const sys = common.sys;
 
 var arena_state: std.heap.ArenaAllocator = undefined;
 var A: std.mem.Allocator = undefined;
@@ -75,6 +76,20 @@ fn dumpsCase(doc: json.Py, indent: usize, sort: bool) void {
     const out = json.dumps(A, doc, indent, sort) catch unreachable;
     const field = std.fmt.allocPrint(A, "{d},{s}", .{ indent, if (sort) "true" else "false" }) catch unreachable;
     emit("dumps", field, out);
+}
+
+fn strerrorCase(code: u16) void {
+    const e: linux.E = @fromBackingInt(code);
+    emit("strerror", std.mem.asBytes(&code), sys.strerror(e));
+}
+
+fn osErrorCase(code: u16, path: []const u8) void {
+    const e: linux.E = @fromBackingInt(code);
+    const in = A.alloc(u8, 2 + path.len) catch unreachable;
+    @memcpy(in[0..2], std.mem.asBytes(&code));
+    @memcpy(in[2..], path);
+    const out = pytext.osErrorErrno(A, e, path) catch unreachable;
+    emit("oserror", in, out);
 }
 
 /// Named sequences around the UTF-8 validity rules and the characters
@@ -250,9 +265,45 @@ fn documents() [12]json.Py {
     };
 }
 
-pub fn main() !void {
+fn fromHex(line: []const u8) []const u8 {
+    std.debug.assert(line.len % 2 == 0);
+    const out = A.alloc(u8, line.len / 2) catch unreachable;
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        const hi = std.fmt.charToDigit(line[i * 2], 16) catch unreachable;
+        const lo = std.fmt.charToDigit(line[i * 2 + 1], 16) catch unreachable;
+        out[i] = (hi << 4) | lo;
+    }
+    return out;
+}
+
+fn errnoStdin() !void {
+    const input = try common.fsx.readAll(A, 0, 64 << 20);
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const op = fields.next().?;
+        const code = std.fmt.parseInt(u16, fields.next().?, 10) catch unreachable;
+        const e: linux.E = @fromBackingInt(code);
+        if (std.mem.eql(u8, op, "strerror")) {
+            all.print(A, "{s}\n", .{hexOf(sys.strerror(e))}) catch unreachable;
+        } else if (std.mem.eql(u8, op, "oserror")) {
+            const path = fromHex(fields.next().?);
+            const msg = try pytext.osErrorErrno(A, e, path);
+            all.print(A, "{s}\n", .{hexOf(msg)}) catch unreachable;
+        }
+    }
+    try sys.writeAll(1, all.items);
+}
+
+pub fn main(init: std.process.Init) !void {
     arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     A = arena_state.allocator();
+    const args = try init.minimal.args.toSlice(A);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--errno-stdin")) {
+        return errnoStdin();
+    }
     initDocStrings();
 
     // Every byte alone: the exhaustive part, cheap for all six kinds.
@@ -304,5 +355,14 @@ pub fn main() !void {
         }
     }
 
-    _ = linux.write(1, all.items.ptr, all.items.len);
+    for (0..201) |code| strerrorCase(@intCast(code));
+    for (0..100) |_| strerrorCase(rand.uintLessThan(u16, 4096));
+
+    const oserror_codes = [_]u16{ 0, 1, 2, 3, 4, 10, 11, 13, 17, 20, 21, 32, 103, 104, 108, 110, 111, 114, 115, 134, 160, 177, 999 };
+    const oserror_paths = [_][]const u8{ "/no/such", "a'b", "a'b\"c", "a\nb\xff", "" };
+    for (oserror_codes) |code| {
+        for (oserror_paths) |path| osErrorCase(code, path);
+    }
+
+    try sys.writeAll(1, all.items);
 }

@@ -12,9 +12,11 @@ the binary is missing. ZIG_COMMON_PARITY_PROBE names another binary.
 """
 import json
 import os
+import random
 import shlex
 import struct
 import subprocess
+import sys
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +24,7 @@ DEFAULT_PROBE = os.path.join(REPO, "zig-out", "bin", "parity_probe")
 
 # The kinds the probe must cover. A kind with no cases means the parity
 # is silently unchecked, so the counts are asserted, not just the lines.
-KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "float", "dumps")
+KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "float", "dumps", "strerror", "oserror")
 MIN_CASES = {
     "cache": 1500,
     "wire": 1500,
@@ -32,6 +34,8 @@ MIN_CASES = {
     "replace": 1500,
     "float": 2000,
     "dumps": 90,
+    "strerror": 300,
+    "oserror": 100,
 }
 
 
@@ -87,6 +91,17 @@ def dumps_expected(data, zig_out):
     return json.dumps(parsed, indent=int(indent), sort_keys=sort == "true").encode("ascii")
 
 
+def strerror_expected(data):
+    (code,) = struct.unpack("<H", data)
+    return os.strerror(code).encode("utf-8")
+
+
+def oserror_expected(data):
+    (code,) = struct.unpack("<H", data[:2])
+    path = data[2:].decode("utf-8", "surrogateescape")
+    return str(OSError(code, os.strerror(code), path)).encode("utf-8", "surrogateescape")
+
+
 class JsonPytextParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -139,6 +154,77 @@ class JsonPytextParity(unittest.TestCase):
 
     def test_dumps_documents(self):
         self.assert_parity("dumps", dumps_expected)
+
+    def test_strerror(self):
+        self.assert_parity("strerror", strerror_expected)
+
+    def test_oserror(self):
+        self.assert_parity("oserror", oserror_expected)
+
+    def test_strerror_oserror_runtime_fuzz(self):
+        env_seed = os.environ.get("ZIG_COMMON_FUZZ_SEED")
+        seed = int(env_seed, 0) if env_seed else int.from_bytes(os.urandom(8), "little")
+        print(f"strerror/oserror fuzz seed={hex(seed)}", file=sys.stderr, flush=True)
+        rng = random.Random(seed)
+
+        errnos = list(range(0, 201))
+        for _ in range(500):
+            errnos.append(rng.randrange(0, 4096))
+
+        lines = [f"strerror\t{code}" for code in errnos]
+        oserror_cases = []
+        for code in errnos:
+            plen = rng.randint(0, 12)
+            # Restrict to ASCII and ill-formed UTF-8 bytes so paths stay
+            # independent of Unicode printable tables across Python releases.
+            raw = bytes(
+                rng.choice(
+                    (
+                        rng.randrange(0, 0x80),
+                        rng.randrange(0x80, 0xC0),
+                        rng.randrange(0xF5, 0x100),
+                    )
+                )
+                for _ in range(plen)
+            )
+            oserror_cases.append((code, raw))
+            lines.append(f"oserror\t{code}\t{raw.hex()}")
+
+        payload = ("\n".join(lines) + "\n").encode("ascii")
+        out = subprocess.run(
+            [probe_path(), "--errno-stdin"],
+            input=payload,
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        got_lines = out.stdout.decode("ascii").splitlines()
+        self.assertEqual(len(got_lines), len(lines))
+
+        bad_str = []
+        for code, got_hex in zip(errnos, got_lines[: len(errnos)]):
+            want = os.strerror(code).encode("utf-8")
+            got = bytes.fromhex(got_hex)
+            if got != want:
+                bad_str.append((code, got, want))
+        self.assertEqual(
+            len(bad_str),
+            0,
+            f"strerror fuzz (seed={hex(seed)}): {len(bad_str)} mismatches; first={bad_str[:1]}",
+        )
+
+        bad_os = []
+        for (code, raw), got_hex in zip(oserror_cases, got_lines[len(errnos) :]):
+            path = raw.decode("utf-8", "surrogateescape")
+            exc = OSError(code, os.strerror(code), path)
+            want = str(exc).encode("utf-8", "surrogateescape")
+            got = bytes.fromhex(got_hex)
+            if got != want:
+                bad_os.append((code, raw, got, want))
+        self.assertEqual(
+            len(bad_os),
+            0,
+            f"oserror fuzz (seed={hex(seed)}): {len(bad_os)} mismatches; first={bad_os[:1]}",
+        )
 
     def test_case_set_is_covered(self):
         for kind in KINDS:
