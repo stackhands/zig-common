@@ -152,6 +152,70 @@ fn archiveIntact(path: [*:0]const u8) bool {
     return linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0;
 }
 
+/// The bytes the gzip data `raw` holds, its members one after another as
+/// `gzip -d` gives them; `limit` or more of them is an error. The
+/// inflater only reads a member's CRC-32 and size, so they are checked
+/// here, and a member that does not end cleanly, whose CRC-32 or size
+/// disagrees with its bytes, or whose header is not gzip is
+/// `error.BadGzip`.
+pub const GunzipError = Allocator.Error || error{ StreamTooLong, BadGzip };
+
+pub fn gunzip(gpa: Allocator, raw: []const u8, limit: usize) GunzipError![]u8 {
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var in: std.Io.Reader = .fixed(raw);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    while (true) {
+        var d: flate.Decompress = .init(&in, .gzip, window);
+        const start = out.items.len;
+        d.reader.appendRemaining(gpa, &out, .limited(limit - start)) catch |err| switch (err) {
+            error.ReadFailed => return error.BadGzip,
+            else => |e| return e,
+        };
+        const m = d.container_metadata.gzip;
+        const member = out.items[start..];
+        if (m.crc != std.hash.Crc32.hash(member) or m.count != @as(u32, @truncate(member.len)))
+            return error.BadGzip;
+        if (in.bufferedLen() == 0) return out.toOwnedSlice(gpa);
+    }
+}
+
+test "gunzip round trips, reads members after another and refuses damage" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var plain_buf: [16 * 64]u8 = undefined;
+    @memset(&plain_buf, 'p');
+    const plain: []const u8 = &plain_buf;
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(a, 4096);
+    var c = try flate.Compress.init(&aw.writer, window, .gzip, .best);
+    try c.writer.writeAll(plain);
+    try c.finish();
+    const got = try gunzip(gpa, aw.written(), 1 << 30);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(plain, got);
+
+    const twice = try std.mem.concat(gpa, u8, &.{ aw.written(), aw.written() });
+    defer gpa.free(twice);
+    const both = try gunzip(gpa, twice, 1 << 30);
+    defer gpa.free(both);
+    try std.testing.expectEqual(@as(usize, 2 * plain.len), both.len);
+    try std.testing.expectEqualStrings(plain, both[plain.len..]);
+
+    var bad = try gpa.dupe(u8, aw.written());
+    defer gpa.free(bad);
+    bad[bad.len - 6] ^= 0xff;
+    try std.testing.expectError(error.BadGzip, gunzip(gpa, bad, 1 << 30));
+    try std.testing.expectError(error.BadGzip, gunzip(gpa, aw.written()[0 .. aw.written().len / 2], 1 << 30));
+    try std.testing.expectError(error.BadGzip, gunzip(gpa, "not gzip at all", 1 << 30));
+    try std.testing.expectError(error.StreamTooLong, gunzip(gpa, aw.written(), 8));
+}
+
 test "gzip does not publish a partial archive under the final name" {
     const gpa = std.testing.allocator;
     var cwd_buf: [sys.path_max]u8 = undefined;
