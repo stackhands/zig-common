@@ -821,3 +821,151 @@ test "argparse: mutually_exclusive rejects conflicting options in scan order" {
         try std.testing.expect(out.ok.seen("json"));
     }
 }
+
+test "UsageError.kind classifies all ten error kinds without leaks" {
+    const gpa = std.testing.allocator;
+
+    // 1. missing_subcommand
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{});
+        defer out.deinit(gpa);
+        try std.testing.expect(out.usage_error.kind == .missing_subcommand);
+    }
+    // 2. unknown_subcommand
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{"bogus"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("bogus", out.usage_error.kind.unknown_subcommand);
+    }
+    // 3. unknown_option (including synthetic short-cluster tail "-zb")
+    {
+        var out = try argparse.parse(gpa, &short_spec, &.{"-azb"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("-zb", out.usage_error.kind.unknown_option);
+    }
+    // 4. extra_positional (ordered before any later unknown option)
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{ "resolve", "a", "b", "--bogus" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("b", out.usage_error.kind.extra_positional);
+    }
+    // 5. missing_value (missing trailing arg)
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{ "probe", "--path" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("path", out.usage_error.kind.missing_value);
+    }
+    // 6. unexpected_value (long flag and short cluster)
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{ "probe", "--json=1" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("json", out.usage_error.kind.unexpected_value.option);
+        try std.testing.expectEqualStrings("1", out.usage_error.kind.unexpected_value.value);
+    }
+    {
+        var out = try argparse.parse(gpa, &short_spec, &.{"-ab=yes"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("beta", out.usage_error.kind.unexpected_value.option);
+        try std.testing.expectEqualStrings("yes", out.usage_error.kind.unexpected_value.value);
+    }
+    // 7. ambiguous_option
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{"--=foo"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("--=foo", out.usage_error.kind.ambiguous_option);
+    }
+    // 8. missing_required (option and positional)
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{"status"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("state-root", out.usage_error.kind.missing_required);
+    }
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{"resolve"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("module", out.usage_error.kind.missing_required);
+    }
+    // 9. invalid_value (option validator and positional choices)
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--lock-timeout", "bad" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("lock-timeout", out.usage_error.kind.invalid_value.name);
+        try std.testing.expectEqualStrings("bad", out.usage_error.kind.invalid_value.value);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{"badmode"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("mode", out.usage_error.kind.invalid_value.name);
+        try std.testing.expectEqualStrings("badmode", out.usage_error.kind.invalid_value.value);
+    }
+    // 10. mutually_exclusive
+    const mutex_spec: argparse.CommandSpec = .{
+        .prog = "tool usage",
+        .usage = "usage: tool usage\n",
+        .help = "usage: tool usage\n",
+        .add_help = false,
+        .policy = .native_exact,
+        .options = &.{
+            .{ .name = "unused", .kind = .flag },
+            .{ .name = "active", .kind = .flag },
+        },
+        .mutually_exclusive = &.{.{ .options = &.{ "unused", "active" } }},
+    };
+    {
+        var out = try argparse.parse(gpa, &mutex_spec, &.{ "--unused", "--active" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("active", out.usage_error.kind.mutually_exclusive.option);
+        try std.testing.expectEqualStrings("unused", out.usage_error.kind.mutually_exclusive.conflict);
+    }
+    // Top-level unknown option under native_exact reports unknown_option instead of missing_subcommand.
+    const native_top: argparse.CommandSpec = .{
+        .prog = "tool",
+        .usage = "usage: tool\n",
+        .help = "usage: tool\n",
+        .policy = .native_exact,
+        .subcommands = &.{.{ .name = "probe", .command = &probe_spec }},
+    };
+    {
+        var out = try argparse.parse(gpa, &native_top, &.{"--bogus"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("--bogus", out.usage_error.kind.unknown_option);
+    }
+    {
+        var out = try argparse.parse(gpa, &native_top, &.{});
+        defer out.deinit(gpa);
+        try std.testing.expect(out.usage_error.kind == .missing_subcommand);
+    }
+}
+
+test "UsageError.deinit and freeing message directly do not leak under std.testing.allocator" {
+    const gpa = std.testing.allocator;
+
+    // Synthetic short-cluster tail freed via UsageError.deinit.
+    {
+        const out = try argparse.parse(gpa, &short_spec, &.{"-azb"});
+        var uerr = out.usage_error;
+        try std.testing.expectEqualStrings("-zb", uerr.kind.unknown_option);
+        uerr.deinit(gpa);
+    }
+    // Synthetic short-cluster tail freed via fail_fast + UsageError.deinit.
+    var ff_short = short_spec;
+    ff_short.policy.fail_fast = true;
+    {
+        const out = try argparse.parse(gpa, &ff_short, &.{"-azb"});
+        var uerr = out.usage_error;
+        try std.testing.expectEqualStrings("-zb", uerr.kind.unknown_option);
+        uerr.deinit(gpa);
+    }
+    // Caller freeing only UsageError.message still leaks nothing because token slices
+    // alias message rather than a separate heap buffer.
+    {
+        const out = try argparse.parse(gpa, &short_spec, &.{"-azb"});
+        try std.testing.expectEqualStrings("-zb", out.usage_error.kind.unknown_option);
+        gpa.free(out.usage_error.message);
+    }
+    {
+        const out = try argparse.parse(gpa, &ff_short, &.{"-azb"});
+        try std.testing.expectEqualStrings("-zb", out.usage_error.kind.unknown_option);
+        gpa.free(out.usage_error.message);
+    }
+}

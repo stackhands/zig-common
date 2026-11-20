@@ -326,13 +326,61 @@ pub const ActionDone = struct {
     stdout_text: []const u8,
 };
 
+/// Machine-readable classification of a `UsageError` so callers can render
+/// native diagnostics without parsing `UsageError.message`.
+pub const ErrorKind = union(enum) {
+    /// A required subcommand was omitted.
+    missing_subcommand,
+    /// An unrecognized subcommand token was supplied.
+    unknown_subcommand: []const u8,
+    /// An unrecognized option-like token was supplied (first offending token).
+    unknown_option: []const u8,
+    /// A positional token exceeded the declared positional slots (first offending token).
+    extra_positional: []const u8,
+    /// A value option was missing its argument (option long name without `--`),
+    /// or received an empty or leading-dash value disallowed by its `OptionSpec`.
+    missing_value: []const u8,
+    /// A boolean flag, `-h`/`--help`, or `--version` received an explicit `=value`.
+    unexpected_value: struct {
+        /// Option long name without `--` (`"help"`, `"version"`, or `OptionSpec.name`).
+        option: []const u8,
+        /// Explicit value slice after `=` or attached short-cluster tail.
+        value: []const u8,
+    },
+    /// An abbreviated long option matched more than one option (raw token).
+    ambiguous_option: []const u8,
+    /// One or more required options or positionals were omitted (first missing
+    /// option long name without `--`, or positional `name`).
+    missing_required: []const u8,
+    /// A choice check or `OptionSpec.validate` callback rejected a value.
+    invalid_value: struct {
+        /// Option long name without `--`, or positional `name`.
+        name: []const u8,
+        /// Rejected raw value.
+        value: []const u8,
+    },
+    /// Two options from a `MutexGroup` were supplied together.
+    mutually_exclusive: struct {
+        /// Option long name without `--` that triggered the conflict.
+        option: []const u8,
+        /// Previously seen conflicting option long name without `--`.
+        conflict: []const u8,
+    },
+};
+
 /// Formatted argparse usage error (exit code 2).
+///
+/// All heap memory owned by a `UsageError` is stored in `message` (any token
+/// slices stored in `kind` borrow either `argv`, `CommandSpec`, or `message`),
+/// and `deinit` releases it in one call.
 pub const UsageError = struct {
     usage: []const u8,
     prog: []const u8,
     message: []u8,
+    kind: ErrorKind,
     exit_code: u8 = cli.usage_exit,
 
+    /// Release all heap memory owned by this `UsageError`.
     pub fn deinit(self: *UsageError, gpa: Allocator) void {
         gpa.free(self.message);
     }
@@ -581,12 +629,41 @@ pub const types = struct {
 
 // ---- pure parser implementation -------------------------------------------
 
-fn makeError(gpa: Allocator, spec: *const CommandSpec, comptime fmt: []const u8, args: anytype) Allocator.Error!ParseOutcome {
+fn makeError(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    kind: ErrorKind,
+    comptime fmt: []const u8,
+    args: anytype,
+) Allocator.Error!ParseOutcome {
     const msg = try std.fmt.allocPrint(gpa, fmt, args);
     return .{ .usage_error = .{
         .usage = spec.usage,
         .prog = spec.prog,
         .message = msg,
+        .kind = kind,
+    } };
+}
+
+fn makeUnrecognizedError(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    joined: []const u8,
+    first_len: usize,
+    is_positional: bool,
+) Allocator.Error!ParseOutcome {
+    const prefix = "unrecognized arguments: ";
+    const msg = try std.fmt.allocPrint(gpa, prefix ++ "{s}", .{joined});
+    const tok_slice = msg[prefix.len .. prefix.len + first_len];
+    const kind: ErrorKind = if (is_positional)
+        .{ .extra_positional = tok_slice }
+    else
+        .{ .unknown_option = tok_slice };
+    return .{ .usage_error = .{
+        .usage = spec.usage,
+        .prog = spec.prog,
+        .message = msg,
+        .kind = kind,
     } };
 }
 
@@ -606,7 +683,7 @@ fn checkOptionValueAllowed(
     if ((!opt.allow_empty and val.len == 0) or (!opt.allow_dash_value and val.len > 0 and val[0] == '-')) {
         const disp = try formatOptionDisplay(gpa, opt);
         defer gpa.free(disp);
-        return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+        return try makeError(gpa, spec, .{ .missing_value = opt.name }, "argument {s}: expected one argument", .{disp});
     }
     return null;
 }
@@ -625,7 +702,7 @@ fn validateOptionValue(
                 defer gpa.free(detail);
                 const disp = try formatOptionDisplay(gpa, opt);
                 defer gpa.free(disp);
-                return try makeError(gpa, spec, "argument {s}: {s}", .{ disp, detail });
+                return try makeError(gpa, spec, .{ .invalid_value = .{ .name = opt.name, .value = val } }, "argument {s}: {s}", .{ disp, detail });
             },
         }
     }
@@ -637,7 +714,7 @@ fn validateOptionValue(
         defer gpa.free(disp);
         const detail = try types.formatChoicesDetail(gpa, val, allowed);
         defer gpa.free(detail);
-        return try makeError(gpa, spec, "argument {s}: {s}", .{ disp, detail });
+        return try makeError(gpa, spec, .{ .invalid_value = .{ .name = opt.name, .value = val } }, "argument {s}: {s}", .{ disp, detail });
     }
     return null;
 }
@@ -672,7 +749,7 @@ fn validatePositionalChoice(
     }
     const detail = try types.formatChoicesDetail(gpa, val, allowed);
     defer gpa.free(detail);
-    return try makeError(gpa, spec, "argument {s}: {s}", .{ p.name, detail });
+    return try makeError(gpa, spec, .{ .invalid_value = .{ .name = p.name, .value = val } }, "argument {s}: {s}", .{ p.name, detail });
 }
 
 fn formatAmbiguous(gpa: Allocator, spec: *const CommandSpec, prefix: []const u8) Allocator.Error![]u8 {
@@ -842,7 +919,16 @@ fn makeMutexError(
     defer gpa.free(disp_opt);
     const disp_conflict = try formatOptionDisplay(gpa, spec.options[conflict_idx]);
     defer gpa.free(disp_conflict);
-    return try makeError(gpa, spec, "argument {s}: not allowed with argument {s}", .{ disp_opt, disp_conflict });
+    return try makeError(
+        gpa,
+        spec,
+        .{ .mutually_exclusive = .{
+            .option = spec.options[opt_idx].name,
+            .conflict = spec.options[conflict_idx].name,
+        } },
+        "argument {s}: not allowed with argument {s}",
+        .{ disp_opt, disp_conflict },
+    );
 }
 
 fn checkUnrecognized(
@@ -857,6 +943,9 @@ fn checkUnrecognized(
     var all: std.ArrayList([]const u8) = .empty;
     defer all.deinit(gpa);
     try all.appendSlice(gpa, top_extra);
+
+    var first_tok: ?[]const u8 = if (top_extra.len > 0) top_extra[0] else null;
+    var first_is_pos = false;
 
     var consumed = consumed_positionals;
     var last_consumed_argv: ?usize = null;
@@ -875,12 +964,16 @@ fn checkUnrecognized(
                 continue;
             }
         }
+        if (first_tok == null) {
+            first_tok = item.token;
+            first_is_pos = item.is_positional;
+        }
         try all.append(gpa, item.token);
     }
     if (all.items.len == 0) return null;
     const joined = try std.mem.join(gpa, " ", all.items);
     defer gpa.free(joined);
-    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{joined});
+    return try makeUnrecognizedError(gpa, top_spec, joined, first_tok.?.len, first_is_pos);
 }
 
 fn buildParsedState(
@@ -1004,7 +1097,7 @@ fn parseCommand(
                         gpa.free(opt_seen);
                         gpa.free(opt_values);
                         own_state = false;
-                        return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{p});
+                        return try makeUnrecognizedError(gpa, top_spec, p, p.len, true);
                     };
                 }
                 if (try validatePositionalChoice(gpa, spec, pos.items.len, p)) |err_out| {
@@ -1065,7 +1158,11 @@ fn parseCommand(
                             .option => |k| try formatOptionDisplay(gpa, spec.options[k]),
                         };
                         defer gpa.free(disp);
-                        cluster_err = try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                        const opt_name: []const u8 = switch (target) {
+                            .help => "help",
+                            .option => |k| spec.options[k].name,
+                        };
+                        cluster_err = try makeError(gpa, spec, .{ .unexpected_value = .{ .option = opt_name, .value = bad_val } }, "argument {s}: ignored explicit argument {s}", .{ disp, q });
                         break;
                     }
                     try items.append(gpa, .{ .target = target });
@@ -1123,7 +1220,7 @@ fn parseCommand(
                                     gpa.free(opt_seen);
                                     gpa.free(opt_values);
                                     own_state = false;
-                                    return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                                    return try makeError(gpa, spec, .{ .missing_value = o.name }, "argument {s}: expected one argument", .{disp});
                                 }
                                 if (supplied_val) {
                                     if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
@@ -1163,7 +1260,7 @@ fn parseCommand(
                             gpa.free(opt_seen);
                             gpa.free(opt_values);
                             own_state = false;
-                            return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{t});
+                            return try makeUnrecognizedError(gpa, top_spec, t, t.len, false);
                         }
                         try scratch.append(gpa, t);
                         try leftovers.append(gpa, .{ .token = t, .is_positional = false, .argv_index = i });
@@ -1205,7 +1302,7 @@ fn parseCommand(
                                     gpa.free(opt_seen);
                                     gpa.free(opt_values);
                                     own_state = false;
-                                    return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                                    return try makeError(gpa, spec, .{ .missing_value = o.name }, "argument {s}: expected one argument", .{disp});
                                 }
                                 if (supplied_val) {
                                     if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
@@ -1253,7 +1350,7 @@ fn parseCommand(
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
                     own_state = false;
-                    return try makeError(gpa, spec, "ambiguous option: {s} could match {s}", .{ arg, amb });
+                    return try makeError(gpa, spec, .{ .ambiguous_option = arg }, "ambiguous option: {s} could match {s}", .{ arg, amb });
                 },
                 .help => {
                     if (eq) |e| {
@@ -1261,12 +1358,13 @@ fn parseCommand(
                             force_unknown = true;
                         } else {
                             if (spec.policy.unknown == .ignore) continue;
-                            const q = try reprToken(gpa, arg[e + 1 ..]);
+                            const val = arg[e + 1 ..];
+                            const q = try reprToken(gpa, val);
                             defer gpa.free(q);
                             gpa.free(opt_seen);
                             gpa.free(opt_values);
                             own_state = false;
-                            return try makeError(gpa, spec, "argument -h/--help: ignored explicit argument {s}", .{q});
+                            return try makeError(gpa, spec, .{ .unexpected_value = .{ .option = "help", .value = val } }, "argument -h/--help: ignored explicit argument {s}", .{q});
                         }
                     } else {
                         if (spec.policy.special_action == .immediate_exit) {
@@ -1285,12 +1383,13 @@ fn parseCommand(
                             force_unknown = true;
                         } else {
                             if (spec.policy.unknown == .ignore) continue;
-                            const q = try reprToken(gpa, arg[e + 1 ..]);
+                            const val = arg[e + 1 ..];
+                            const q = try reprToken(gpa, val);
                             defer gpa.free(q);
                             gpa.free(opt_seen);
                             gpa.free(opt_values);
                             own_state = false;
-                            return try makeError(gpa, spec, "argument --version: ignored explicit argument {s}", .{q});
+                            return try makeError(gpa, spec, .{ .unexpected_value = .{ .option = "version", .value = val } }, "argument --version: ignored explicit argument {s}", .{q});
                         }
                     } else {
                         if (spec.policy.special_action == .immediate_exit) {
@@ -1311,14 +1410,15 @@ fn parseCommand(
                                 force_unknown = true;
                             } else {
                                 if (spec.policy.unknown == .ignore) continue;
+                                const val = arg[e + 1 ..];
                                 const disp = try formatOptionDisplay(gpa, o);
                                 defer gpa.free(disp);
-                                const q = try reprToken(gpa, arg[e + 1 ..]);
+                                const q = try reprToken(gpa, val);
                                 defer gpa.free(q);
                                 gpa.free(opt_seen);
                                 gpa.free(opt_values);
                                 own_state = false;
-                                return try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                                return try makeError(gpa, spec, .{ .unexpected_value = .{ .option = o.name, .value = val } }, "argument {s}: ignored explicit argument {s}", .{ disp, q });
                             }
                         } else {
                             if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
@@ -1347,7 +1447,7 @@ fn parseCommand(
                             gpa.free(opt_seen);
                             gpa.free(opt_values);
                             own_state = false;
-                            return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                            return try makeError(gpa, spec, .{ .missing_value = o.name }, "argument {s}: expected one argument", .{disp});
                         }
                         if (supplied_val) {
                             if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
@@ -1398,7 +1498,7 @@ fn parseCommand(
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
                     own_state = false;
-                    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+                    return try makeUnrecognizedError(gpa, top_spec, arg, arg.len, true);
                 };
             }
             if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
@@ -1419,7 +1519,7 @@ fn parseCommand(
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
                     own_state = false;
-                    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+                    return try makeUnrecognizedError(gpa, top_spec, arg, arg.len, true);
                 };
             }
             if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
@@ -1436,7 +1536,7 @@ fn parseCommand(
             gpa.free(opt_seen);
             gpa.free(opt_values);
             own_state = false;
-            return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+            return try makeUnrecognizedError(gpa, top_spec, arg, arg.len, false);
         }
         try leftovers.append(gpa, .{ .token = arg, .is_positional = false, .argv_index = i });
     }
@@ -1456,7 +1556,7 @@ fn parseCommand(
             gpa.free(opt_seen);
             gpa.free(opt_values);
             own_state = false;
-            return try makeError(gpa, spec, "the following arguments are required: {s}", .{spec.subcommand_dest});
+            return try makeError(gpa, spec, .missing_subcommand, "the following arguments are required: {s}", .{spec.subcommand_dest});
         }
         const cmd_name = argv[idx];
         var matched_sub: ?SubcommandSpec = null;
@@ -1480,7 +1580,7 @@ fn parseCommand(
             gpa.free(opt_seen);
             gpa.free(opt_values);
             own_state = false;
-            return try makeError(gpa, spec, "argument {s}: invalid choice: {s} (choose from {s})", .{ spec.subcommand_dest, qcmd, choices_buf.items });
+            return try makeError(gpa, spec, .{ .unknown_subcommand = cmd_name }, "argument {s}: invalid choice: {s} (choose from {s})", .{ spec.subcommand_dest, qcmd, choices_buf.items });
         };
 
         var top_unknowns: std.ArrayList([]const u8) = .empty;
@@ -1533,8 +1633,10 @@ fn parseCommand(
         for (missing_names.items) |m| gpa.free(m);
         missing_names.deinit(gpa);
     }
+    var first_missing: ?[]const u8 = null;
     for (spec.options, 0..) |o, idx| {
         if (o.required and !o.has_default and !opt_seen[idx]) {
+            if (first_missing == null) first_missing = o.name;
             try missing_names.append(gpa, try formatOptionDisplay(gpa, o));
         }
     }
@@ -1542,6 +1644,7 @@ fn parseCommand(
     for (spec.positionals) |p| {
         if (p.arity == .required_one or p.arity == .one_or_more) {
             if (pos.items.len <= req_pos_count) {
+                if (first_missing == null) first_missing = p.name;
                 try missing_names.append(gpa, try gpa.dupe(u8, p.name));
             }
             req_pos_count += 1;
@@ -1557,7 +1660,7 @@ fn parseCommand(
         gpa.free(opt_seen);
         gpa.free(opt_values);
         own_state = false;
-        return try makeError(gpa, spec, "the following arguments are required: {s}", .{joined.items});
+        return try makeError(gpa, spec, .{ .missing_required = first_missing.? }, "the following arguments are required: {s}", .{joined.items});
     }
 
     // Check merged unrecognized arguments unless unknown tokens are ignored
