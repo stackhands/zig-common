@@ -394,3 +394,23 @@ test "both lock files are created mode 0600" {
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
 }
+
+test "acquire tightens existing owned lock files to mode 0600" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+
+    const gate = try sys.openat(dir, ".lock", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o644);
+    sys.close(gate);
+    const sidecar = try sys.openat(dir, ".lock.posix", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o644);
+    sys.close(sidecar);
+    try testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, ".lock", false)).perm());
+    try testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, ".lock.posix", false)).perm());
+
+    const l = try RootLock.acquire(gpa, root, 0);
+    defer l.release();
+    try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
+    try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
+}
