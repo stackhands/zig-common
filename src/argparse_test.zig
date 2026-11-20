@@ -342,3 +342,128 @@ test "contract 8 (prolog_lenient): exact names, optional_value, -- ignored, defe
         try std.testing.expectEqualStrings("", out.ok.value("timeout").?);
     }
 }
+
+const validated_spec: argparse.CommandSpec = .{
+    .prog = "tool",
+    .usage = "usage: tool [-h] [--state-root DIR] [-f FLOAT] [--grace-hours H] [--min-free-bytes N] [--backend {auto,squashfs,none}] [--tag TAG] [mode]\n",
+    .help = "usage: tool\n",
+    .options = &.{
+        .{ .name = "state-root", .kind = .value, .required = true },
+        .{ .name = "lock-timeout", .short = 'f', .kind = .value, .validate = argparse.types.pyFloat },
+        .{ .name = "grace-hours", .kind = .value, .validate = argparse.types.nonNegativeFiniteFloat },
+        .{ .name = "min-free-bytes", .kind = .value, .validate = argparse.types.boundedU64 },
+        .{ .name = "backend", .kind = .value, .choices = &.{ "auto", "squashfs", "none" } },
+        .{ .name = "color", .kind = .value, .validate = argparse.types.choice(&.{ "red", "blue" }) },
+        .{ .name = "tag", .kind = .append, .validate = argparse.types.nonNegativeU128 },
+    },
+    .positionals = &.{
+        .{ .name = "mode", .arity = .optional_one, .choices = &.{ "fast", "safe" } },
+    },
+};
+
+test "contract 6: repeated flags, append order, and eager typed/choice validation" {
+    const gpa = std.testing.allocator;
+
+    // Repeated single-value keeps last; append keeps all in order.
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{
+            "--state-root",     "/a",
+            "--state-root",     "/b",
+            "--lock-timeout",   "1_0.5",
+            "-f",               " 2.5 ",
+            "--grace-hours",    "0",
+            "--min-free-bytes", "-0",
+            "--backend",        "auto",
+            "--color",          "red",
+            "--tag",            "10",
+            "--tag",            "20",
+            "fast",
+        });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("/b", out.ok.value("state-root").?);
+        try std.testing.expectEqualStrings(" 2.5 ", out.ok.value("lock-timeout").?);
+        try std.testing.expectEqual(@as(usize, 2), out.ok.values("tag").len);
+        try std.testing.expectEqualStrings("10", out.ok.values("tag")[0]);
+        try std.testing.expectEqualStrings("20", out.ok.values("tag")[1]);
+        try std.testing.expectEqualStrings("fast", out.ok.positional(0).?);
+    }
+
+    // Eager validation fires on the first bad occurrence even when a later valid
+    // occurrence, a missing required option, or a trailing -h follows.
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--lock-timeout", "bad", "--lock-timeout", "2.0" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument -f/--lock-timeout: invalid float value: 'bad'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "-fbad", "-h" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument -f/--lock-timeout: invalid float value: 'bad'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--backend", "bogus", "--backend", "auto" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --backend: invalid choice: 'bogus' (choose from 'auto', 'squashfs', 'none')", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--color", "green", "-h" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --color: invalid choice: 'green' (choose from 'red', 'blue')", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--grace-hours", "-1", "-h" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --grace-hours: must be a finite number >= 0: '-1'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{"--grace-hours=nan"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --grace-hours: must be a finite number >= 0: 'nan'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{"--min-free-bytes=-1"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --min-free-bytes: must be >= 0: '-1'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{"--min-free-bytes=18446744073709551616"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --min-free-bytes: integer out of range: '18446744073709551616'", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "badmode", "-h" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument mode: invalid choice: 'badmode' (choose from 'fast', 'safe')", out.usage_error.message);
+    }
+    // Short -h before bad option in same cluster triggers help first (matching Python 3.14).
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{"-hfbad"});
+        defer out.deinit(gpa);
+        try std.testing.expect(out == .action_done);
+        try std.testing.expectEqual(@as(u8, 0), out.action_done.exit_code);
+    }
+}
+
+test "types.parsePyFloat and types.parseNonNegativeU128 edge cases" {
+    try std.testing.expectEqual(@as(?f64, 10.5), argparse.types.parsePyFloat("1_0.5"));
+    try std.testing.expectEqual(@as(?f64, 0.5), argparse.types.parsePyFloat(" .5\u{00a0}"));
+    try std.testing.expectEqual(@as(?f64, 5.0), argparse.types.parsePyFloat("5."));
+    try std.testing.expect(std.math.isPositiveInf(argparse.types.parsePyFloat("+Infinity").?));
+    try std.testing.expect(std.math.isNegativeInf(argparse.types.parsePyFloat("-inf").?));
+    try std.testing.expect(std.math.isNan(argparse.types.parsePyFloat("-NaN").?));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("0x1"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("1__0"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("_1"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("1_"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("1_.2"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("1._2"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("1e_2"));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat("."));
+    try std.testing.expectEqual(@as(?f64, null), argparse.types.parsePyFloat(""));
+
+    try std.testing.expectEqual(@as(u128, 0), try argparse.types.parseNonNegativeU128("-0"));
+    try std.testing.expectEqual(@as(u128, 1000), try argparse.types.parseNonNegativeU128(" +1_000 "));
+    try std.testing.expectError(error.BelowZero, argparse.types.parseNonNegativeU128("-1"));
+    try std.testing.expectError(error.NotAnInteger, argparse.types.parseNonNegativeU128("1__0"));
+    try std.testing.expectError(error.NotAnInteger, argparse.types.parseNonNegativeU128("abc"));
+}

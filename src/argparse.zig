@@ -151,6 +151,8 @@ pub const PositionalSpec = struct {
     name: []const u8,
     /// Positional arity.
     arity: PositionalArity = .required_one,
+    /// Optional static set of allowed values, validated eagerly on parse.
+    choices: ?[]const []const u8 = null,
 };
 
 /// Subcommand binding a command name to its own `CommandSpec`.
@@ -320,6 +322,205 @@ pub fn reprToken(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
     return pytext.reprStrAlloc(gpa, s);
 }
 
+/// Reusable eager typed validators matching Python 3.14 `argparse` conventions.
+pub const types = struct {
+    fn formatChoicesDetail(gpa: Allocator, raw: []const u8, allowed: []const []const u8) Allocator.Error![]u8 {
+        var choices_buf: std.ArrayList(u8) = .empty;
+        defer choices_buf.deinit(gpa);
+        for (allowed, 0..) |c, ci| {
+            if (ci > 0) try choices_buf.appendSlice(gpa, ", ");
+            const qc = try reprToken(gpa, c);
+            defer gpa.free(qc);
+            try choices_buf.appendSlice(gpa, qc);
+        }
+        const qraw = try reprToken(gpa, raw);
+        defer gpa.free(qraw);
+        return std.fmt.allocPrint(gpa, "invalid choice: {s} (choose from {s})", .{ qraw, choices_buf.items });
+    }
+
+    fn scanDigitsWithUnderscores(s: []const u8, idx: *usize) struct { digits: usize, ok: bool } {
+        var digits: usize = 0;
+        var prev_underscore = false;
+        while (idx.* < s.len) {
+            const c = s[idx.*];
+            if (std.ascii.isDigit(c)) {
+                digits += 1;
+                prev_underscore = false;
+                idx.* += 1;
+            } else if (c == '_') {
+                if (digits == 0 or prev_underscore) return .{ .digits = digits, .ok = false };
+                prev_underscore = true;
+                idx.* += 1;
+            } else {
+                break;
+            }
+        }
+        if (prev_underscore) return .{ .digits = digits, .ok = false };
+        return .{ .digits = digits, .ok = true };
+    }
+
+    /// Parse a Python-syntax float (surrounding Python whitespace, optional sign,
+    /// case-insensitive `inf`/`infinity`/`nan`, or decimal digits with Python
+    /// single-underscore rules). Returns `null` on invalid syntax.
+    pub fn parsePyFloat(raw: []const u8) ?f64 {
+        const s = pytext.pyStrip(raw);
+        if (s.len == 0) return null;
+        var i: usize = 0;
+        var neg = false;
+        if (s[i] == '+' or s[i] == '-') {
+            neg = s[i] == '-';
+            i += 1;
+            if (i >= s.len) return null;
+        }
+        const body = s[i..];
+        if (std.ascii.eqlIgnoreCase(body, "inf") or std.ascii.eqlIgnoreCase(body, "infinity")) {
+            return if (neg) -std.math.inf(f64) else std.math.inf(f64);
+        }
+        if (std.ascii.eqlIgnoreCase(body, "nan")) {
+            return std.math.nan(f64);
+        }
+
+        // Validate decimal float grammar with single underscores only between digits.
+        var p = i;
+        const int_part = scanDigitsWithUnderscores(s, &p);
+        if (!int_part.ok) return null;
+        var frac_digits: usize = 0;
+        if (p < s.len and s[p] == '.') {
+            p += 1;
+            const frac_part = scanDigitsWithUnderscores(s, &p);
+            if (!frac_part.ok) return null;
+            frac_digits = frac_part.digits;
+        }
+        if (int_part.digits == 0 and frac_digits == 0) return null;
+
+        if (p < s.len and (s[p] == 'e' or s[p] == 'E')) {
+            p += 1;
+            if (p < s.len and (s[p] == '+' or s[p] == '-')) p += 1;
+            const exp_part = scanDigitsWithUnderscores(s, &p);
+            if (!exp_part.ok or exp_part.digits == 0) return null;
+        }
+        if (p != s.len) return null;
+
+        if (std.mem.findScalar(u8, s, '_') == null) {
+            return std.fmt.parseFloat(f64, s) catch null;
+        }
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        for (s) |c| {
+            if (c == '_') continue;
+            if (len >= buf.len) return null;
+            buf[len] = c;
+            len += 1;
+        }
+        return std.fmt.parseFloat(f64, buf[0..len]) catch null;
+    }
+
+    /// Eager validator matching Python `argparse(..., type=float)`.
+    pub fn pyFloat(gpa: Allocator, raw: []const u8) Allocator.Error!ValidationResult {
+        if (parsePyFloat(raw) != null) return .ok;
+        const q = try reprToken(gpa, raw);
+        defer gpa.free(q);
+        return .{ .err = try std.fmt.allocPrint(gpa, "invalid float value: {s}", .{q}) };
+    }
+
+    /// Eager validator requiring a finite float `>= 0` (for duration/grace flags).
+    pub fn nonNegativeFiniteFloat(gpa: Allocator, raw: []const u8) Allocator.Error!ValidationResult {
+        const v = parsePyFloat(raw) orelse {
+            const q = try reprToken(gpa, raw);
+            defer gpa.free(q);
+            return .{ .err = try std.fmt.allocPrint(gpa, "invalid float value: {s}", .{q}) };
+        };
+        if (!std.math.isFinite(v) or v < 0) {
+            const q = try reprToken(gpa, raw);
+            defer gpa.free(q);
+            return .{ .err = try std.fmt.allocPrint(gpa, "must be a finite number >= 0: {s}", .{q}) };
+        }
+        return .ok;
+    }
+
+    /// Error set returned by `parseNonNegativeU128`.
+    pub const IntError = error{ NotAnInteger, BelowZero, Overflow };
+
+    /// Parse a Python-syntax decimal integer `>= 0` (including `-0` as `0`,
+    /// surrounding Python whitespace, optional `+`, and single underscores
+    /// between digits).
+    pub fn parseNonNegativeU128(raw: []const u8) IntError!u128 {
+        const s = pytext.pyStrip(raw);
+        if (s.len == 0) return error.NotAnInteger;
+        var i: usize = 0;
+        var neg = false;
+        if (s[i] == '+' or s[i] == '-') {
+            neg = s[i] == '-';
+            i += 1;
+            if (i >= s.len) return error.NotAnInteger;
+        }
+        var p = i;
+        const part = scanDigitsWithUnderscores(s, &p);
+        if (!part.ok or part.digits == 0 or p != s.len) return error.NotAnInteger;
+
+        if (neg) {
+            for (s[i..]) |c| {
+                if (c != '_' and c != '0') return error.BelowZero;
+            }
+            return 0;
+        }
+
+        var acc: u128 = 0;
+        for (s[i..]) |c| {
+            if (c == '_') continue;
+            const d: u128 = c - '0';
+            acc = std.math.mul(u128, acc, 10) catch return error.Overflow;
+            acc = std.math.add(u128, acc, d) catch return error.Overflow;
+        }
+        return acc;
+    }
+
+    /// Eager validator requiring a non-negative `u128` decimal integer.
+    pub fn nonNegativeU128(gpa: Allocator, raw: []const u8) Allocator.Error!ValidationResult {
+        _ = parseNonNegativeU128(raw) catch |err| {
+            const q = try reprToken(gpa, raw);
+            defer gpa.free(q);
+            return switch (err) {
+                error.NotAnInteger => .{ .err = try std.fmt.allocPrint(gpa, "invalid integer value: {s}", .{q}) },
+                error.BelowZero => .{ .err = try std.fmt.allocPrint(gpa, "must be >= 0: {s}", .{q}) },
+                error.Overflow => .{ .err = try std.fmt.allocPrint(gpa, "integer out of range: {s}", .{q}) },
+            };
+        };
+        return .ok;
+    }
+
+    /// Eager validator requiring a decimal integer within `0..std.math.maxInt(u64)`.
+    pub fn boundedU64(gpa: Allocator, raw: []const u8) Allocator.Error!ValidationResult {
+        const v = parseNonNegativeU128(raw) catch |err| {
+            const q = try reprToken(gpa, raw);
+            defer gpa.free(q);
+            return switch (err) {
+                error.NotAnInteger => .{ .err = try std.fmt.allocPrint(gpa, "invalid integer value: {s}", .{q}) },
+                error.BelowZero => .{ .err = try std.fmt.allocPrint(gpa, "must be >= 0: {s}", .{q}) },
+                error.Overflow => .{ .err = try std.fmt.allocPrint(gpa, "integer out of range: {s}", .{q}) },
+            };
+        };
+        if (v > std.math.maxInt(u64)) {
+            const q = try reprToken(gpa, raw);
+            defer gpa.free(q);
+            return .{ .err = try std.fmt.allocPrint(gpa, "integer out of range: {s}", .{q}) };
+        }
+        return .ok;
+    }
+
+    /// Construct a `ValidatorFn` validating membership in a static `allowed` list.
+    pub fn choice(comptime allowed: []const []const u8) ValidatorFn {
+        return struct {
+            fn validate(gpa: Allocator, raw: []const u8) Allocator.Error!ValidationResult {
+                for (allowed) |item| {
+                    if (std.mem.eql(u8, item, raw)) return .ok;
+                }
+                return .{ .err = try formatChoicesDetail(gpa, raw, allowed) };
+            }
+        }.validate;
+    }
+};
+
 // ---- pure parser implementation -------------------------------------------
 
 fn makeError(gpa: Allocator, spec: *const CommandSpec, comptime fmt: []const u8, args: anytype) Allocator.Error!ParseOutcome {
@@ -336,6 +537,54 @@ fn formatOptionDisplay(gpa: Allocator, opt: OptionSpec) Allocator.Error![]u8 {
         return std.fmt.allocPrint(gpa, "-{c}/--{s}", .{ s, opt.name });
     }
     return std.fmt.allocPrint(gpa, "--{s}", .{opt.name});
+}
+
+fn validateOptionValue(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    opt: OptionSpec,
+    val: []const u8,
+) Allocator.Error!?ParseOutcome {
+    if (opt.validate) |vf| {
+        const res = try vf(gpa, val);
+        switch (res) {
+            .ok => {},
+            .err => |detail| {
+                defer gpa.free(detail);
+                const disp = try formatOptionDisplay(gpa, opt);
+                defer gpa.free(disp);
+                return try makeError(gpa, spec, "argument {s}: {s}", .{ disp, detail });
+            },
+        }
+    }
+    if (opt.choices) |allowed| {
+        for (allowed) |c| {
+            if (std.mem.eql(u8, c, val)) return null;
+        }
+        const disp = try formatOptionDisplay(gpa, opt);
+        defer gpa.free(disp);
+        const detail = try types.formatChoicesDetail(gpa, val, allowed);
+        defer gpa.free(detail);
+        return try makeError(gpa, spec, "argument {s}: {s}", .{ disp, detail });
+    }
+    return null;
+}
+
+fn validatePositionalChoice(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    pos_index: usize,
+    val: []const u8,
+) Allocator.Error!?ParseOutcome {
+    if (pos_index >= spec.positionals.len) return null;
+    const p = spec.positionals[pos_index];
+    const allowed = p.choices orelse return null;
+    for (allowed) |c| {
+        if (std.mem.eql(u8, c, val)) return null;
+    }
+    const detail = try types.formatChoicesDetail(gpa, val, allowed);
+    defer gpa.free(detail);
+    return try makeError(gpa, spec, "argument {s}: {s}", .{ p.name, detail });
 }
 
 fn formatAmbiguous(gpa: Allocator, spec: *const CommandSpec, prefix: []const u8) Allocator.Error![]u8 {
@@ -565,6 +814,12 @@ fn parseCommand(
             }
             try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true });
             for (argv[i + 1 ..]) |p| {
+                if (try validatePositionalChoice(gpa, spec, pos.items.len, p)) |err_out| {
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return err_out;
+                }
                 try pos.append(gpa, p);
                 try leftovers.append(gpa, .{ .token = p, .is_positional = true });
             }
@@ -666,6 +921,13 @@ fn parseCommand(
                                     own_state = false;
                                     return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
                                 }
+                                if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
+                                    if (unknown_tail) |t| gpa.free(t);
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return err_out;
+                                }
                                 if (o.kind == .append) {
                                     try opt_lists[k].append(gpa, val);
                                 } else {
@@ -707,6 +969,12 @@ fn parseCommand(
                                     gpa.free(opt_values);
                                     own_state = false;
                                     return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                                }
+                                if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return err_out;
                                 }
                                 if (o.kind == .append) {
                                     try opt_lists[k].append(gpa, val);
@@ -806,6 +1074,12 @@ fn parseCommand(
                         own_state = false;
                         return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
                     }
+                    if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return err_out;
+                    }
                     if (o.kind == .append) {
                         try opt_lists[k].append(gpa, val);
                     } else {
@@ -826,6 +1100,12 @@ fn parseCommand(
             if (is_remainder) {
                 remainder = argv[i..];
                 break;
+            }
+            if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
+                gpa.free(opt_seen);
+                gpa.free(opt_values);
+                own_state = false;
+                return err_out;
             }
             try pos.append(gpa, arg);
             try leftovers.append(gpa, .{ .token = arg, .is_positional = true });
