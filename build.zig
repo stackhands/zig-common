@@ -33,6 +33,18 @@ pub fn build(b: *std.Build) void {
     const install_probe = b.addInstallArtifact(probe, .{});
     b.step("parity-probe", "Build the Python parity probe").dependOn(&install_probe.step);
 
+    // The filesystem parity probe, whose output tests/test_fs_lock_parity.py
+    // compares byte for byte with Python's path, filesystem and lock calls.
+    const fs_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fs_lock_parity_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fs_probe_mod.addImport("zig_common", mod);
+    const fs_probe = b.addExecutable(.{ .name = "fs_lock_parity_probe", .root_module = fs_probe_mod });
+    const install_fs_probe = b.addInstallArtifact(fs_probe, .{});
+    b.step("fs-lock-parity-probe", "Build the filesystem parity probe").dependOn(&install_fs_probe.step);
+
     // The API reference from the doc comments, into <prefix>/docs.
     const lib = b.addLibrary(.{ .name = "zig_common", .root_module = mod });
     const docs = b.addInstallDirectory(.{

@@ -41,7 +41,25 @@ pub fn openPrivate(dir: fsx.fd_t, name: []const u8, create: bool) Error!?fsx.fd_
     return fd;
 }
 
-/// The errors of `lockExclusive`: the `sys.Error` of a failed flock, or
+/// The state root pre-check `RootLock.acquire` applies: a root that
+/// exists and is not a directory once symbolic links are followed is
+/// ENOTDIR, a dangling link and a link loop among them, and a missing
+/// name passes for makedirs to create. The Python tool reaches its
+/// lexists-and-not-isdir line only after its component check has found
+/// no symlink, since that check refuses a symlinked root as unsafe
+/// first; a symlinked root is not this pre-check's to refuse either
+/// way, and RootLock keeps its own NotDir from the open that does not
+/// follow it, a known difference in the message alone.
+pub fn preflightRoot(root: []const u8) Error!void {
+    if (fsx.statAt(fsx.cwd, root, true)) |st| {
+        if (st.isDir()) return;
+        return error.NotDir;
+    } else |_| {}
+    // isdir says no; a name that still exists is a link it could not
+    // follow, a dangling link among them, and is ENOTDIR.
+    if (fsx.statAt(fsx.cwd, root, false)) |_| return error.NotDir else |_| {}
+}
+
 /// `error.TimedOut` when another holder kept the lock past the timeout.
 pub const LockError = Error || error{TimedOut};
 
@@ -333,6 +351,12 @@ pub const RootLock = struct {
         _ = gpa;
         const atomic = @import("atomic.zig");
         const root = withoutTrailingSlashes(state_root);
+        // The Python tool pre-checks the root before makedirs; a
+        // non-directory root is ENOTDIR here whatever makedirs alone
+        // would say. A root that is a directory once links are followed
+        // passes this and is refused below only when the root itself is
+        // a link, as the root is opened without following it.
+        try preflightRoot(root);
         try atomic.makedirs(root);
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
         const dir = try fsx.openDir(fsx.cwd, root, false);
@@ -460,6 +484,86 @@ fn nowMs() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+test "the state root preflight matches lexists and isdir" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-preflight-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(dir);
+
+    const fd = try sys.openat(dir, "plain", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(fd);
+    _ = linux.mkdirat(dir, (try sys.z(&zb, "real")).ptr, 0o700);
+    _ = linux.symlinkat("real", dir, (try sys.z(&zb, "link-dir")).ptr);
+    _ = linux.symlinkat("plain", dir, (try sys.z(&zb, "link-file")).ptr);
+    _ = linux.symlinkat("nowhere", dir, (try sys.z(&zb, "link-dangling")).ptr);
+    _ = linux.symlinkat("link-loop", dir, (try sys.z(&zb, "link-loop")).ptr);
+
+    var nb: [sys.path_max]u8 = undefined;
+    const at = struct {
+        fn at(b: []const u8, name: []const u8, out: *[sys.path_max]u8) []const u8 {
+            return std.fmt.bufPrint(out, "{s}/{s}", .{ b, name }) catch unreachable;
+        }
+    };
+
+    // accepted: a directory, a missing name that makedirs will create,
+    // and a link to a directory, which the expression in isolation
+    // follows as isdir does. A symlinked root never reaches this line
+    // in the Python tool, whose component check refuses it as unsafe
+    // first, and RootLock refuses it after the pre-check with NotDir.
+    try preflightRoot(at.at(base, "real", &nb));
+    try preflightRoot(at.at(base, "link-dir", &nb));
+    try preflightRoot(at.at(base, "absent", &nb));
+
+    // refused with ENOTDIR: a file, a link to a file, a dangling link
+    // and a link loop, all lexists-true and isdir-false
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "plain", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-file", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-dangling", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-loop", &nb)));
+}
+
+test "RootLock refuses a non-directory state root with NotDir" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-rootfile-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+
+    // a regular file as the root
+    const file_root = try std.fmt.allocPrint(gpa, "{s}/file-root", .{base});
+    defer gpa.free(file_root);
+    const fd = try sys.openat(fsx.cwd, file_root, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(fd);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, file_root, 0));
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", sys.describe(error.NotDir));
+
+    // a dangling symbolic link as the root
+    const dangling_root = try std.fmt.allocPrint(gpa, "{s}/dangling-root", .{base});
+    defer gpa.free(dangling_root);
+    _ = linux.symlinkat("nowhere", fsx.cwd, (try sys.z(&zb, dangling_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, dangling_root, 0));
+
+    // a symlink to a directory as the root: the Python tool refuses it
+    // as unsafe through its component check, RootLock with the NotDir
+    // of the open that does not follow it, and neither accepts it
+    const real_root = try std.fmt.allocPrint(gpa, "{s}/real-root", .{base});
+    defer gpa.free(real_root);
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, real_root)).ptr, 0o700);
+    const link_root = try std.fmt.allocPrint(gpa, "{s}/link-root", .{base});
+    defer gpa.free(link_root);
+    _ = linux.symlinkat("real-root", fsx.cwd, (try sys.z(&zb, link_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, link_root, 0));
 }
 
 test "RootLock refuses a second holder and is free after release" {
