@@ -18,6 +18,7 @@ import errno
 import fcntl
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -26,7 +27,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROBE = os.path.join(REPO, "zig-out", "bin", "fs_lock_parity_probe")
 
 # zig error names by the errno Python's reference call raises.
-BY_ERRNO = {errno.EEXIST: "Exists", errno.ENOTDIR: "NotDir", errno.ENOENT: "NotFound"}
+BY_ERRNO = {errno.EEXIST: "Exists", errno.ENOTDIR: "NotDir", errno.ENOENT: "NotFound", errno.EACCES: "AccessDenied"}
+
+# The umask the probe child runs under; 0o027 bites the default 0644
+# mode, and the reference below computes its modes without relying on
+# the runner's own umask, so a writer that ignored the umask cannot
+# match.
+UMASK = 0o027
 
 FIXTURE = {
     "d": ("dir", None),
@@ -48,6 +55,14 @@ def enc(text):
     return text.encode("utf-8", "surrogateescape")
 
 
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def probe_path():
     path = os.environ.get("ZIG_COMMON_PARITY_PROBE", DEFAULT_PROBE)
     if not os.path.exists(path):
@@ -57,7 +72,11 @@ def probe_path():
 
 def run_probe(mode, *args, cwd=None):
     return subprocess.run(
-        [probe_path(), mode, *args], cwd=cwd, check=True, stdout=subprocess.PIPE
+        [probe_path(), mode, *args],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        preexec_fn=lambda: os.umask(UMASK),
     ).stdout.decode("utf-8", "surrogateescape")
 
 
@@ -82,8 +101,20 @@ def make_fixture(root):
 
 
 def py_makedirs(root, name):
+    path = os.path.join(root.encode(), enc(name))
+    # the directories this call creates, to chmod like the child's umask
+    created = []
+    current = path
+    while not os.path.lexists(current):
+        created.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
     try:
-        os.makedirs(os.path.join(root.encode(), enc(name)), exist_ok=True)
+        os.makedirs(path, exist_ok=True)
+        for made in created:
+            os.chmod(made, 0o777 & ~UMASK)
         return "OK"
     except OSError as exc:
         return "ERR:" + BY_ERRNO[exc.errno]
@@ -110,8 +141,7 @@ def py_copy_to(root, dst):
         temp = os.path.join(
             root.encode(), (".%s.%d.tmp" % (dst, os.getpid())).encode()
         )
-        mode = 0o600 if existing is not None else src_mode
-        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             data = os.read(src, 1 << 20)
             os.write(out, data)
@@ -122,6 +152,8 @@ def py_copy_to(root, dst):
                 except PermissionError:
                     pass
                 os.chmod(temp, existing.st_mode & 0o777)
+            else:
+                os.chmod(temp, src_mode & ~UMASK)
         finally:
             os.close(out)
         os.replace(temp, dst_path)
@@ -150,15 +182,126 @@ def py_realpath(root, name):
         return ("ERR", BY_ERRNO[exc.errno])
 
 
+def make_atomic_fixture(root):
+    """The fixture the `atomic` probe mode and its reference both need."""
+    root_b = root.encode()
+    os.mkdir(os.path.join(root_b, b"ro"), 0o755)
+    for name, mode, content in (
+        (b"vfile", 0o644, b"victim\n"),
+        (b"aw-keep", 0o640, b"existing\n"),
+        (b"rc-keep", 0o640, b"rc\n"),
+        (b"ap-exist", 0o644, b"ap-existing\n"),
+    ):
+        fd = os.open(os.path.join(root_b, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, content)
+        finally:
+            os.close(fd)
+        os.chmod(os.path.join(root_b, name), mode)
+    fd = os.open(os.path.join(root_b, b"ro", b"rc-keep"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, b"rokeep\n")
+    finally:
+        os.close(fd)
+    os.chmod(os.path.join(root_b, b"ro", b"rc-keep"), 0o644)
+    for name, target in ((b"aw-link", b"vfile"), (b"rc-link", b"vfile"), (b"ap-link", b"vfile")):
+        os.symlink(target, os.path.join(root_b, name))
+    os.mkfifo(os.path.join(root_b, b"ap-fifo"), 0o644)
+    os.chmod(os.path.join(root_b, b"ro"), 0o555)
+
+
+def py_atomic_write(root, name, data, mode=None):
+    """The documented atomicWrite behavior: a temp file beside the target,
+    the existing mode kept, 0644 less the umask for a new one, a symlink
+    refused, then os.replace and a parent fsync."""
+    path = os.path.join(root, name)
+    if os.path.islink(path):
+        return "ERR:Refused"
+    parent = os.path.dirname(path)
+    tmp = os.path.join(parent, "." + os.path.basename(name) + ".new")
+    try:
+        if os.path.lexists(path):
+            want = stat.S_IMODE(os.lstat(path).st_mode)
+        elif mode is not None:
+            want = mode
+        else:
+            want = 0o644 & ~UMASK
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+            os.fchmod(fd, want)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        fsync_dir(parent)
+        return "OK"
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "ERR:" + BY_ERRNO.get(exc.errno, "Errno%d" % exc.errno)
+
+
+def py_replace_contents(root, name, data):
+    """The documented replaceContents behavior: the target must be an
+    existing regular file, never a symlink, and keeps its mode."""
+    path = os.path.join(root, name)
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return "ERR:" + BY_ERRNO[exc.errno]
+    if stat.S_ISLNK(st.st_mode):
+        return "ERR:SymLink"
+    if not stat.S_ISREG(st.st_mode):
+        return "ERR:NotRegularFile"
+    tmp = os.path.join(root, "%s.tmp.%d" % (name, os.getpid()))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+            os.fchmod(fd, stat.S_IMODE(st.st_mode))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        return "OK"
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "ERR:" + BY_ERRNO.get(exc.errno, "Errno%d" % exc.errno)
+
+
+def py_append_line(root, name, line):
+    """The documented appendLine behavior: one appended line, a symlink or
+    non-regular target refused, a new file 0666 less the umask."""
+    path = os.path.join(root, name)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if stat.S_ISLNK(st.st_mode):
+            return "ERR:SymLink"
+        if not stat.S_ISREG(st.st_mode):
+            return "ERR:NotRegularFile"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, line.encode() + b"\n")
+        finally:
+            os.close(fd)
+        if st is None:
+            os.chmod(path, 0o666 & ~UMASK)
+        return "OK"
+    except OSError as exc:
+        return "ERR:" + BY_ERRNO.get(exc.errno, "Errno%d" % exc.errno)
+
+
 class FsLockParity(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls._old_umask = os.umask(0o022)
-
-    @classmethod
-    def tearDownClass(cls):
-        os.umask(cls._old_umask)
-
     # ---- path normalization ----
 
     def test_norm_and_abs_paths(self):
@@ -246,6 +389,42 @@ class FsLockParity(unittest.TestCase):
         # the two trees must agree
         self.assert_trees_equal(probe_root, python_root)
 
+    def test_atomic_replace_append(self):
+        probe_root = tempfile.mkdtemp()
+        python_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, probe_root, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, python_root, ignore_errors=True)
+        make_atomic_fixture(python_root)
+        make_atomic_fixture(probe_root)
+
+        out = run_probe("atomic", cwd=probe_root)
+        got = [line.split("\t") for line in out.splitlines()]
+        self.assertTrue(got, "the probe printed no atomic cases")
+
+        want = []
+        want.append(("atomicwrite", "aw-new", py_atomic_write(python_root, "aw-new", b"new content\n")))
+        want.append(("atomicwrite", "aw-keep", py_atomic_write(python_root, "aw-keep", b"replaced\n")))
+        want.append(("atomicwrite", "aw-link", py_atomic_write(python_root, "aw-link", b"x\n")))
+        want.append(("atomicwrite", "ro/aw-new", py_atomic_write(python_root, "ro/aw-new", b"x\n")))
+        want.append(("atomicwrite", "aw-mode", py_atomic_write(python_root, "aw-mode", b"m\n", mode=0o600)))
+        want.append(("replacecontents", "rc-keep", py_replace_contents(python_root, "rc-keep", b"replaced\n")))
+        want.append(("replacecontents", "rc-missing", py_replace_contents(python_root, "rc-missing", b"x\n")))
+        want.append(("replacecontents", "rc-link", py_replace_contents(python_root, "rc-link", b"x\n")))
+        want.append(("replacecontents", "ro/rc-keep", py_replace_contents(python_root, "ro/rc-keep", b"x\n")))
+        want.append(("appendline", "ap-new", py_append_line(python_root, "ap-new", "fresh line")))
+        want.append(("appendline", "ap-exist", py_append_line(python_root, "ap-exist", "second")))
+        want.append(("appendline", "ap-link", py_append_line(python_root, "ap-link", "x")))
+        want.append(("appendline", "ro/ap-new", py_append_line(python_root, "ro/ap-new", "x")))
+        want.append(("appendline", "ap-fifo", py_append_line(python_root, "ap-fifo", "x")))
+
+        for (g_op, g_arg, g_res), (w_op, w_name, w_res) in zip(got, want):
+            self.assertEqual(g_op, w_op)
+            self.assertEqual(bytes.fromhex(g_arg), enc(w_name))
+            self.assertEqual(g_res, w_res, "%s %s" % (w_op, w_name))
+
+        # the two trees must agree, mode bits under the umask included
+        self.assert_trees_equal(probe_root, python_root)
+
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
         names_a = sorted(os.listdir(root_a))
@@ -254,7 +433,10 @@ class FsLockParity(unittest.TestCase):
         for name in names_a:
             pa = os.path.join(root_a, name)
             pb = os.path.join(root_b, name)
-            self.assertFalse(name.startswith(b"."), "leftover temporary %r" % name)
+            self.assertFalse(
+                name.startswith(b".") or b".tmp." in name,
+                "leftover temporary %r" % name,
+            )
             sa, sb = os.lstat(pa), os.lstat(pb)
             self.assertEqual(
                 (os.path.stat.S_IFMT(sa.st_mode), sa.st_mode & 0o7777, sa.st_size),

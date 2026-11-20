@@ -154,6 +154,43 @@ fn realpathCase(name: []const u8) void {
     }
 }
 
+/// `atomic` mode: atomicWrite, replaceContents and appendLine cases on
+/// the fixture the test created around the probe's working directory.
+fn atomicMode() void {
+    const dir = fsx.openDir(fsx.cwd, ".", false) catch unreachable;
+    defer sys.close(dir);
+    const aw_cases = [_]struct { name: []const u8, data: []const u8, opts: common.atomic.WriteOptions }{
+        .{ .name = "aw-new", .data = "new content\n", .opts = .{} },
+        .{ .name = "aw-keep", .data = "replaced\n", .opts = .{} },
+        .{ .name = "aw-link", .data = "x\n", .opts = .{} },
+        .{ .name = "ro/aw-new", .data = "x\n", .opts = .{} },
+        .{ .name = "aw-mode", .data = "m\n", .opts = .{ .mode = 0o600 } },
+    };
+    for (aw_cases) |c| {
+        var why: common.atomic.Why = .{};
+        opLine("atomicwrite", c.name, common.atomic.atomicWrite(A, c.name, c.data, c.opts, &why));
+    }
+    const rc_cases = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "rc-keep", .data = "replaced\n" },
+        .{ .name = "rc-missing", .data = "x\n" },
+        .{ .name = "rc-link", .data = "x\n" },
+        .{ .name = "ro/rc-keep", .data = "x\n" },
+    };
+    for (rc_cases) |c| {
+        opLine("replacecontents", c.name, fsx.replaceContents(A, dir, c.name, c.data));
+    }
+    const ap_cases = [_]struct { name: []const u8, line: []const u8 }{
+        .{ .name = "ap-new", .line = "fresh line" },
+        .{ .name = "ap-exist", .line = "second" },
+        .{ .name = "ap-link", .line = "x" },
+        .{ .name = "ro/ap-new", .line = "x" },
+        .{ .name = "ap-fifo", .line = "x" },
+    };
+    for (ap_cases) |c| {
+        opLine("appendline", c.name, fsx.appendLine(A, dir, c.name, c.line));
+    }
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -220,6 +257,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try normMode();
     } else if (std.mem.eql(u8, mode, "effects")) {
         effectsMode();
+    } else if (std.mem.eql(u8, mode, "atomic")) {
+        atomicMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {
