@@ -559,6 +559,365 @@ def generate_prolog_cases(rng, count=500):
     return cases
 
 
+def run_python_intermixed(argv_bytes):
+    argv_str = [a.decode("utf-8", "surrogateescape") for a in argv_bytes]
+    kwargs = {"prog": "imix"}
+    if IS_PY314:
+        kwargs["color"] = False
+    p = argparse.ArgumentParser(**kwargs)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--prefix")
+    p.add_argument("first")
+    p.add_argument("files", nargs="+")
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        try:
+            ns = p.parse_intermixed_args(argv_str)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if code == 0:
+                return {"kind": "action_done", "exit_code": 0, "stdout": bhex(out_buf.getvalue())}
+            return {"kind": "usage_error", "exit_code": code, "stderr": bhex(err_buf.getvalue())}
+
+    return {
+        "kind": "ok",
+        "json": bool(ns.json),
+        "prefix": bhex(ns.prefix),
+        "first": bhex(ns.first),
+        "files": [bhex(x) for x in ns.files],
+    }
+
+
+def generate_intermixed_cases(rng, count=400):
+    tokens = [
+        b"-h",
+        b"--help",
+        b"--json",
+        b"--json=1",
+        b"--prefix",
+        b"--prefix=/opt",
+        b"--prefix=",
+        b"--",
+        b"--bogus",
+        b"-1",
+        b"f1",
+        b"f2",
+        b"f3",
+    ]
+    cases = [
+        [],
+        [b"a"],
+        [b"a", b"b"],
+        [b"a", b"--json", b"b", b"--prefix", b"/p", b"c"],
+        [b"a", b"--json", b"--", b"--bogus", b"-h"],
+        [b"--json", b"--", b"a", b"b"],
+        [b"a", b"b", b"--json", b"--"],
+    ]
+    while len(cases) < count:
+        n = rng.randrange(0, 8)
+        cases.append([rng.choice(tokens) for _ in range(n)])
+    return cases
+
+
+def run_python_native(argv_bytes):
+    """Reference parser matching Policy.native_exact, UnknownMode.positional, prescan, ignore_empty, mutex, and ErrorKind."""
+    sub_idx = None
+    for i, a in enumerate(argv_bytes):
+        if a in (b"-h", b"--help"):
+            return {"kind": "action_done", "exit_code": 0, "stdout": bhex(b"native help\n")}
+        if a == b"--version":
+            return {"kind": "action_done", "exit_code": 0, "stdout": bhex(b"native 1.0\n")}
+        if a.startswith(b"-"):
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_option", "token": bhex(a)}
+        sub_idx = i
+        break
+
+    if sub_idx is None:
+        return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_subcommand"}
+
+    cmd = argv_bytes[sub_idx]
+    rest = argv_bytes[sub_idx + 1 :]
+    if cmd not in (b"rotate", b"failed", b"used", b"prescan", b"mutex"):
+        return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_subcommand", "token": bhex(cmd)}
+
+    def parse_val(args, idx, name, allow_empty=True, allow_dash=True):
+        a = args[idx]
+        prefix = b"--" + name + b"="
+        if a.startswith(prefix):
+            val = a[len(prefix) :]
+        else:
+            if idx + 1 >= len(args):
+                return None, idx, {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_value", "token": bhex(name)}
+            idx += 1
+            val = args[idx]
+        if (not allow_empty and len(val) == 0) or (not allow_dash and val.startswith(b"-")):
+            return None, idx, {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_value", "token": bhex(name)}
+        return val, idx, None
+
+    if cmd == b"rotate":
+        dry_run = False
+        compress_after = None
+        target = None
+        module = None
+        pos = []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == b"--dry-run":
+                dry_run = True
+            elif a == b"--compress-after" or a.startswith(b"--compress-after="):
+                val, i, err = parse_val(rest, i, b"compress-after", True, True)
+                if err:
+                    return err
+                compress_after = val
+            elif a == b"--target" or a.startswith(b"--target="):
+                val, i, err = parse_val(rest, i, b"target", False, True)
+                if err:
+                    return err
+                target = val
+            elif a == b"--module" or a.startswith(b"--module="):
+                val, i, err = parse_val(rest, i, b"module", False, False)
+                if err:
+                    return err
+                module = val
+            elif a.startswith(b"-"):
+                return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_option", "token": bhex(a)}
+            else:
+                if len(pos) >= 1:
+                    return {"kind": "usage_error", "exit_code": 2, "err_kind": "extra_positional", "token": bhex(a)}
+                pos.append(a)
+            i += 1
+        if len(pos) < 1:
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(b"ROOT")}
+        return {
+            "kind": "ok",
+            "command": "rotate",
+            "dry_run": dry_run,
+            "compress_after": bhex(compress_after),
+            "target": bhex(target),
+            "module": bhex(module),
+            "root": bhex(pos[0]),
+        }
+
+    if cmd == b"failed":
+        syslog = None
+        pos = []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == b"--syslog" or a.startswith(b"--syslog="):
+                val, i, err = parse_val(rest, i, b"syslog", True, True)
+                if err:
+                    return err
+                syslog = val
+            else:
+                if len(pos) >= 4:
+                    return {"kind": "usage_error", "exit_code": 2, "err_kind": "extra_positional", "token": bhex(a)}
+                pos.append(a)
+            i += 1
+        req_names = [b"STATUS", b"NAME", b"LOGDIR"]
+        if len(pos) < 3:
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(req_names[len(pos)])}
+        return {"kind": "ok", "command": "failed", "syslog": bhex(syslog), "pos": [bhex(x) for x in pos]}
+
+    if cmd == b"prescan":
+        for a in rest:
+            if a in (b"-h", b"--help"):
+                return {"kind": "action_done", "exit_code": 0, "stdout": bhex(b"prescan help\n")}
+            if a == b"--version":
+                return {"kind": "action_done", "exit_code": 0, "stdout": bhex(b"prescan 1.0\n")}
+        fmt = None
+        pos = []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == b"--format" or a.startswith(b"--format="):
+                val, i, err = parse_val(rest, i, b"format", False, True)
+                if err:
+                    return err
+                fmt = val
+            elif a.startswith(b"-"):
+                return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_option", "token": bhex(a)}
+            else:
+                if len(a) == 0 and len(pos) == 0:
+                    i += 1
+                    continue
+                if len(pos) >= 1:
+                    return {"kind": "usage_error", "exit_code": 2, "err_kind": "extra_positional", "token": bhex(a)}
+                pos.append(a)
+            i += 1
+        if len(pos) < 1:
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(b"RUN")}
+        return {"kind": "ok", "command": "prescan", "format": bhex(fmt), "run": bhex(pos[0])}
+
+    if cmd == b"mutex":
+        unused = False
+        active = False
+        json_flag = False
+        pos = []
+        for a in rest:
+            if a == b"--unused":
+                if active:
+                    return {"kind": "usage_error", "exit_code": 2, "err_kind": "mutually_exclusive", "option": bhex(b"unused"), "conflict": bhex(b"active")}
+                unused = True
+            elif a == b"--active":
+                if unused:
+                    return {"kind": "usage_error", "exit_code": 2, "err_kind": "mutually_exclusive", "option": bhex(b"active"), "conflict": bhex(b"unused")}
+                active = True
+            elif a == b"--json":
+                json_flag = True
+            elif a.startswith(b"-"):
+                return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_option", "token": bhex(a)}
+            else:
+                pos.append(a)
+        if len(pos) < 1:
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(b"FILE")}
+        return {"kind": "ok", "command": "mutex", "unused": unused, "active": active, "json": json_flag, "files": [bhex(x) for x in pos]}
+
+    # cmd == b"used"
+    json_flag = False
+    prefix = None
+    pos = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == b"--json":
+            json_flag = True
+        elif a == b"--prefix" or a.startswith(b"--prefix="):
+            val, i, err = parse_val(rest, i, b"prefix", False, False)
+            if err:
+                return err
+            prefix = val
+        elif a.startswith(b"-"):
+            return {"kind": "usage_error", "exit_code": 2, "err_kind": "unknown_option", "token": bhex(a)}
+        else:
+            pos.append(a)
+        i += 1
+    if prefix is None:
+        return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(b"prefix")}
+    if len(pos) < 1:
+        return {"kind": "usage_error", "exit_code": 2, "err_kind": "missing_required", "token": bhex(b"FILE")}
+    return {"kind": "ok", "command": "used", "json": json_flag, "prefix": bhex(prefix), "files": [bhex(x) for x in pos]}
+
+
+def generate_native_cases(rng, count=600):
+    top_toks = [b"-h", b"--help", b"--help=1", b"--version", b"--version=1", b"--bogus", b"nope"]
+    sub_pools = {
+        b"rotate": [
+            b"--dry-run",
+            b"--dry-run=1",
+            b"--compress-after",
+            b"--compress-after=",
+            b"--compress-after=-5",
+            b"--target",
+            b"--target=",
+            b"--target=-x",
+            b"--module",
+            b"--module=",
+            b"--module=-x",
+            b"--module=GCC",
+            b"--bogus",
+            b"-1",
+            b"",
+            b"logs",
+            b"extra",
+        ],
+        b"failed": [
+            b"--syslog",
+            b"--syslog=",
+            b"--syslog=-x",
+            b"--bogus",
+            b"-1",
+            b"1",
+            b"Foo",
+            b"logdir",
+            b"tmpdir",
+            b"extra",
+        ],
+        b"used": [
+            b"--json",
+            b"--json=1",
+            b"--prefix",
+            b"--prefix=",
+            b"--prefix=-x",
+            b"--prefix=/opt",
+            b"--bogus",
+            b"a.json",
+            b"b.json",
+            b"c.json",
+        ],
+        b"prescan": [
+            b"-h",
+            b"--help",
+            b"--help=1",
+            b"--version",
+            b"--version=1",
+            b"--format",
+            b"--format=",
+            b"--format=json",
+            b"--bogus",
+            b"",
+            b"run1",
+            b"run2",
+        ],
+        b"mutex": [
+            b"--unused",
+            b"--unused=1",
+            b"--active",
+            b"--active=1",
+            b"--json",
+            b"--bogus",
+            b"a.log",
+            b"b.log",
+        ],
+    }
+    cases = [
+        [],
+        [b"--bogus"],
+        [b"--help"],
+        [b"--help=1"],
+        [b"--version"],
+        [b"--version=1"],
+        [b"nope"],
+        [b"rotate", b"--bogus"],
+        [b"rotate", b"--bogus", b"--target"],
+        [b"rotate", b"--dry-run=1", b"logs"],
+        [b"rotate", b"--compress-after", b"-5", b"logs"],
+        [b"rotate", b"--target=", b"logs"],
+        [b"rotate", b"--module=-x", b"logs"],
+        [b"failed", b"-1", b"Foo", b"--bogus"],
+        [b"failed", b"1", b"Foo", b"dir", b"tmp", b"extra"],
+        [b"used", b"a.json", b"--prefix", b"/opt", b"--json", b"b.json"],
+        [b"prescan", b"--bogus", b"-h"],
+        [b"prescan", b"--format", b"--help"],
+        [b"prescan", b"--bogus", b"--version"],
+        [b"prescan", b"", b"run1"],
+        [b"prescan", b"run1", b""],
+        [b"prescan", b""],
+        [b"mutex", b"--unused", b"--active", b"--bogus"],
+        [b"mutex", b"--bogus", b"--unused", b"--active"],
+        [b"mutex", b"--active", b"--unused", b"a.log"],
+        [b"mutex", b"--unused", b"--json", b"a.log"],
+    ]
+    subs = [b"rotate", b"failed", b"used", b"prescan", b"mutex"]
+    while len(cases) < count:
+        if rng.random() < 0.15:
+            cases.append([rng.choice(top_toks) for _ in range(rng.randrange(0, 3))])
+            continue
+        argv = []
+        if rng.random() < 0.1:
+            argv.append(rng.choice([b"--bogus", b"--help=1"]))
+        sub = rng.choice(subs)
+        argv.append(sub)
+        pool = sub_pools[sub]
+        for _ in range(rng.randrange(0, 7)):
+            argv.append(rng.choice(pool))
+        cases.append(argv)
+    return cases
+
+
 def run_probe_batch(mode, cases):
     lines = []
     for argv in cases:
@@ -644,6 +1003,56 @@ class ArgparseParityTest(unittest.TestCase):
                     break
         if mismatches:
             self.fail(f"seed={SEED}: prolog mismatches: {mismatches[:5]!r}")
+
+    @unittest.skipUnless(IS_PY314, "parse_intermixed_args differential parity requires Python 3.14+")
+    def test_intermixed_variadic_differential_fuzz(self):
+        cases = generate_intermixed_cases(self.rng, count=400)
+        zig_results = run_probe_batch("intermixed", cases)
+
+        mismatches = []
+        counts = {"ok": 0, "action_done": 0, "usage_error": 0}
+        for argv, zig_res in zip(cases, zig_results):
+            py_res = run_python_intermixed(argv)
+            counts[py_res["kind"]] = counts.get(py_res["kind"], 0) + 1
+            if zig_res != py_res:
+                mismatches.append((argv, py_res, zig_res))
+                if len(mismatches) >= 10:
+                    break
+        if mismatches:
+            lines = [f"seed={SEED}: intermixed mismatches:"]
+            for argv, py_res, zig_res in mismatches[:5]:
+                py_s = dict(py_res)
+                zig_s = dict(zig_res)
+                for d in (py_s, zig_s):
+                    for k in ("stdout", "stderr"):
+                        if k in d and d[k] is not None:
+                            d[k] = bytes.fromhex(d[k]).decode("utf-8", "replace")
+                lines.append(f"  argv={argv!r}\n    py ={py_s!r}\n    zig={zig_s!r}")
+            self.fail("\n".join(lines))
+
+        self.assertGreater(counts["ok"], 20)
+        self.assertGreater(counts["action_done"], 20)
+        self.assertGreater(counts["usage_error"], 50)
+
+    def test_native_exact_differential_fuzz(self):
+        cases = generate_native_cases(self.rng, count=500)
+        zig_results = run_probe_batch("native", cases)
+
+        mismatches = []
+        counts = {"ok": 0, "action_done": 0, "usage_error": 0}
+        for argv, zig_res in zip(cases, zig_results):
+            py_res = run_python_native(argv)
+            counts[py_res["kind"]] = counts.get(py_res["kind"], 0) + 1
+            if zig_res != py_res:
+                mismatches.append((argv, py_res, zig_res))
+                if len(mismatches) >= 10:
+                    break
+        if mismatches:
+            self.fail(f"seed={SEED}: native_exact mismatches: {mismatches[:5]!r}")
+
+        self.assertGreater(counts["ok"], 20)
+        self.assertGreater(counts["action_done"], 10)
+        self.assertGreater(counts["usage_error"], 100)
 
     @unittest.skipUnless(IS_PY314, "Policy.python314 subprocess parity requires Python 3.14+")
     def test_parse_or_exit_subprocess_codes_and_streams(self):
