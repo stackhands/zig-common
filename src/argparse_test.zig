@@ -292,3 +292,53 @@ test "contract 7 and 8: argv-ordered leftovers, remainder unknowns, and exit-2 u
         try std.testing.expectEqualStrings("a.eb", sub.remainder[1]);
     }
 }
+
+const prolog_spec: argparse.CommandSpec = .{
+    .prog = "eessi-arch-guard",
+    .usage = "usage: eessi-arch-guard [--shell] [--timeout SEC]\n",
+    .help = "usage: eessi-arch-guard [--shell] [--timeout SEC]\n",
+    .version = "0.2.0\n",
+    .policy = .prolog_lenient,
+    .options = &.{
+        .{ .name = "shell", .kind = .flag },
+        .{ .name = "strict", .kind = .flag },
+        .{ .name = "timeout", .kind = .optional_value },
+        .{ .name = "chain", .kind = .optional_value },
+    },
+};
+
+test "contract 8 (prolog_lenient): exact names, optional_value, -- ignored, deferred help/version, never exit-2" {
+    const gpa = std.testing.allocator;
+
+    // Abbreviations and unknown flags are silently ignored; -- does not terminate scanning
+    {
+        var out = try argparse.parse(gpa, &prolog_spec, &.{ "--sh", "--bogus", "--", "--shell", "--shell=1", "-hh", "-h", "--version" });
+        defer out.deinit(gpa);
+        try std.testing.expect(out.ok.seen("shell"));
+        try std.testing.expect(!out.ok.seen("strict"));
+        try std.testing.expect(out.ok.help_requested);
+        try std.testing.expect(out.ok.version_requested);
+    }
+    // optional_value yields "" when absent or followed by any '-' token (even -5), while --timeout=-5 binds "-5"
+    {
+        var out = try argparse.parse(gpa, &prolog_spec, &.{ "--timeout", "-5", "--chain" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("", out.ok.value("timeout").?);
+        try std.testing.expectEqualStrings("", out.ok.value("chain").?);
+    }
+    {
+        var out = try argparse.parse(gpa, &prolog_spec, &.{ "--timeout=-5", "--chain", "/etc/prolog" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("-5", out.ok.value("timeout").?);
+        try std.testing.expectEqualStrings("/etc/prolog", out.ok.value("chain").?);
+    }
+    // Malformed / non-UTF-8 / ambiguous tokens never trigger usage_error under prolog_lenient
+    {
+        const nasty = [_][]const u8{ "--=", "--=foo", "--help=1", "--version=bad", "-h=1", "\xff\xfe", "--timeout", "--strict" };
+        var out = try argparse.parse(gpa, &prolog_spec, &nasty);
+        defer out.deinit(gpa);
+        try std.testing.expect(out == .ok);
+        try std.testing.expect(out.ok.seen("strict"));
+        try std.testing.expectEqualStrings("", out.ok.value("timeout").?);
+    }
+}

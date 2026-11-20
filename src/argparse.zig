@@ -72,6 +72,19 @@ pub const Policy = struct {
         .short_clusters = true,
         .special_action = .immediate_exit,
     };
+
+    /// Lenient Slurm TaskProlog policy matching `eessi-arch-guard`'s `parse_args`:
+    /// exact flag names only, unknown tokens ignored, `--` ignored, negative
+    /// tokens never consumed as space-separated values, no short clustering,
+    /// and deferred `-h`/`--help`/`--version` recording without exit-2 errors.
+    pub const prolog_lenient: Policy = .{
+        .allow_abbrev = false,
+        .unknown = .ignore,
+        .double_dash = .ignore,
+        .negative_numbers = .never,
+        .short_clusters = false,
+        .special_action = .record,
+    };
 };
 
 /// Result returned by a typed option validator callback.
@@ -642,6 +655,8 @@ fn parseCommand(
                                 } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
                                     i += 1;
                                     val = argv[i];
+                                } else if (o.kind == .optional_value) {
+                                    val = "";
                                 } else {
                                     if (unknown_tail) |t| gpa.free(t);
                                     const disp = try formatOptionDisplay(gpa, o);
@@ -665,6 +680,44 @@ fn parseCommand(
                     }
                     continue;
                 }
+            } else if (arg.len == 2) {
+                if (matchShortChar(spec, arg[1])) |target| {
+                    switch (target) {
+                        .help => {
+                            if (spec.policy.special_action == .immediate_exit) {
+                                gpa.free(opt_seen);
+                                gpa.free(opt_values);
+                                own_state = false;
+                                return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
+                            }
+                            help_requested = true;
+                        },
+                        .option => |k| {
+                            const o = spec.options[k];
+                            opt_seen[k] = true;
+                            if (o.kind != .flag) {
+                                var val: []const u8 = "";
+                                if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                                    i += 1;
+                                    val = argv[i];
+                                } else if (o.kind != .optional_value) {
+                                    const disp = try formatOptionDisplay(gpa, o);
+                                    defer gpa.free(disp);
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                                }
+                                if (o.kind == .append) {
+                                    try opt_lists[k].append(gpa, val);
+                                } else {
+                                    opt_values[k] = val;
+                                }
+                            }
+                        },
+                    }
+                    continue;
+                }
             }
         }
 
@@ -683,6 +736,7 @@ fn parseCommand(
                 },
                 .help => {
                     if (eq) |e| {
+                        if (spec.policy.unknown == .ignore) continue;
                         const q = try reprToken(gpa, arg[e + 1 ..]);
                         defer gpa.free(q);
                         gpa.free(opt_seen);
@@ -701,6 +755,7 @@ fn parseCommand(
                 },
                 .version => {
                     if (eq) |e| {
+                        if (spec.policy.unknown == .ignore) continue;
                         const q = try reprToken(gpa, arg[e + 1 ..]);
                         defer gpa.free(q);
                         gpa.free(opt_seen);
@@ -719,9 +774,9 @@ fn parseCommand(
                 },
                 .option => |k| {
                     const o = spec.options[k];
-                    opt_seen[k] = true;
                     if (o.kind == .flag) {
                         if (eq) |e| {
+                            if (spec.policy.unknown == .ignore) continue;
                             const disp = try formatOptionDisplay(gpa, o);
                             defer gpa.free(disp);
                             const q = try reprToken(gpa, arg[e + 1 ..]);
@@ -731,14 +786,18 @@ fn parseCommand(
                             own_state = false;
                             return try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
                         }
+                        opt_seen[k] = true;
                         continue;
                     }
+                    opt_seen[k] = true;
                     var val: []const u8 = undefined;
                     if (eq) |e| {
                         val = arg[e + 1 ..];
                     } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
                         i += 1;
                         val = argv[i];
+                    } else if (o.kind == .optional_value) {
+                        val = "";
                     } else {
                         const disp = try formatOptionDisplay(gpa, o);
                         defer gpa.free(disp);
@@ -873,15 +932,17 @@ fn parseCommand(
         return try makeError(gpa, spec, "the following arguments are required: {s}", .{joined.items});
     }
 
-    // Check merged unrecognized arguments.
-    const pos_slots = nonRemainderPositionals(spec);
-    const consumed_pos = @min(pos.items.len, pos_slots);
-    const keep_sep = pos_slots == 0 and !is_remainder;
-    if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep)) |err_out| {
-        gpa.free(opt_seen);
-        gpa.free(opt_values);
-        own_state = false;
-        return err_out;
+    // Check merged unrecognized arguments unless unknown tokens are ignored.
+    if (spec.policy.unknown == .collect) {
+        const pos_slots = nonRemainderPositionals(spec);
+        const consumed_pos = @min(pos.items.len, pos_slots);
+        const keep_sep = pos_slots == 0 and !is_remainder;
+        if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep)) |err_out| {
+            gpa.free(opt_seen);
+            gpa.free(opt_values);
+            own_state = false;
+            return err_out;
+        }
     }
 
     const parsed = try buildParsedState(gpa, spec, opt_seen, opt_values, opt_lists, &pos, remainder, help_requested, version_requested);
