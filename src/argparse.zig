@@ -44,6 +44,10 @@ pub const NegativeNumberMode = enum {
     /// Every token starting with `-` is option-like (never consumed as a
     /// space-separated value).
     never,
+    /// Consume any token following a value option (including dash-prefixed
+    /// tokens such as `-5` or `--foo`) while keeping standalone dash tokens
+    /// option-like.
+    any,
 };
 
 /// How `-h`/`--help` and `--version` actions behave during parsing.
@@ -52,10 +56,13 @@ pub const SpecialActionMode = enum {
     immediate_exit,
     /// Record `help_requested` / `version_requested` on `Parsed` and keep scanning.
     record,
+    /// Scan the full argument vector for `-h`/`--help` or `--version` before
+    /// parsing options and return `ParseOutcome.action_done` immediately if found.
+    prescan,
 };
 
-/// Parser behaviour policy controlling strict Python 3.14 parity vs. lenient
-/// TaskProlog parsing.
+/// Parser behaviour policy controlling strict Python 3.14 parity, lenient
+/// TaskProlog parsing, and exact-match native Zig CLIs.
 pub const Policy = struct {
     allow_abbrev: bool = true,
     unknown: UnknownMode = .collect,
@@ -63,6 +70,15 @@ pub const Policy = struct {
     negative_numbers: NegativeNumberMode = .py314,
     short_clusters: bool = true,
     special_action: SpecialActionMode = .immediate_exit,
+    /// Treat `--flag=val` on a boolean flag (and `--help=val` / `--version=val`)
+    /// as an unrecognized option-like token instead of an `ignored explicit argument` error.
+    flag_explicit_as_unknown: bool = false,
+    /// Report unrecognized options and excess positionals before missing required
+    /// options, positionals, or subcommands.
+    unknown_before_required: bool = false,
+    /// Return immediately on the first unrecognized option, excess positional,
+    /// or mutually exclusive conflict encountered during left-to-right scanning.
+    fail_fast: bool = false,
     write_stdout: WriteFn = defaultStdout,
     write_stderr: WriteFn = defaultStderr,
 
@@ -87,6 +103,23 @@ pub const Policy = struct {
         .negative_numbers = .never,
         .short_clusters = false,
         .special_action = .record,
+    };
+
+    /// Exact-match policy for native Zig CLIs: no abbreviations, no short
+    /// clustering, `--` is not a special separator, any token following a value
+    /// option is consumed as its value, `--flag=val` is treated as an unknown
+    /// option, unknown tokens are reported before missing required arguments,
+    /// and scan-time errors fail fast left-to-right.
+    pub const native_exact: Policy = .{
+        .allow_abbrev = false,
+        .unknown = .collect,
+        .double_dash = .ignore,
+        .negative_numbers = .any,
+        .short_clusters = false,
+        .special_action = .immediate_exit,
+        .flag_explicit_as_unknown = true,
+        .unknown_before_required = true,
+        .fail_fast = true,
     };
 };
 
@@ -136,6 +169,12 @@ pub const OptionSpec = struct {
     choices: ?[]const []const u8 = null,
     /// Optional eager value validator; runs on every occurrence as it is parsed.
     validate: ?ValidatorFn = null,
+    /// Allow an empty string value (`--opt=` or `--opt ""`). When `false`,
+    /// an empty value is rejected as a missing option argument.
+    allow_empty: bool = true,
+    /// Allow a value starting with `-` (including `--opt=-val`). When `false`,
+    /// a leading-dash value is rejected as a missing option argument.
+    allow_dash_value: bool = true,
 };
 
 /// Arity of a positional argument.
@@ -172,6 +211,12 @@ pub const SubcommandSpec = struct {
     command: *const CommandSpec,
 };
 
+/// Group of option long names that cannot appear together on the same invocation.
+pub const MutexGroup = struct {
+    /// Long option names (without leading `--`) belonging to this group.
+    options: []const []const u8,
+};
+
 /// Declarative specification for a parser (top-level or subcommand).
 pub const CommandSpec = struct {
     /// Program or subcommand name printed before `: error: `.
@@ -188,6 +233,8 @@ pub const CommandSpec = struct {
     policy: Policy = .python314,
     /// Options in registration order (used for ambiguity listings and missing-argument errors).
     options: []const OptionSpec = &.{},
+    /// Mutually exclusive option groups for this parser.
+    mutually_exclusive: []const MutexGroup = &.{},
     /// Positional arguments in declaration order.
     positionals: []const PositionalSpec = &.{},
     /// Optional subcommand dispatch table.
@@ -314,10 +361,11 @@ pub const ParseOutcome = union(enum) {
 /// Whether `arg` looks like an option under `mode`.
 /// Under `.py314`, mirrors Python 3.14 `_parse_optional`: starts with `-`, has
 /// length >= 2, contains no ASCII space, and is not a negative number (`-DIGIT`
-/// or `-.DIGIT`). Under `.never`, any token starting with `-` is option-like.
+/// or `-.DIGIT`). Under `.never` and `.any`, any token starting with `-` is
+/// option-like when standing alone.
 pub fn optionLike(arg: []const u8, mode: NegativeNumberMode) bool {
     switch (mode) {
-        .never => return arg.len >= 1 and arg[0] == '-',
+        .never, .any => return arg.len >= 1 and arg[0] == '-',
         .py314 => {
             if (arg.len < 2 or arg[0] != '-') return false;
             if (std.mem.findScalar(u8, arg, ' ') != null) return false;
@@ -549,6 +597,20 @@ fn formatOptionDisplay(gpa: Allocator, opt: OptionSpec) Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "--{s}", .{opt.name});
 }
 
+fn checkOptionValueAllowed(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    opt: OptionSpec,
+    val: []const u8,
+) Allocator.Error!?ParseOutcome {
+    if ((!opt.allow_empty and val.len == 0) or (!opt.allow_dash_value and val.len > 0 and val[0] == '-')) {
+        const disp = try formatOptionDisplay(gpa, opt);
+        defer gpa.free(disp);
+        return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+    }
+    return null;
+}
+
 fn validateOptionValue(
     gpa: Allocator,
     spec: *const CommandSpec,
@@ -689,7 +751,7 @@ fn matchShortChar(spec: *const CommandSpec, c: u8) ?ShortTarget {
 }
 
 fn isOptionToken(spec: *const CommandSpec, arg: []const u8) bool {
-    if (spec.policy.negative_numbers == .never) {
+    if (spec.policy.negative_numbers == .never or spec.policy.negative_numbers == .any) {
         return arg.len >= 1 and arg[0] == '-';
     }
     if (arg.len < 2 or arg[0] != '-') return false;
@@ -706,6 +768,11 @@ fn isOptionToken(spec: *const CommandSpec, arg: []const u8) bool {
         if (matchShortChar(spec, arg[1]) != null) return true;
     }
     return optionLike(arg, spec.policy.negative_numbers);
+}
+
+fn canConsumeNextValue(spec: *const CommandSpec, next_arg: []const u8) bool {
+    if (spec.policy.negative_numbers == .any) return true;
+    return !isOptionToken(spec, next_arg);
 }
 
 const ClusterItem = struct {
@@ -742,6 +809,40 @@ fn nonRemainderPositionals(spec: *const CommandSpec) usize {
         n += 1;
     };
     return n;
+}
+
+fn findMutexConflict(spec: *const CommandSpec, opt_seen: []const bool, opt_idx: usize) ?usize {
+    const name = spec.options[opt_idx].name;
+    for (spec.mutually_exclusive) |group| {
+        var in_group = false;
+        for (group.options) |member| {
+            if (std.mem.eql(u8, member, name)) {
+                in_group = true;
+                break;
+            }
+        }
+        if (!in_group) continue;
+        for (group.options) |member| {
+            if (std.mem.eql(u8, member, name)) continue;
+            for (spec.options, 0..) |o, oi| {
+                if (std.mem.eql(u8, o.name, member) and opt_seen[oi]) return oi;
+            }
+        }
+    }
+    return null;
+}
+
+fn makeMutexError(
+    gpa: Allocator,
+    spec: *const CommandSpec,
+    opt_idx: usize,
+    conflict_idx: usize,
+) Allocator.Error!ParseOutcome {
+    const disp_opt = try formatOptionDisplay(gpa, spec.options[opt_idx]);
+    defer gpa.free(disp_opt);
+    const disp_conflict = try formatOptionDisplay(gpa, spec.options[conflict_idx]);
+    defer gpa.free(disp_conflict);
+    return try makeError(gpa, spec, "argument {s}: not allowed with argument {s}", .{ disp_opt, disp_conflict });
 }
 
 fn checkUnrecognized(
@@ -861,7 +962,25 @@ fn parseCommand(
 
     const is_remainder = hasRemainder(spec);
     const has_subs = spec.subcommands.len > 0;
+    const max_fixed_pos: ?usize = if (is_remainder or hasVariadicPositional(spec)) null else nonRemainderPositionals(spec);
     var sub_index: ?usize = null;
+
+    if (spec.policy.special_action == .prescan) {
+        for (argv) |a| {
+            if (spec.add_help and (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help"))) {
+                gpa.free(opt_seen);
+                gpa.free(opt_values);
+                own_state = false;
+                return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
+            }
+            if (spec.version != null and std.mem.eql(u8, a, "--version")) {
+                gpa.free(opt_seen);
+                gpa.free(opt_values);
+                own_state = false;
+                return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.version.? } };
+            }
+        }
+    }
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -880,6 +999,14 @@ fn parseCommand(
             try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true, .argv_index = i });
             for (argv[i + 1 ..], 0..) |p, pi| {
                 if (p.len == 0 and ignoresEmptyAt(spec, pos.items.len)) continue;
+                if (spec.policy.fail_fast and spec.policy.unknown != .ignore) {
+                    if (max_fixed_pos) |max_p| if (pos.items.len >= max_p) {
+                        gpa.free(opt_seen);
+                        gpa.free(opt_values);
+                        own_state = false;
+                        return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{p});
+                    };
+                }
                 if (try validatePositionalChoice(gpa, spec, pos.items.len, p)) |err_out| {
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
@@ -968,16 +1095,27 @@ fn parseCommand(
                             },
                             .option => |k| {
                                 const o = spec.options[k];
-                                opt_seen[k] = true;
-                                if (o.kind == .flag) continue;
+                                if (o.kind == .flag) {
+                                    if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                                        if (unknown_tail) |t| gpa.free(t);
+                                        gpa.free(opt_seen);
+                                        gpa.free(opt_values);
+                                        own_state = false;
+                                        return try makeMutexError(gpa, spec, k, conflict_idx);
+                                    }
+                                    opt_seen[k] = true;
+                                    continue;
+                                }
                                 var val: []const u8 = undefined;
+                                var supplied_val = true;
                                 if (it.explicit) |ev| {
                                     val = ev;
-                                } else if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
+                                } else if (i + 1 < argv.len and canConsumeNextValue(spec, argv[i + 1])) {
                                     i += 1;
                                     val = argv[i];
                                 } else if (o.kind == .optional_value) {
                                     val = "";
+                                    supplied_val = false;
                                 } else {
                                     if (unknown_tail) |t| gpa.free(t);
                                     const disp = try formatOptionDisplay(gpa, o);
@@ -987,6 +1125,15 @@ fn parseCommand(
                                     own_state = false;
                                     return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
                                 }
+                                if (supplied_val) {
+                                    if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
+                                        if (unknown_tail) |t| gpa.free(t);
+                                        gpa.free(opt_seen);
+                                        gpa.free(opt_values);
+                                        own_state = false;
+                                        return err_out;
+                                    }
+                                }
                                 if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
                                     if (unknown_tail) |t| gpa.free(t);
                                     gpa.free(opt_seen);
@@ -994,6 +1141,14 @@ fn parseCommand(
                                     own_state = false;
                                     return err_out;
                                 }
+                                if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                                    if (unknown_tail) |t| gpa.free(t);
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return try makeMutexError(gpa, spec, k, conflict_idx);
+                                }
+                                opt_seen[k] = true;
                                 if (o.kind == .append) {
                                     try opt_lists[k].append(gpa, val);
                                 } else {
@@ -1003,6 +1158,13 @@ fn parseCommand(
                         }
                     }
                     if (unknown_tail) |t| {
+                        if (spec.policy.fail_fast and spec.policy.unknown == .collect) {
+                            defer gpa.free(t);
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{t});
+                        }
                         try scratch.append(gpa, t);
                         try leftovers.append(gpa, .{ .token = t, .is_positional = false, .argv_index = i });
                     }
@@ -1022,12 +1184,21 @@ fn parseCommand(
                         },
                         .option => |k| {
                             const o = spec.options[k];
-                            opt_seen[k] = true;
-                            if (o.kind != .flag) {
+                            if (o.kind == .flag) {
+                                if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return try makeMutexError(gpa, spec, k, conflict_idx);
+                                }
+                                opt_seen[k] = true;
+                            } else {
                                 var val: []const u8 = "";
-                                if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
+                                var supplied_val = false;
+                                if (i + 1 < argv.len and canConsumeNextValue(spec, argv[i + 1])) {
                                     i += 1;
                                     val = argv[i];
+                                    supplied_val = true;
                                 } else if (o.kind != .optional_value) {
                                     const disp = try formatOptionDisplay(gpa, o);
                                     defer gpa.free(disp);
@@ -1036,12 +1207,27 @@ fn parseCommand(
                                     own_state = false;
                                     return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
                                 }
+                                if (supplied_val) {
+                                    if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
+                                        gpa.free(opt_seen);
+                                        gpa.free(opt_values);
+                                        own_state = false;
+                                        return err_out;
+                                    }
+                                }
                                 if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
                                     gpa.free(opt_seen);
                                     gpa.free(opt_values);
                                     own_state = false;
                                     return err_out;
                                 }
+                                if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                                    gpa.free(opt_seen);
+                                    gpa.free(opt_values);
+                                    own_state = false;
+                                    return try makeMutexError(gpa, spec, k, conflict_idx);
+                                }
+                                opt_seen[k] = true;
                                 if (o.kind == .append) {
                                     try opt_lists[k].append(gpa, val);
                                 } else {
@@ -1056,6 +1242,7 @@ fn parseCommand(
         }
 
         // 3. Long options ("--name", "--name=val", unique prefixes when allow_abbrev).
+        var force_unknown = false;
         if (std.mem.startsWith(u8, arg, "--") and (arg.len > 2)) {
             const eq = std.mem.findScalar(u8, arg, '=');
             const name = arg[2 .. eq orelse arg.len];
@@ -1070,95 +1257,133 @@ fn parseCommand(
                 },
                 .help => {
                     if (eq) |e| {
-                        if (spec.policy.unknown == .ignore) continue;
-                        const q = try reprToken(gpa, arg[e + 1 ..]);
-                        defer gpa.free(q);
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return try makeError(gpa, spec, "argument -h/--help: ignored explicit argument {s}", .{q});
-                    }
-                    if (spec.policy.special_action == .immediate_exit) {
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
-                    }
-                    help_requested = true;
-                    continue;
-                },
-                .version => {
-                    if (eq) |e| {
-                        if (spec.policy.unknown == .ignore) continue;
-                        const q = try reprToken(gpa, arg[e + 1 ..]);
-                        defer gpa.free(q);
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return try makeError(gpa, spec, "argument --version: ignored explicit argument {s}", .{q});
-                    }
-                    if (spec.policy.special_action == .immediate_exit) {
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.version.? } };
-                    }
-                    version_requested = true;
-                    continue;
-                },
-                .option => |k| {
-                    const o = spec.options[k];
-                    if (o.kind == .flag) {
-                        if (eq) |e| {
+                        if (spec.policy.flag_explicit_as_unknown) {
+                            force_unknown = true;
+                        } else {
                             if (spec.policy.unknown == .ignore) continue;
-                            const disp = try formatOptionDisplay(gpa, o);
-                            defer gpa.free(disp);
                             const q = try reprToken(gpa, arg[e + 1 ..]);
                             defer gpa.free(q);
                             gpa.free(opt_seen);
                             gpa.free(opt_values);
                             own_state = false;
-                            return try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                            return try makeError(gpa, spec, "argument -h/--help: ignored explicit argument {s}", .{q});
                         }
-                        opt_seen[k] = true;
+                    } else {
+                        if (spec.policy.special_action == .immediate_exit) {
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.help } };
+                        }
+                        help_requested = true;
                         continue;
                     }
-                    opt_seen[k] = true;
-                    var val: []const u8 = undefined;
+                },
+                .version => {
                     if (eq) |e| {
-                        val = arg[e + 1 ..];
-                    } else if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
-                        i += 1;
-                        val = argv[i];
-                    } else if (o.kind == .optional_value) {
-                        val = "";
+                        if (spec.policy.flag_explicit_as_unknown) {
+                            force_unknown = true;
+                        } else {
+                            if (spec.policy.unknown == .ignore) continue;
+                            const q = try reprToken(gpa, arg[e + 1 ..]);
+                            defer gpa.free(q);
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return try makeError(gpa, spec, "argument --version: ignored explicit argument {s}", .{q});
+                        }
                     } else {
-                        const disp = try formatOptionDisplay(gpa, o);
-                        defer gpa.free(disp);
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                        if (spec.policy.special_action == .immediate_exit) {
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return .{ .action_done = .{ .exit_code = 0, .stdout_text = spec.version.? } };
+                        }
+                        version_requested = true;
+                        continue;
                     }
-                    if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
-                        gpa.free(opt_seen);
-                        gpa.free(opt_values);
-                        own_state = false;
-                        return err_out;
-                    }
-                    if (o.kind == .append) {
-                        try opt_lists[k].append(gpa, val);
+                },
+                .option => |k| {
+                    const o = spec.options[k];
+                    if (o.kind == .flag) {
+                        if (eq) |e| {
+                            if (spec.policy.flag_explicit_as_unknown) {
+                                force_unknown = true;
+                            } else {
+                                if (spec.policy.unknown == .ignore) continue;
+                                const disp = try formatOptionDisplay(gpa, o);
+                                defer gpa.free(disp);
+                                const q = try reprToken(gpa, arg[e + 1 ..]);
+                                defer gpa.free(q);
+                                gpa.free(opt_seen);
+                                gpa.free(opt_values);
+                                own_state = false;
+                                return try makeError(gpa, spec, "argument {s}: ignored explicit argument {s}", .{ disp, q });
+                            }
+                        } else {
+                            if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                                gpa.free(opt_seen);
+                                gpa.free(opt_values);
+                                own_state = false;
+                                return try makeMutexError(gpa, spec, k, conflict_idx);
+                            }
+                            opt_seen[k] = true;
+                            continue;
+                        }
                     } else {
-                        opt_values[k] = val;
+                        var val: []const u8 = undefined;
+                        var supplied_val = true;
+                        if (eq) |e| {
+                            val = arg[e + 1 ..];
+                        } else if (i + 1 < argv.len and canConsumeNextValue(spec, argv[i + 1])) {
+                            i += 1;
+                            val = argv[i];
+                        } else if (o.kind == .optional_value) {
+                            val = "";
+                            supplied_val = false;
+                        } else {
+                            const disp = try formatOptionDisplay(gpa, o);
+                            defer gpa.free(disp);
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return try makeError(gpa, spec, "argument {s}: expected one argument", .{disp});
+                        }
+                        if (supplied_val) {
+                            if (try checkOptionValueAllowed(gpa, spec, o, val)) |err_out| {
+                                gpa.free(opt_seen);
+                                gpa.free(opt_values);
+                                own_state = false;
+                                return err_out;
+                            }
+                        }
+                        if (try validateOptionValue(gpa, spec, o, val)) |err_out| {
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return err_out;
+                        }
+                        if (findMutexConflict(spec, opt_seen, k)) |conflict_idx| {
+                            gpa.free(opt_seen);
+                            gpa.free(opt_values);
+                            own_state = false;
+                            return try makeMutexError(gpa, spec, k, conflict_idx);
+                        }
+                        opt_seen[k] = true;
+                        if (o.kind == .append) {
+                            try opt_lists[k].append(gpa, val);
+                        } else {
+                            opt_values[k] = val;
+                        }
+                        continue;
                     }
-                    continue;
                 },
                 .none => {},
             }
         }
 
         // 4. Non-option token: subcommand, remainder start, or positional.
-        if (!optionLike(arg, spec.policy.negative_numbers)) {
+        if (!force_unknown and !optionLike(arg, spec.policy.negative_numbers)) {
             if (has_subs) {
                 sub_index = i;
                 break;
@@ -1168,6 +1393,14 @@ fn parseCommand(
                 break;
             }
             if (arg.len == 0 and ignoresEmptyAt(spec, pos.items.len)) continue;
+            if (spec.policy.fail_fast and spec.policy.unknown != .ignore) {
+                if (max_fixed_pos) |max_p| if (pos.items.len >= max_p) {
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+                };
+            }
             if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
                 gpa.free(opt_seen);
                 gpa.free(opt_values);
@@ -1181,6 +1414,14 @@ fn parseCommand(
 
         // 5. Unrecognized option-like token.
         if (spec.policy.unknown == .positional) {
+            if (spec.policy.fail_fast) {
+                if (max_fixed_pos) |max_p| if (pos.items.len >= max_p) {
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+                };
+            }
             if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
                 gpa.free(opt_seen);
                 gpa.free(opt_values);
@@ -1191,6 +1432,12 @@ fn parseCommand(
             try leftovers.append(gpa, .{ .token = arg, .is_positional = true, .argv_index = i });
             continue;
         }
+        if (spec.policy.fail_fast and spec.policy.unknown == .collect) {
+            gpa.free(opt_seen);
+            gpa.free(opt_values);
+            own_state = false;
+            return try makeError(gpa, top_spec, "unrecognized arguments: {s}", .{arg});
+        }
         try leftovers.append(gpa, .{ .token = arg, .is_positional = false, .argv_index = i });
     }
 
@@ -1198,6 +1445,14 @@ fn parseCommand(
     if (has_subs) {
         const idx = sub_index orelse argv.len;
         if (idx >= argv.len) {
+            if (spec.policy.unknown_before_required and spec.policy.unknown != .ignore and leftovers.items.len > 0) {
+                if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, 0, true, false)) |err_out| {
+                    gpa.free(opt_seen);
+                    gpa.free(opt_values);
+                    own_state = false;
+                    return err_out;
+                }
+            }
             gpa.free(opt_seen);
             gpa.free(opt_values);
             own_state = false;
@@ -1257,6 +1512,21 @@ fn parseCommand(
         }
     }
 
+    // When unknown_before_required is enabled, report unknown options and excess
+    // positionals before missing required arguments.
+    if (spec.policy.unknown_before_required and spec.policy.unknown != .ignore) {
+        const variadic = hasVariadicPositional(spec);
+        const pos_slots = nonRemainderPositionals(spec);
+        const consumed_pos = if (variadic) pos.items.len else @min(pos.items.len, pos_slots);
+        const keep_sep = !variadic and pos_slots == 0 and !is_remainder;
+        if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep, variadic)) |err_out| {
+            gpa.free(opt_seen);
+            gpa.free(opt_values);
+            own_state = false;
+            return err_out;
+        }
+    }
+
     // Check required options and required positionals (in registration order).
     var missing_names: std.ArrayList([]u8) = .empty;
     defer {
@@ -1290,8 +1560,9 @@ fn parseCommand(
         return try makeError(gpa, spec, "the following arguments are required: {s}", .{joined.items});
     }
 
-    // Check merged unrecognized arguments unless unknown tokens are ignored.
-    if (spec.policy.unknown != .ignore) {
+    // Check merged unrecognized arguments unless unknown tokens are ignored
+    // (or already checked above).
+    if (!spec.policy.unknown_before_required and spec.policy.unknown != .ignore) {
         const variadic = hasVariadicPositional(spec);
         const pos_slots = nonRemainderPositionals(spec);
         const consumed_pos = if (variadic) pos.items.len else @min(pos.items.len, pos_slots);

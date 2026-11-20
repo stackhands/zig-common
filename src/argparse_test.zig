@@ -636,3 +636,188 @@ test "argparse: PositionalSpec.ignore_empty skips empty tokens only while slot i
         try std.testing.expectEqualStrings("unrecognized arguments: ", out.usage_error.message);
     }
 }
+
+test "Policy.native_exact, NegativeNumberMode.any, and allow_empty/allow_dash_value" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expect(argparse.optionLike("-", .any));
+    try std.testing.expect(argparse.optionLike("-5", .any));
+    try std.testing.expect(!argparse.optionLike("5", .any));
+
+    const rotate_spec: argparse.CommandSpec = .{
+        .prog = "tool rotate",
+        .usage = "usage: tool rotate\n",
+        .help = "usage: tool rotate\n",
+        .add_help = false,
+        .policy = .native_exact,
+        .options = &.{
+            .{ .name = "dry-run", .kind = .flag },
+            .{ .name = "compress-after", .kind = .value },
+            .{ .name = "target", .kind = .value, .allow_empty = false },
+            .{ .name = "module", .kind = .value, .allow_empty = false, .allow_dash_value = false },
+        },
+        .positionals = &.{.{ .name = "ROOT", .arity = .required_one }},
+    };
+
+    // NegativeNumberMode.any consumes any next token for value options (even -5 or --foo)
+    // and allow_empty=true allows empty --compress-after=.
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--compress-after", "-5", "--target", "-x", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("-5", out.ok.value("compress-after").?);
+        try std.testing.expectEqualStrings("-x", out.ok.value("target").?);
+        try std.testing.expectEqualStrings("logs", out.ok.positional(0).?);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--compress-after=", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("", out.ok.value("compress-after").?);
+    }
+
+    // allow_empty=false rejects --target= and --target "" as missing value.
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--target=", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --target: expected one argument", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--target", "", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --target: expected one argument", out.usage_error.message);
+    }
+
+    // allow_dash_value=false rejects both --module -x and --module=-x as missing value.
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--module", "-x", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --module: expected one argument", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--module=-x", "logs" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --module: expected one argument", out.usage_error.message);
+    }
+
+    // flag_explicit_as_unknown treats --dry-run=1 (even with spaces) as unknown option,
+    // and fail_fast / unknown_before_required report it before later errors or missing ROOT.
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{"--dry-run=1"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --dry-run=1", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{"--dry-run=a b"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --dry-run=a b", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "--bogus", "--target" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --bogus", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{ "logs", "extra", "--target" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: extra", out.usage_error.message);
+    }
+    // Missing required ROOT is reported when no unknown tokens are present.
+    {
+        var out = try argparse.parse(gpa, &rotate_spec, &.{"--dry-run"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("the following arguments are required: ROOT", out.usage_error.message);
+    }
+    // With fail_fast and immediate_exit, --bogus fails before --help; with prescan, --help wins.
+    const help_native: argparse.CommandSpec = .{
+        .prog = "tool why",
+        .usage = "usage: tool why\n",
+        .help = "why help\n",
+        .version = "1.0\n",
+        .policy = .native_exact,
+        .positionals = &.{.{ .name = "RUN", .arity = .required_one }},
+    };
+    {
+        var out = try argparse.parse(gpa, &help_native, &.{ "--bogus", "--help" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --bogus", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &help_native, &.{"--help=1"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --help=1", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &help_native, &.{"--version=1"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --version=1", out.usage_error.message);
+    }
+}
+
+test "argparse: SpecialActionMode.prescan handles help and version before option errors" {
+    const gpa = std.testing.allocator;
+    var prescan_pol = argparse.Policy.native_exact;
+    prescan_pol.special_action = .prescan;
+    const spec: argparse.CommandSpec = .{
+        .prog = "tool why",
+        .usage = "usage: tool why\n",
+        .help = "why help\n",
+        .version = "1.2.3\n",
+        .policy = prescan_pol,
+        .options = &.{.{ .name = "target", .kind = .value }},
+        .positionals = &.{.{ .name = "RUN", .arity = .required_one }},
+    };
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--bogus", "-h" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("why help\n", out.action_done.stdout_text);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--target", "--help" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("why help\n", out.action_done.stdout_text);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--bogus", "--version" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("1.2.3\n", out.action_done.stdout_text);
+    }
+}
+
+test "argparse: mutually_exclusive rejects conflicting options in scan order" {
+    const gpa = std.testing.allocator;
+    const spec: argparse.CommandSpec = .{
+        .prog = "tool usage",
+        .usage = "usage: tool usage\n",
+        .help = "usage help\n",
+        .add_help = false,
+        .policy = .native_exact,
+        .options = &.{
+            .{ .name = "unused", .kind = .flag },
+            .{ .name = "active", .kind = .flag },
+            .{ .name = "json", .kind = .flag },
+        },
+        .mutually_exclusive = &.{.{ .options = &.{ "unused", "active" } }},
+        .positionals = &.{.{ .name = "FILE", .arity = .one_or_more }},
+    };
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--unused", "--active", "--bogus" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --active: not allowed with argument --unused", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--active", "--unused", "a.log" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --unused: not allowed with argument --active", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--bogus", "--unused", "--active" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --bogus", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "--unused", "--json", "a.log" });
+        defer out.deinit(gpa);
+        try std.testing.expect(out.ok.seen("unused"));
+        try std.testing.expect(!out.ok.seen("active"));
+        try std.testing.expect(out.ok.seen("json"));
+    }
+}
