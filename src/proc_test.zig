@@ -466,3 +466,32 @@ test "stdin to a child that does not read it fails with EPIPE, not SIGPIPE" {
     _ = linux.sigaction(.PIPE, null, &after);
     try testing.expect(after.handler.handler == linux.SIG.DFL);
 }
+
+test "run with all standard streams closed moves shared devnull and pipes above 2" {
+    const pid: isize = @bitCast(linux.fork());
+    if (pid == 0) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        sys.close(0);
+        sys.close(1);
+        sys.close(2);
+        const low = sys.keepAboveStdio(sys.openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(10)) catch linux.exit_group(11);
+        defer sys.close(low);
+        if (low < 3) linux.exit_group(12);
+        // With 0, 1 and 2 closed and stderr uncaptured, stdin and stderr share
+        // devnull at slot 0 while stdout's pipe occupies slots 1 and 2.
+        const res = proc.run(a, "/bin/sh", &.{ "sh", "-c", "printf ok && printf drop >&2" }, no_env, .{}) catch linux.exit_group(13);
+        if (res.term.code() != 0 or !std.mem.eql(u8, res.stdout, "ok")) linux.exit_group(14);
+        if (proc.run(a, "/no/such/zig-common-program", &.{"missing"}, no_env, .{ .exec_error = true })) |_| {
+            linux.exit_group(15);
+        } else |err| {
+            if (err != error.NotFound) linux.exit_group(16);
+        }
+        linux.exit_group(0);
+    }
+    try testing.expect(pid > 0);
+    var status: i32 = 0;
+    _ = try sys.call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
+    try testing.expectEqual(@as(i32, 0), status);
+}

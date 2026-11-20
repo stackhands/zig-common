@@ -353,6 +353,17 @@ pub fn close(fd: fd_t) void {
     _ = linux.close(fd);
 }
 
+/// Move an open descriptor out of the standard-stream slots 0, 1 and 2.
+/// A descriptor already at 3 or above is returned unchanged; one in 0..2
+/// is duplicated to 3 or above with `FD_CLOEXEC` set and closed at its
+/// original slot. On error the original descriptor is left open.
+pub fn keepAboveStdio(fd: fd_t) Error!fd_t {
+    if (fd >= 3) return fd;
+    const moved = try call(linux.fcntl, .{ fd, linux.F.DUPFD_CLOEXEC, @as(usize, 3) });
+    close(fd);
+    return @intCast(moved);
+}
+
 /// read(2) into `buf`: the number of bytes read, 0 at the end of the file.
 pub fn read(fd: fd_t, buf: []u8) Error!usize {
     return call(linux.read, .{ fd, buf.ptr, buf.len });
@@ -485,4 +496,43 @@ test "errnoText names success, returns null for unknown errnos and sys wrappers 
         defer close(full_fd);
         try std.testing.expectError(error.NoSpace, writeAll(full_fd, "x"));
     } else |_| {}
+}
+
+test "keepAboveStdio moves descriptors 0, 1 and 2 above 2 with close-on-exec" {
+    const high_fd = try openat(linux.AT.FDCWD, "/dev/null", .{}, 0);
+    defer close(high_fd);
+    try std.testing.expect(high_fd >= 3);
+    try std.testing.expectEqual(high_fd, try keepAboveStdio(high_fd));
+    try std.testing.expectError(error.InvalidArgument, keepAboveStdio(-1));
+    try std.testing.expectEqual(linux.E.BADF, last_errno);
+
+    const pid: isize = @bitCast(linux.fork());
+    if (pid == 0) {
+        close(0);
+        close(1);
+        close(2);
+        const a = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(10);
+        const b = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(11);
+        const c = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(12);
+        if (a != 0 or b != 1 or c != 2) linux.exit_group(13);
+
+        for ([_]fd_t{ a, b, c }) |low| {
+            const moved = keepAboveStdio(low) catch linux.exit_group(14);
+            if (moved < 3) linux.exit_group(15);
+            const flags = linux.fcntl(moved, linux.F.GETFD, 0);
+            if (linux.errno(flags) != .SUCCESS or (flags & linux.FD_CLOEXEC) == 0) linux.exit_group(16);
+            if (linux.errno(linux.fcntl(low, linux.F.GETFD, 0)) != .BADF) linux.exit_group(17);
+            defer close(moved);
+        }
+
+        _ = keepAboveStdio(0) catch |err| {
+            if (err != error.InvalidArgument or last_errno != .BADF) linux.exit_group(18);
+            linux.exit_group(0);
+        };
+        linux.exit_group(19);
+    }
+    try std.testing.expect(pid > 0);
+    var status: i32 = 0;
+    _ = try call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
+    try std.testing.expectEqual(@as(i32, 0), status);
 }
