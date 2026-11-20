@@ -16,6 +16,7 @@ is missing. ZIG_COMMON_PARITY_PROBE names another binary.
 """
 import errno
 import fcntl
+import gzip
 import os
 import shutil
 import stat
@@ -301,6 +302,45 @@ def py_append_line(root, name, line):
         return "ERR:" + BY_ERRNO.get(exc.errno, "Errno%d" % exc.errno)
 
 
+def make_which_fixture(root):
+    """The PATH fixture the `which` probe mode needs, relative names."""
+    root_b = root.encode()
+    os.mkdir(os.path.join(root_b, b"binA"), 0o755)
+    os.mkdir(os.path.join(root_b, b"binB"), 0o755)
+    os.mkdir(os.path.join(root_b, b"empty"), 0o755)
+    os.mkdir(os.path.join(root_b, b"sub"), 0o755)
+    fd = os.open(os.path.join(root_b, b"binA", b"good.sh"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+    os.write(fd, b"#!/bin/sh\n")
+    os.close(fd)
+    fd = os.open(os.path.join(root_b, b"binA", b"plain.txt"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, b"x")
+    os.close(fd)
+    os.symlink(b"good.sh", os.path.join(root_b, b"binA", b"sym-good.sh"))
+    os.symlink(b"nowhere", os.path.join(root_b, b"binA", b"dangling.sh"))
+    os.mkdir(os.path.join(root_b, b"binA", b"dir.sh"))
+    os.symlink(b"/bin/true", os.path.join(root_b, b"binA", b"abs.sh"))
+    fd = os.open(os.path.join(root_b, b"binB", b"good.sh"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    os.write(fd, b"#!/bin/sh\n")
+    os.close(fd)
+    fd = os.open(os.path.join(root_b, b"sub", b"rel.sh"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+    os.write(fd, b"#!/bin/sh\n")
+    os.close(fd)
+
+
+def make_gzip_fixture(root):
+    root_b = root.encode()
+    fd = os.open(os.path.join(root_b, b"run.1234.log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    try:
+        os.write(fd, b"log line one\nlog line two\n")
+    finally:
+        os.close(fd)
+    os.chmod(os.path.join(root_b, b"run.1234.log"), 0o640)
+    os.utime(
+        os.path.join(root_b, b"run.1234.log"),
+        ns=(1600000000 * 10 ** 9 + 123456789,) * 2,
+    )
+
+
 class FsLockParity(unittest.TestCase):
     # ---- path normalization ----
 
@@ -424,6 +464,113 @@ class FsLockParity(unittest.TestCase):
 
         # the two trees must agree, mode bits under the umask included
         self.assert_trees_equal(probe_root, python_root)
+
+    def test_which_shutil(self):
+        with tempfile.TemporaryDirectory() as probe_root, tempfile.TemporaryDirectory() as python_root:
+            make_which_fixture(probe_root)
+            make_which_fixture(python_root)
+            out = run_probe("which", cwd=probe_root)
+            old = os.getcwd()
+            os.chdir(python_root)
+            try:
+                checked = 0
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if parts[0] == "whichshutil":
+                        path = os.fsdecode(bytes.fromhex(parts[1]))
+                        name = os.fsdecode(bytes.fromhex(parts[2]))
+                        want = shutil.which(name, path=path if path else None)
+                        # shutil.which treats an empty PATH as None, using
+                        # os.defpath; the probe passes the empty string.
+                        if path == "":
+                            want = shutil.which(name)
+                        got = None if parts[3] == "NULL" else bytes.fromhex(parts[3])
+                        want_b = None if want is None else os.fsencode(want)
+                        if (want_b is None) != (got is None):
+                            self.fail(
+                                "which %r in %r: python %r zig %r" % (name, path, want_b, got)
+                            )
+                        if want_b is not None:
+                            self.assertEqual(
+                                os.path.relpath(got.decode("utf-8", "surrogateescape")),
+                                os.path.relpath(want),
+                                "which %r in %r" % (name, path),
+                            )
+                        checked += 1
+                    elif parts[0] == "whichshutil-unset":
+                        name = os.fsdecode(bytes.fromhex(parts[1]))
+                        want = shutil.which(name, path=os.defpath)
+                        got = None if parts[2] == "NULL" else bytes.fromhex(parts[2])
+                        if want is None:
+                            self.assertIsNone(got, "which %r unset" % name)
+                        else:
+                            self.assertIsNotNone(got, "which %r unset" % name)
+                            self.assertEqual(
+                                os.fsencode(want), got, "which %r unset" % name
+                            )
+                        checked += 1
+                self.assertGreaterEqual(checked, 60, "too few which cases")
+            finally:
+                os.chdir(old)
+
+    def test_diag_repr_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = run_probe("diag", cwd=tmp)
+            checked = 0
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if parts[0] == "repr":
+                    data = bytes.fromhex(parts[1])
+                    got = bytes.fromhex(parts[2])
+                    want = repr(os.fsdecode(data)).encode("utf-8", "surrogateescape")
+                    self.assertEqual(want, got, "repr of %r" % data)
+                    checked += 1
+                elif parts[0] == "oserror":
+                    e = int(parts[1])
+                    path = bytes.fromhex(parts[2])
+                    got = bytes.fromhex(parts[3])
+                    want = ("[Errno %d] %s: %r" % (e, os.strerror(e), os.fsdecode(path))).encode(
+                        "utf-8", "surrogateescape"
+                    )
+                    self.assertEqual(want, got, "oserror %d of %r" % (e, path))
+                    checked += 1
+            self.assertGreaterEqual(checked, 60, "too few diag cases")
+
+    def test_gzip_matches_gzip(self):
+        if shutil.which("gzip") is None:
+            self.skipTest("gzip is not installed")
+        with tempfile.TemporaryDirectory() as probe_root, tempfile.TemporaryDirectory() as python_root:
+            make_gzip_fixture(probe_root)
+            make_gzip_fixture(python_root)
+            out = run_probe("gzip", cwd=probe_root)
+            self.assertIn("gzip\tOK", out)
+            subprocess.run(
+                ["gzip", "-9", "-f", "run.1234.log"],
+                cwd=python_root,
+                check=True,
+            )
+            probe_gz = os.path.join(probe_root, "run.1234.log.gz")
+            python_gz = os.path.join(python_root, "run.1234.log.gz")
+            for name in ("run.1234.log",):
+                self.assertFalse(os.path.exists(os.path.join(probe_root, name)))
+                self.assertFalse(os.path.exists(os.path.join(python_root, name)))
+            st_probe = os.stat(probe_gz)
+            st_python = os.stat(python_gz)
+            self.assertEqual(stat.S_IMODE(st_probe.st_mode), stat.S_IMODE(st_python.st_mode))
+            self.assertEqual(st_probe.st_mtime_ns, st_python.st_mtime_ns)
+            self.assertEqual(
+                st_probe.st_mtime_ns,
+                (1600000000 * 10 ** 9 + 123456789),
+                "the mtime the fixture set was kept",
+            )
+            with open(probe_gz, "rb") as fa:
+                probe_bytes = fa.read()
+            with open(python_gz, "rb") as fb:
+                python_bytes = fb.read()
+            # same gzip header: magic, method, flags, mtime, extra flag, os
+            self.assertEqual(probe_bytes[:10], python_bytes[:10])
+            # same stored name, and the same bytes once decompressed
+            self.assertEqual(gzip.decompress(probe_bytes), gzip.decompress(python_bytes))
 
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)

@@ -24,6 +24,9 @@ const common = @import("zig_common");
 const fsx = common.fsx;
 const state = common.state;
 const sys = common.sys;
+const proc = common.proc;
+const pytext = common.pytext;
+const logs = common.logs;
 
 var arena_state: std.heap.ArenaAllocator = undefined;
 var A: std.mem.Allocator = undefined;
@@ -191,6 +194,67 @@ fn atomicMode() void {
     }
 }
 
+/// `which` mode: whichShutil over a PATH fixture the test built around
+/// the probe's working directory, plus the unset-PATH cases.
+fn whichMode() void {
+    const names = [_][]const u8{ "good.sh", "plain.txt", "sym-good.sh", "dangling.sh", "dir.sh", "abs.sh", "missing.sh", "sub/rel.sh" };
+    const paths = [_][]const u8{ "binA", "binA:binB", "binB:binA", "", ":", "binA:", ":binA", "binA:./sub" };
+    for (paths) |p| {
+        for (names) |n| {
+            if (proc.whichShutil(A, n, p) catch unreachable) |got| {
+                emit(&.{ "whichshutil", hexOf(p), hexOf(n), hexOf(got) });
+            } else {
+                emit(&.{ "whichshutil", hexOf(p), hexOf(n), "NULL" });
+            }
+        }
+    }
+    const unset_names = [_][]const u8{ "sh", "missing.sh" };
+    for (unset_names) |n| {
+        if (proc.whichShutil(A, n, null) catch unreachable) |got| {
+            emit(&.{ "whichshutil-unset", hexOf(n), hexOf(got) });
+        } else {
+            emit(&.{ "whichshutil-unset", hexOf(n), "NULL" });
+        }
+    }
+}
+
+/// `diag` mode: reprStr strings and osErrorErrno messages, the error
+/// text every tool prints where Python printed str(OSError).
+fn diagMode() void {
+    const texts = [_][]const u8{
+        "plain",              "it's",    "a'b\"c",      "a\\b",       "space path",
+        "\t\n\r\x01\x1f\x7f", "caf\xe9", "caf\xc3\xa9", "\xff\xfe",   "a\xffb",
+        "\xc2\xa0\xc2\xad",   "",        ".",           "..",         "x/y",
+        "EESSI/2026.06",      "$HOME",   "`tick`",      "semi;colon",
+    };
+    for (texts) |t| {
+        const r = pytext.reprStrAlloc(A, t) catch unreachable;
+        emit(&.{ "repr", hexOf(t), hexOf(r) });
+    }
+    const errnos = [_]u32{ 2, 13, 1, 20, 17, 36, 28, 18, 22, 5 };
+    const paths = [_][]const u8{ "/no/such", "a\xffb", "it's", "dir\x01ctl", "caf\xe9" };
+    for (errnos) |e| {
+        for (paths) |p| {
+            const msg = pytext.osErrorErrno(A, @fromBackingInt(@intCast(e)), p) catch unreachable;
+            emit(&.{ "oserror", std.fmt.allocPrint(A, "{d}", .{e}) catch unreachable, hexOf(p), hexOf(msg) });
+        }
+    }
+}
+
+/// `gzip` mode: gzipInPlace over the fixture file in the working
+/// directory; the test compresses the same fixture with gzip itself and
+/// compares the effects.
+fn gzipMode() void {
+    const dir = fsx.openDir(fsx.cwd, ".", false) catch unreachable;
+    defer sys.close(dir);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (logs.gzipInPlace(A, io, dir, "run.1234.log")) |_| {
+        emit(&.{ "gzip", "OK" });
+    } else |e| {
+        emit(&.{ "gzip", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable });
+    }
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -259,6 +323,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         effectsMode();
     } else if (std.mem.eql(u8, mode, "atomic")) {
         atomicMode();
+    } else if (std.mem.eql(u8, mode, "which")) {
+        whichMode();
+    } else if (std.mem.eql(u8, mode, "diag")) {
+        diagMode();
+    } else if (std.mem.eql(u8, mode, "gzip")) {
+        gzipMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {
