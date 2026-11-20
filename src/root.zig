@@ -9,6 +9,8 @@ pub const proc = @import("proc.zig");
 pub const logs = @import("logs.zig");
 /// Messages, the exit code for usage errors, and the version line.
 pub const cli = @import("cli.zig");
+/// Declarative Python 3.14 argparse-compatible argument parser.
+pub const argparse = @import("argparse.zig");
 /// The environment as the C library sees it.
 pub const env = @import("env.zig");
 /// Private state files in a directory other users may write.
@@ -27,4 +29,5 @@ test {
     _ = @import("atomic_test.zig");
     _ = @import("state_test.zig");
     _ = @import("proc_test.zig");
+    _ = @import("argparse_test.zig");
 }
