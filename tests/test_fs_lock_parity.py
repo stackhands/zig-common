@@ -846,6 +846,51 @@ class FsLockParity(unittest.TestCase):
                         os.chmod(ro, 0o755)
                     shutil.rmtree(p, ignore_errors=True)
 
+    def test_gunzip_matches_python_gzip(self):
+        """logs.gunzip over a run-time corpus against Python's gzip
+        module, whose errors and outputs the reference recomputes from
+        the same bytes; GNU gzip checked the same corpus by hand when
+        the mode was written."""
+        out = run_probe("gunzip")
+        checked = ok_cases = 0
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if parts[0] != "gunzip":
+                continue
+            name = bytes.fromhex(parts[1]).decode()
+            limit = int(parts[2])
+            blob = bytes.fromhex(parts[3])
+            try:
+                want = gzip.decompress(blob)
+            except (gzip.BadGzipFile, EOFError, OSError):
+                want = None
+            if want is None:
+                self.assertTrue(
+                    parts[4].startswith("ERR:"),
+                    "gunzip %s: python refuses, the probe says %s" % (name, parts[4]),
+                )
+                self.assertNotEqual(
+                    parts[4],
+                    "ERR:StreamTooLong",
+                    "gunzip %s: the limit cannot be the refusal when python refuses too"
+                    % name,
+                )
+            elif len(want) >= limit:
+                self.assertEqual(
+                    parts[4],
+                    "ERR:StreamTooLong",
+                    "gunzip %s: the limit should refuse" % name,
+                )
+            else:
+                self.assertEqual(parts[4], "OK", "gunzip %s" % name)
+                self.assertEqual(
+                    bytes.fromhex(parts[5]), want, "gunzip %s bytes" % name
+                )
+                ok_cases += 1
+            checked += 1
+        self.assertGreaterEqual(checked, 16, "too few gunzip cases")
+        self.assertGreaterEqual(ok_cases, 8, "too few accepted gunzip cases")
+
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
         names_a = sorted(os.listdir(root_a))
