@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const pytext = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -122,6 +123,26 @@ pub fn describe(err: Error) []const u8 {
         error.OutOfMemory => "[Errno 12] Cannot allocate memory",
         else => |e| sys.describe(@errorCast(e)),
     };
+}
+
+/// Python's text for an OSError from a step of `atomicWrite`. `path` is the
+/// filename and `path2` the second filename of a rename. A null path is a
+/// call that carries none, such as write or fsync of an open descriptor.
+/// The error itself is unchanged; `why.msg` holds the text.
+fn failOs(a: Allocator, why: *Why, err: sys.Error, path: ?[]const u8, path2: ?[]const u8) Error {
+    const text = sys.describe(err);
+    if (path2) |second| {
+        const q1 = pytext.reprStrAlloc(a, path orelse "") catch return error.OutOfMemory;
+        defer a.free(q1);
+        const q2 = pytext.reprStrAlloc(a, second) catch return error.OutOfMemory;
+        defer a.free(q2);
+        why.msg = a.print("{s}: {s} -> {s}", .{ text, q1, q2 }) catch unallocated_refusal;
+    } else if (path) |one| {
+        const q1 = pytext.reprStrAlloc(a, one) catch return error.OutOfMemory;
+        defer a.free(q1);
+        why.msg = a.print("{s}: {s}", .{ text, q1 }) catch unallocated_refusal;
+    } else why.msg = a.print("{s}", .{text}) catch unallocated_refusal;
+    return err;
 }
 
 /// Why a replacement was refused; filled in when an error is returned. The
@@ -505,7 +526,7 @@ pub const WriteOptions = struct {
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
-    try makedirs(parent);
+    makedirs(parent) catch |err| return failOs(a, why, err, parent, null);
     if (fsx.statAt(fsx.cwd, path, false)) |st| {
         if (st.isLink()) return refuse(a, why, "refusing to replace a symlink: {s}", .{path});
     } else |_| {}
@@ -527,7 +548,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         const owner_ok = stale.uid == euid or (metadata != null and stale.uid == metadata.?.info.uid);
         if (!stale.isReg() or !owner_ok or stale.nlink != 1)
             return refuse(a, why, "temporary file must be an owned regular file with one link: {s}", .{tmp});
-        try sys.unlinkat(fsx.cwd, tmp, 0);
+        sys.unlinkat(fsx.cwd, tmp, 0) catch |err| return failOs(a, why, err, tmp, null);
     } else |_| {}
 
     {
@@ -535,18 +556,21 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    const fd = try openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    const fd = openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600) catch |err|
+        return failOs(a, why, err, tmp, null);
     const created = fsx.fstat(fd) catch |err| {
+        // os.fstat names no path. Record that before the cleanup calls.
+        const failed = failOs(a, why, err, null, null);
         sys.close(fd);
         // Created above with O_EXCL, so it is this call's file.
         sys.unlinkat(fsx.cwd, tmp, 0) catch {};
-        return err;
+        return failed;
     };
     ops.created(fd);
     errdefer discard(tmp, created);
     {
         defer sys.close(fd);
-        try writeTemp(fd, data);
+        writeTemp(fd, data) catch |err| return failOs(a, why, err, null, null);
         var inner: Why = .{};
         defer inner.deinit(a);
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
@@ -555,7 +579,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
             defer a.free(step);
             if (opts.faults.fails(step)) return injected(a, why, step);
         }
-        _ = try op(ops.fsync, .{fd});
+        _ = op(ops.fsync, .{fd}) catch |err| return failOs(a, why, err, null, null);
     }
     if (metadata) |m| {
         var inner: Why = .{};
@@ -569,8 +593,11 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    try renameTemp(tmp, path);
-    try fsyncDir(parent);
+    renameTemp(tmp, path) catch |err| return failOs(a, why, err, tmp, path);
+    // Opening the directory names it. Flushing the descriptor names no file.
+    const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
+    defer sys.close(directory);
+    sys.fsync(directory) catch |err| return failOs(a, why, err, null, null);
 }
 
 /// atomic_write pinned to an open directory: replace `dir/name` with
@@ -682,6 +709,36 @@ test "a step a test makes fail leaves the destination and no temporary file" {
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
         try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try a.print("{s}/.f.new", .{dir}), false));
     }
+}
+
+test "opening a file in an unwritable directory names the temporary file" {
+    if (linux.geteuid() == 0) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try a.print("{s}/.zig-cache/atomic-ro-{d}", .{ cwd, linux.getpid() });
+    try makedirs(dir);
+    const directory = try sys.openat(fsx.cwd, dir, .{ .DIRECTORY = true }, 0);
+    _ = linux.fchmod(directory, 0o555);
+    sys.close(directory);
+    defer {
+        const again = sys.openat(fsx.cwd, dir, .{ .DIRECTORY = true }, 0) catch unreachable;
+        _ = linux.fchmod(again, 0o755);
+        sys.close(again);
+        fsx.deleteTree(a, fsx.cwd, dir) catch {};
+    }
+    const path = try a.print("{s}/metrics.prom", .{dir});
+    var why: Why = .{};
+    defer why.deinit(a);
+    try std.testing.expectError(error.AccessDenied, atomicWrite(a, path, "x\n", .{}, &why));
+    const tmp = try a.print("{s}/.metrics.prom.new", .{dir});
+    const quoted = try pytext.reprStrAlloc(a, tmp);
+    defer a.free(quoted);
+    const want = try a.print("[Errno 13] Permission denied: {s}", .{quoted});
+    try std.testing.expectEqualStrings(want, why.msg);
+    try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, tmp, false));
 }
 
 test "atomicWrite frees what it allocates" {
