@@ -52,6 +52,20 @@ fn noted(err: Error, path: ?[]const u8) Error {
     return err;
 }
 
+fn notedUnder(err: Error, root: []const u8, name: []const u8) Error {
+    noteText(sys.describe(err), null);
+    var n: usize = 0;
+    const root_part = if (std.mem.eql(u8, root, "/")) "" else root;
+    const parts = [_][]const u8{ root_part, "/", name };
+    for (parts) |part| {
+        const take = @min(part.len, os_path.len - n);
+        @memcpy(os_path[n..][0..take], part[0..take]);
+        n += take;
+    }
+    os_path_len = n;
+    return err;
+}
+
 fn noteErrno(e: linux.E, path: ?[]const u8) void {
     noteText(sys.describeErrno(e), path);
 }
@@ -501,18 +515,18 @@ pub const RootLock = struct {
         // passes this and is refused below only when the root itself is
         // a link, as the root is opened without following it.
         clearOsFailure();
-        try preflightRoot(root);
+        preflightRoot(root) catch |err| return noted(err, root);
         atomic.makedirs(root) catch |err| return noted(err, root);
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
         const dir = fsx.openDir(fsx.cwd, root, false) catch |err| return noted(err, root);
         defer sys.close(dir);
-        const gate = (try openLockFile(dir, gate_name, realOpenLock)) orelse return error.GateNotPrivate;
+        const gate = (try openLockFile(dir, root, gate_name, realOpenLock)) orelse return error.GateNotPrivate;
         errdefer sys.close(gate);
         try takeFlock(gate, deadline);
-        const posix = (try openLockFile(dir, sidecar_name, lock_ops.open_sidecar)) orelse return error.NotPrivate;
+        const posix = (try openLockFile(dir, root, sidecar_name, lock_ops.open_sidecar)) orelse return error.NotPrivate;
         errdefer sys.close(posix);
         try takeRecord(posix, deadline);
-        if (!try isSoleLink(dir, gate_name, gate)) return error.GateNotPrivate;
+        if (!try isSoleLink(dir, root, gate_name, gate)) return error.GateNotPrivate;
         _ = lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) }) catch |err| return noted(err, null);
         var buf: [24]u8 = undefined;
         const line = std.mem.print(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
@@ -525,19 +539,19 @@ pub const RootLock = struct {
     /// absent or a regular file of this user with one link before the open,
     /// so a FIFO, device or symbolic link there is never opened, and the
     /// descriptor is that file after it.
-    fn openLockFile(dir: fsx.fd_t, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
+    fn openLockFile(dir: fsx.fd_t, root: []const u8, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
         if (fsx.statAt(dir, name, false)) |st| {
             if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return null;
         } else |err| switch (err) {
             error.NotFound => {},
-            else => |e| return noted(e, name),
+            else => |e| return notedUnder(e, root, name),
         }
         const fd: fsx.fd_t = @intCast(lockCall(open, .{ dir, name.ptr }) catch |err| switch (err) {
             error.SymLink, error.IsDir => return null,
-            else => |e| return noted(e, name),
+            else => |e| return notedUnder(e, root, name),
         });
         errdefer sys.close(fd);
-        if (try isSoleLink(dir, name, fd)) {
+        if (try isSoleLink(dir, root, name, fd)) {
             sys.fchmod(fd, 0o600) catch |err| return noted(err, null);
             return fd;
         }
@@ -549,12 +563,12 @@ pub const RootLock = struct {
     /// `dir/name`. The name is looked up as well as the descriptor: a
     /// planted hard link unlinked while the lock is awaited leaves the
     /// descriptor on the other name's file, with one link.
-    fn isSoleLink(dir: fsx.fd_t, name: []const u8, fd: fsx.fd_t) Error!bool {
+    fn isSoleLink(dir: fsx.fd_t, root: []const u8, name: []const u8, fd: fsx.fd_t) Error!bool {
         const st = fsx.fstat(fd) catch |err| return noted(err, null);
         if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return false;
         const at = fsx.statAt(dir, name, false) catch |err| switch (err) {
             error.NotFound => return false,
-            else => |e| return noted(e, name),
+            else => |e| return notedUnder(e, root, name),
         };
         return at.dev == st.dev and at.ino == st.ino and at.nlink == 1;
     }
@@ -676,6 +690,16 @@ test "the state root preflight matches lexists and isdir" {
     try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-loop", &nb)));
 }
 
+test "lock filenames are joined to every state-root spelling without allocation" {
+    try std.testing.expectEqual(error.Unexpected, notedUnder(error.Unexpected, "/", ".lock.posix"));
+    var failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings("/.lock.posix", failure.path);
+
+    try std.testing.expectEqual(error.Unexpected, notedUnder(error.Unexpected, ".lock", ".lock"));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(".lock/.lock", failure.path);
+}
+
 test "RootLock refuses a non-directory state root with NotDir" {
     const gpa = std.testing.allocator;
     var pb: [sys.path_max]u8 = undefined;
@@ -692,13 +716,27 @@ test "RootLock refuses a non-directory state root with NotDir" {
     const fd = try sys.openat(fsx.cwd, file_root, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     sys.close(fd);
     try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, file_root, 0));
-    try std.testing.expectEqualStrings("[Errno 20] Not a directory", sys.describe(error.NotDir));
+    var failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(file_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
 
     // a dangling symbolic link as the root
     const dangling_root = try std.fmt.allocPrint(gpa, "{s}/dangling-root", .{base});
     defer gpa.free(dangling_root);
     _ = linux.symlinkat("nowhere", fsx.cwd, (try sys.z(&zb, dangling_root)).ptr);
     try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, dangling_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(dangling_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+
+    // a symbolic-link loop as the root
+    const loop_root = try std.fmt.allocPrint(gpa, "{s}/loop-root", .{base});
+    defer gpa.free(loop_root);
+    _ = linux.symlinkat("loop-root", fsx.cwd, (try sys.z(&zb, loop_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, loop_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(loop_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
 
     // a symlink to a directory as the root: the Python tool refuses it
     // as unsafe through its component check, RootLock with the NotDir
@@ -710,6 +748,9 @@ test "RootLock refuses a non-directory state root with NotDir" {
     defer gpa.free(link_root);
     _ = linux.symlinkat("real-root", fsx.cwd, (try sys.z(&zb, link_root)).ptr);
     try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, link_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(link_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
 }
 
 test "RootLock refuses a second holder and is free after release" {
@@ -811,6 +852,8 @@ test "creating the gate in a read-only directory names .lock" {
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     try std.testing.expectError(error.AccessDenied, RootLock.acquire(gpa, base, 0));
     const note = osFailure() orelse unreachable;
-    try std.testing.expectEqualStrings(".lock", note.path);
+    const want_gate = try std.fmt.allocPrint(gpa, "{s}/.lock", .{base});
+    defer gpa.free(want_gate);
+    try std.testing.expectEqualStrings(want_gate, note.path);
     try std.testing.expectEqualStrings("[Errno 13] Permission denied", note.text);
 }
