@@ -605,7 +605,8 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         return failed;
     };
     ops.created(fd);
-    errdefer discard(tmp, created);
+    var renamed = false;
+    errdefer if (!renamed) discard(tmp, created);
     {
         defer sys.close(fd);
         writeTemp(fd, data) catch |err| return failOs(a, why, err, null, null);
@@ -632,6 +633,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
     renameTemp(tmp, path) catch |err| return failOs(a, why, err, tmp, path);
+    renamed = true;
     // Opening the directory names it. Flushing the descriptor names no file.
     const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
     defer sys.close(directory);
@@ -676,6 +678,24 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
 fn discard(tmp: []const u8, created: fsx.Stat) void {
     const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
     if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
+}
+
+var saved_nofile: linux.rlimit = undefined;
+var nofile_lowered = false;
+
+fn renameThenExhaustFiles(old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize {
+    const rc = linux.renameat(old_dir, old_path, new_dir, new_path);
+    if (linux.errno(rc) != .SUCCESS) return rc;
+    if (linux.errno(linux.prlimit(0, .NOFILE, null, &saved_nofile)) != .SUCCESS) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+    const none: linux.rlimit = .{ .cur = 0, .max = saved_nofile.max };
+    if (linux.errno(linux.prlimit(0, .NOFILE, &none, null)) != .SUCCESS) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+    nofile_lowered = true;
+    return rc;
+}
+
+fn restoreFileLimit() void {
+    if (nofile_lowered) _ = linux.prlimit(0, .NOFILE, &saved_nofile, null);
+    nofile_lowered = false;
 }
 
 test "Why.deinit frees a refusal's message only when it was allocated" {
@@ -793,6 +813,38 @@ test "atomicWrite frees what it allocates" {
     try atomicWrite(gpa, path, "one\n", .{}, &why);
     try atomicWrite(gpa, path, "two\n", .{}, &why);
     try std.testing.expectEqual(@as(usize, 0), why.msg.len);
+}
+
+test "a post-rename parent-open failure keeps its errno" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/atomic-parent-open-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(dir);
+    try makedirs(dir);
+    defer fsx.deleteTree(gpa, fsx.cwd, dir) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/f", .{dir});
+    defer gpa.free(path);
+    var why: Why = .{};
+    defer why.deinit(gpa);
+    const old_ops = ops.*;
+    defer ops.* = old_ops;
+    ops.renameat = renameThenExhaustFiles;
+    defer restoreFileLimit();
+
+    try std.testing.expectError(error.Unexpected, atomicWrite(gpa, path, "new\n", .{}, &why));
+    try std.testing.expectEqual(linux.E.MFILE, sys.last_errno);
+    const quoted = try pytext.reprStrAlloc(gpa, dir);
+    defer gpa.free(quoted);
+    const want = try std.fmt.allocPrint(gpa, "[Errno 24] Too many open files: {s}", .{quoted});
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, why.msg);
+    restoreFileLimit();
+    const live = try fsx.openRegular(fsx.cwd, path, false);
+    defer sys.close(live.fd);
+    const bytes = try fsx.readAll(gpa, live.fd, 16);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("new\n", bytes);
 }
 
 test "an interrupted ACL read is retried" {

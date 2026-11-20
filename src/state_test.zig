@@ -162,6 +162,9 @@ fn eioFtruncate(_: fsx.fd_t, _: i64) usize {
 fn eioWrite(_: fsx.fd_t, _: []const u8) usize {
     return err(.IO);
 }
+fn shortWrite(_: fsx.fd_t, bytes: []const u8) usize {
+    return bytes.len - 1;
+}
 fn eioOpen(_: fsx.fd_t, _: [*:0]const u8) usize {
     return err(.IO);
 }
@@ -186,6 +189,19 @@ test "acquisition errors release the descriptors and the gate" {
         try testing.expectEqual(before, fdCount(A));
         try acquireAndRelease(root);
     }
+}
+
+test "a short pid write does not reuse a stale errno" {
+    const root = begin();
+    defer end(root);
+    const initialized = try RootLock.acquire(A, root, 0);
+    initialized.release();
+    sys.last_errno = .DQUOT;
+    state.lock_ops.write = shortWrite;
+    try testing.expectError(error.NoSpace, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings("", failure.path);
+    try testing.expectEqualStrings("[Errno 28] No space left on device", failure.text);
 }
 
 test "a sidecar open failure releases the local gate" {

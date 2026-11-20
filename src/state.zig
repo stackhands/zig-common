@@ -509,6 +509,7 @@ pub const RootLock = struct {
         _ = gpa;
         const atomic = @import("atomic.zig");
         const root = withoutTrailingSlashes(state_root);
+        sys.last_errno = .SUCCESS;
         // The Python tool pre-checks the root before makedirs; a
         // non-directory root is ENOTDIR here whatever makedirs alone
         // would say. A root that is a directory once links are followed
