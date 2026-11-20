@@ -8,6 +8,7 @@ const proc = @import("proc.zig");
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 const atomic = @import("atomic.zig");
+const test_support = @import("test_support.zig");
 const testing = std.testing;
 
 const limit = 64 * 1024;
@@ -494,4 +495,55 @@ test "run with all standard streams closed moves shared devnull and pipes above 
     var status: i32 = 0;
     _ = try sys.call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
     try testing.expectEqual(@as(i32, 0), status);
+}
+
+fn keepAboveStdioFdCounts() u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_impl.deinit();
+    const a = arena_impl.allocator();
+    const pages = std.heap.page_allocator;
+
+    // Slots 0, 1 and 2 are closed, which is when childExec moves a source
+    // and when a newly opened descriptor can land below 3.
+    sys.close(0);
+    sys.close(1);
+    sys.close(2);
+    const baseline = test_support.fdCount(pages) catch return 9;
+
+    const opened = sys.openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch return 10;
+    if (opened >= 3) return 11;
+    const moved = sys.keepAboveStdio(opened) catch return 12;
+    if (moved < 3) return 13;
+    // One new descriptor, the moved one. The low slot is closed, so a
+    // duplication that skips that close shows up as an extra entry.
+    const after_move = test_support.fdCount(pages) catch return 9;
+    if (after_move != baseline + 1) return 14;
+    if (linux.errno(linux.fcntl(opened, linux.F.GETFD, 0)) != .BADF) return 15;
+    sys.close(moved);
+    const after_close = test_support.fdCount(pages) catch return 9;
+    if (after_close != baseline) return 16;
+
+    // proc.run opens devnull and the stdout pipe, and the child moves any
+    // of those that sit below 3. This process closes its copies.
+    const res = proc.run(a, "/bin/sh", &.{ "sh", "-c", "printf ok && printf drop >&2" }, no_env, .{}) catch return 17;
+    if (res.term.code() != 0 or !std.mem.eql(u8, res.stdout, "ok")) return 18;
+    const after_run = test_support.fdCount(pages) catch return 9;
+    if (after_run != baseline) return 19;
+
+    // The exec-failure pipe's write end goes through keepAboveStdio here.
+    if (proc.run(a, "/no/such/zig-common-program", &.{"missing"}, no_env, .{ .exec_error = true })) |_| {
+        return 20;
+    } else |err| {
+        if (err != error.NotFound) return 21;
+    }
+    const after_exec = test_support.fdCount(pages) catch return 9;
+    if (after_exec != baseline) return 22;
+    return 0;
+}
+
+test "proc keepAboveStdio paths do not leak descriptors" {
+    // The count runs in the child. Closing the standard streams there is
+    // what makes these paths move a descriptor, and the child's table is
+    // the one the calls change.
+    try test_support.expectChildPasses(keepAboveStdioFdCounts);
 }
