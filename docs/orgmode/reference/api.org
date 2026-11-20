@@ -94,9 +94,13 @@ Error set: [[zig:zig_common.logs.GzipError]].
 
 | Function                               | Error set |
 |----------------------------------------+-----------|
+| [[zig:zig_common.cli.Stdout.write]]    | none      |
+| [[zig:zig_common.cli.Stdout.print]]    | none      |
+| [[zig:zig_common.cli.Stdout.finish]]   | none      |
 | [[zig:zig_common.cli.put]]             | none      |
 | [[zig:zig_common.cli.print]]           | none      |
 | [[zig:zig_common.cli.out]]             | none      |
+| [[zig:zig_common.cli.writeOut]]        | none      |
 | [[zig:zig_common.cli.err]]             | none      |
 | [[zig:zig_common.cli.die]]             | none      |
 | [[zig:zig_common.cli.versionLine]]     | none      |
