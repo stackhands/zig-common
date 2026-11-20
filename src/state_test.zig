@@ -65,7 +65,7 @@ fn assertRemoteExcluded(root: []const u8) !void {
     if (pid == 0) {
         state.lock_ops.flock = noFlock;
         if (RootLock.acquire(A, root, 0)) |l| {
-            l.release();
+            l.release() catch unreachable;
             linux.exit_group(1);
         } else |e| linux.exit_group(if (e == error.Busy) 0 else 2);
     }
@@ -82,7 +82,7 @@ fn assertGateHeld(root: []const u8) !void {
 
 fn acquireAndRelease(root: []const u8) !void {
     const l = try RootLock.acquire(A, root, 0);
-    l.release();
+    l.release() catch unreachable;
 }
 
 test "the record lock excludes an independent kernel gate" {
@@ -90,10 +90,10 @@ test "the record lock excludes an independent kernel gate" {
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
     assertRemoteExcluded(root) catch |e| {
-        holder.release();
+        holder.release() catch unreachable;
         return e;
     };
-    holder.release();
+    holder.release() catch unreachable;
     try acquireAndRelease(root);
 }
 
@@ -101,7 +101,7 @@ test "failed local contenders keep the record lock" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     for (0..4) |_| {
         try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
         try testing.expect(state.osFailure() == null);
@@ -125,7 +125,7 @@ test "an interrupted non-blocking flock is retried" {
     eintr_left = 1;
     state.lock_ops.flock = eintrFlock;
     const held = try RootLock.acquire(A, root, 0);
-    held.release();
+    held.release() catch unreachable;
     try testing.expectEqual(@as(u8, 0), eintr_left);
 
     eintr_left = 1;
@@ -142,7 +142,7 @@ test "a second acquire by the holder keeps both locks" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
     try assertGateHeld(root);
     try assertRemoteExcluded(root);
@@ -179,7 +179,7 @@ test "acquisition errors release the descriptors and the gate" {
         if (comptime std.mem.eql(u8, target, "ftruncate")) state.lock_ops.ftruncate = eioFtruncate;
         if (comptime std.mem.eql(u8, target, "write")) state.lock_ops.write = eioWrite;
         if (RootLock.acquire(A, root, null)) |l| {
-            l.release();
+            l.release() catch unreachable;
             return error.TestUnexpectedResult;
         } else |_| {}
         const failure = state.osFailure() orelse unreachable;
@@ -195,7 +195,7 @@ test "a short pid write does not reuse a stale errno" {
     const root = begin();
     defer end(root);
     const initialized = try RootLock.acquire(A, root, 0);
-    initialized.release();
+    initialized.release() catch unreachable;
     sys.last_errno = .DQUOT;
     state.lock_ops.write = shortWrite;
     try testing.expectError(error.NoSpace, RootLock.acquire(A, root, 0));
@@ -237,10 +237,10 @@ test "a forked child's release does not unlock the parent" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     const pid: isize = @bitCast(linux.fork());
     if (pid == 0) {
-        holder.release();
+        holder.release() catch unreachable;
         linux.exit_group(0);
     }
     try testing.expectEqual(@as(u32, 0), waitExit(pid));
@@ -255,7 +255,7 @@ test "a release error still closes both layers" {
     const holder = try RootLock.acquire(A, root, 0);
     const before = fdCount(A);
     state.lock_ops.fcntl = eioFcntl;
-    holder.release();
+    try testing.expectError(error.Unexpected, holder.release());
     state.lock_ops.* = .{};
     try testing.expectEqual(before - 2, fdCount(A));
     try acquireAndRelease(root);
@@ -278,7 +278,7 @@ test "a timed acquire does not wait forever" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
     try testing.expectError(error.Busy, RootLock.acquire(A, root, 200));
@@ -393,7 +393,7 @@ test "a hard link planted while the gate is awaited stops the truncate" {
     state.lock_ops.* = .{};
     try sys.unlinkat(dir, "alias", 0);
     const l = try RootLock.acquire(gpa, root, 0);
-    l.release();
+    l.release() catch unreachable;
 }
 
 test "a gate moved to another name while it is awaited is not truncated" {
@@ -463,7 +463,7 @@ test "both lock files are created mode 0600" {
     const root = try scratchRoot(gpa);
     defer removeRoot(gpa, root);
     const l = try RootLock.acquire(gpa, root, 0);
-    defer l.release();
+    defer l.release() catch unreachable;
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
 }
@@ -483,7 +483,7 @@ test "acquire tightens existing owned lock files to mode 0600" {
     try testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, ".lock.posix", false)).perm());
 
     const l = try RootLock.acquire(gpa, root, 0);
-    defer l.release();
+    defer l.release() catch unreachable;
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
 }

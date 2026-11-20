@@ -584,16 +584,25 @@ pub const RootLock = struct {
 
     /// Unlock the record lock, close its descriptor, then unlock and close
     /// the gate. Both descriptors are closed whatever an unlock returns; a
-    /// forked child only closes them.
-    pub fn release(l: RootLock) void {
+    /// forked child only closes them. The first unlock error is returned
+    /// after both closes, as Python's release lets the OSError out.
+    pub fn release(l: RootLock) sys.Error!void {
+        var first: ?sys.Error = null;
         if (linux.getpid() == l.owner) {
             var fl: linux.Flock = std.mem.zeroes(linux.Flock);
             fl.type = linux.F.UNLCK;
-            _ = lock_ops.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+            _ = lockCall(lock_ops.fcntl, .{ l.posix, linux.F.SETLK, @intFromPtr(&fl) }) catch |err| {
+                first = err;
+            };
         }
         sys.close(l.posix);
-        if (linux.getpid() == l.owner) _ = lock_ops.flock(l.gate, std.posix.LOCK.UN);
+        if (linux.getpid() == l.owner) {
+            _ = lockCall(lock_ops.flock, .{ l.gate, std.posix.LOCK.UN }) catch |err| {
+                if (first == null) first = err;
+            };
+        }
         sys.close(l.gate);
+        if (first) |err| return err;
     }
 };
 
@@ -774,9 +783,9 @@ test "RootLock refuses a second holder and is free after release" {
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     const first = try RootLock.acquire(gpa, base, 0);
     try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));
-    first.release();
+    first.release() catch unreachable;
     const again = try RootLock.acquire(gpa, base, 0);
-    again.release();
+    again.release() catch unreachable;
 }
 
 test "lockExclusiveCancel returns Canceled when cancel is set" {
@@ -852,7 +861,7 @@ test "creating the gate in a read-only directory names .lock" {
     const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
     const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-ro-{d}", .{ cwd, linux.getpid() });
     const held = try RootLock.acquire(gpa, base, 0);
-    held.release();
+    held.release() catch unreachable;
     var zb: [sys.path_max:0]u8 = undefined;
     const gate = try std.mem.print(zb[0..zb.len], "{s}/.lock", .{base});
     try sys.unlinkat(fsx.cwd, gate, 0);
