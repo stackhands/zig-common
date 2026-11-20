@@ -68,6 +68,7 @@ pub threadlocal var last_errno: linux.E = .SUCCESS;
 /// null for an errno it does not name.
 pub fn errnoText(e: linux.E) ?[]const u8 {
     return switch (e) {
+        .SUCCESS => "Success",
         .PERM => "Operation not permitted",
         .NOENT => "No such file or directory",
         .SRCH => "No such process",
@@ -449,8 +450,8 @@ test "strerror formats unnamed errno values instead of panicking" {
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
 }
 
-test "errnoText returns null for unknown errnos and sys wrappers surface expected errors" {
-    try std.testing.expectEqual(@as(?[]const u8, null), errnoText(.SUCCESS));
+test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {
+    try std.testing.expectEqualStrings("Success", errnoText(.SUCCESS).?);
     var raw: u16 = 134;
     try std.testing.expectEqual(@as(?[]const u8, null), errnoText(@fromBackingInt(raw)));
     raw = 999;
