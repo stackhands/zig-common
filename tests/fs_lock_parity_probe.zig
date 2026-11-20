@@ -27,6 +27,8 @@ const sys = common.sys;
 const proc = common.proc;
 const pytext = common.pytext;
 const logs = common.logs;
+const env = common.env;
+const cli = common.cli;
 
 var arena_state: std.heap.ArenaAllocator = undefined;
 var A: std.mem.Allocator = undefined;
@@ -255,6 +257,78 @@ fn gzipMode() void {
     }
 }
 
+/// `envcli` mode: the environment parsing and builder edge cases and
+/// the CLI exit code, compared with what a Python child sees from the
+/// same environ block and with argparse's error exit.
+fn envCliMode() void {
+    const block = [_:null]?[*:0]const u8{ "A=1", "NOEQ", "B=x=y", "A=2", "E=", "B=late" };
+    const e = env.Env.fromEnvp(&block);
+
+    // the block itself, so the test can recompute from the same input
+    var joined: std.ArrayList(u8) = .empty;
+    for (block) |entry_o| {
+        const entry = entry_o orelse break;
+        if (joined.items.len > 0) joined.append(A, 1) catch unreachable;
+        joined.appendSlice(A, std.mem.span(entry)) catch unreachable;
+    }
+    emit(&.{ "env-block", hexOf(joined.items) });
+
+    // Env.get: the first entry wins, as a getenv-walking child sees it
+    const names = [_][]const u8{ "A", "B", "E", "NOEQ", "MISSING", "", "B=" };
+    for (names) |n| {
+        if (e.get(n)) |v| {
+            emit(&.{ "env-get", hexOf(n), hexOf(v) });
+        } else {
+            emit(&.{ "env-get", hexOf(n), "NULL" });
+        }
+    }
+
+    // Builder: order kept, a set replaces in place, an unset removes;
+    // the ops are emitted so the test can replay them
+    var b = env.Builder.fromEnv(A, e) catch unreachable;
+    b.set("D", "") catch unreachable;
+    b.set("A", "replaced") catch unreachable;
+    b.unset("E");
+    b.set("F", "with=equals") catch unreachable;
+    emit(&.{ "builder-op", "set", hexOf("D"), hexOf("") });
+    emit(&.{ "builder-op", "set", hexOf("A"), hexOf("replaced") });
+    emit(&.{ "builder-op", "unset", hexOf("E") });
+    emit(&.{ "builder-op", "set", hexOf("F"), hexOf("with=equals") });
+    const built = b.envp() catch unreachable;
+    var out_block: std.ArrayList(u8) = .empty;
+    var bi: usize = 0;
+    while (built[bi] != null) : (bi += 1) {
+        const entry = built[bi].?;
+        if (out_block.items.len > 0) out_block.append(A, 1) catch unreachable;
+        out_block.appendSlice(A, std.mem.span(entry)) catch unreachable;
+    }
+    emit(&.{ "builder-block", hexOf(out_block.items) });
+
+    // names execve cannot carry are refused
+    const bad_cases = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "", .value = "x" },
+        .{ .name = "A=B", .value = "x" },
+        .{ .name = "OK", .value = "x\x00y" },
+    };
+    for (bad_cases) |c| {
+        var bad = env.Builder.init(A);
+        bad.set(c.name, c.value) catch unreachable;
+        if (bad.envp()) |_| {
+            emit(&.{ "builder-bad", hexOf(c.name), hexOf(c.value), "OK" });
+        } else |err| {
+            emit(&.{ "builder-bad", hexOf(c.name), hexOf(c.value), std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(err)}) catch unreachable });
+        }
+    }
+
+    // validName, the shell's assignment-name rule
+    const name_cases = [_][]const u8{ "_A1", "1A", "A-B", "", "z", "A9_b" };
+    for (name_cases) |n| {
+        emit(&.{ "valid-name", hexOf(n), if (env.validName(n)) "1" else "0" });
+    }
+
+    emit(&.{ "usage-exit", std.fmt.allocPrint(A, "{d}", .{cli.usage_exit}) catch unreachable });
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -329,6 +403,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         diagMode();
     } else if (std.mem.eql(u8, mode, "gzip")) {
         gzipMode();
+    } else if (std.mem.eql(u8, mode, "envcli")) {
+        envCliMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {

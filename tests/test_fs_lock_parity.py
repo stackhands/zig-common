@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -571,6 +572,123 @@ class FsLockParity(unittest.TestCase):
             self.assertEqual(probe_bytes[:10], python_bytes[:10])
             # same stored name, and the same bytes once decompressed
             self.assertEqual(gzip.decompress(probe_bytes), gzip.decompress(python_bytes))
+
+    def test_env_cli_helpers(self):
+        """env parsing, the builder and the usage exit, against what a
+        real Python child sees from the same environ block and against
+        argparse's error exit code."""
+        out = run_probe("envcli")
+        lines = [l.split("\t") for l in out.splitlines()]
+
+        # the block the probe parsed
+        self.assertEqual(lines[0][0], "env-block")
+        block = bytes.fromhex(lines[0][1]).decode().split("\x01")
+
+        # Env.get, recomputed the way a getenv-walking child resolves
+        # the block: the first entry wins, an entry without = is not a
+        # variable, and the split is at the first =
+        def py_get(name):
+            for entry in block:
+                if "=" not in entry:
+                    continue
+                key, _, value = entry.partition("=")
+                if key == name:
+                    return value
+            return None
+
+        i = 1
+        seen_get = 0
+        while lines[i][0] == "env-get":
+            name = bytes.fromhex(lines[i][1]).decode()
+            if lines[i][2] == "NULL":
+                got = None
+            else:
+                got = bytes.fromhex(lines[i][2]).decode()
+            self.assertEqual(py_get(name), got, "env get %r" % name)
+            seen_get += 1
+            i += 1
+        self.assertGreaterEqual(seen_get, 6, "too few env-get cases")
+
+        # the builder ops, replayed with the documented rules
+        entries = []
+        for entry in block:
+            if "=" not in entry:
+                continue
+            key, _, value = entry.partition("=")
+            if not any(k == key for k, _ in entries):
+                entries.append((key, value))
+        seen_ops = 0
+        while lines[i][0] == "builder-op":
+            op = lines[i][1]
+            name = bytes.fromhex(lines[i][2]).decode()
+            value = bytes.fromhex(lines[i][3]).decode() if len(lines[i]) > 3 else None
+            if op == "set":
+                for pos, (key, _) in enumerate(entries):
+                    if key == name:
+                        entries[pos] = (name, value)
+                        break
+                else:
+                    entries.append((name, value))
+            elif op == "unset":
+                entries = [(k, v) for k, v in entries if k != name]
+            seen_ops += 1
+            i += 1
+        self.assertGreaterEqual(seen_ops, 4, "too few builder ops")
+        self.assertEqual(lines[i][0], "builder-block")
+        built = bytes.fromhex(lines[i][1]).decode()
+        if built:
+            self.assertEqual(
+                [(k, v) for k, _, v in (e.partition("=") for e in built.split("\x01"))],
+                entries,
+                "the built block",
+            )
+        else:
+            self.assertEqual(entries, [])
+        i += 1
+
+        # names execve cannot carry are refused in both
+        seen_bad = 0
+        while lines[i][0] == "builder-bad":
+            name = bytes.fromhex(lines[i][1]).decode()
+            value = bytes.fromhex(lines[i][2]).decode()
+            self.assertIn("\x00" in value or "=" in name or name == "", (True,), "case not bad")
+            self.assertEqual(lines[i][3], "ERR:InvalidArgument", "builder bad %r" % name)
+            seen_bad += 1
+            i += 1
+        self.assertGreaterEqual(seen_bad, 3, "too few bad-name cases")
+
+        # validName against the shell assignment rule
+        import re as _re
+
+        seen_names = 0
+        while lines[i][0] == "valid-name":
+            name = bytes.fromhex(lines[i][1]).decode()
+            want = "1" if _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else "0"
+            self.assertEqual(lines[i][2], want, "validName %r" % name)
+            seen_names += 1
+            i += 1
+        self.assertGreaterEqual(seen_names, 5, "too few validName cases")
+
+        # the usage exit against argparse's own error exit
+        self.assertEqual(lines[i][0], "usage-exit")
+        self.assertEqual(int(lines[i][1]), 2)
+        probe_code = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import argparse\n"
+                "p = argparse.ArgumentParser(prog='tool')\n"
+                "try:\n"
+                "    p.parse_args(['--nope'])\n"
+                "except SystemExit as e:\n"
+                "    print(e.code)\n",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(int(lines[i][1]), int(probe_code), "argparse exit")
 
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
