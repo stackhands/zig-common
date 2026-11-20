@@ -177,7 +177,18 @@ pub fn gunzip(gpa: Allocator, raw: []const u8, limit: usize) GunzipError![]u8 {
         const member = out.items[start..];
         if (m.crc != std.hash.Crc32.hash(member) or m.count != @as(u32, @truncate(member.len)))
             return error.BadGzip;
-        if (in.bufferedLen() == 0) return out.toOwnedSlice(gpa);
+        const rest = in.buffered();
+        if (rest.len == 0) return out.toOwnedSlice(gpa);
+        // gzip -d and Python's gzip treat bytes that are all zero after
+        // the last member as padding, not as the start of another member
+        var all_zero = true;
+        for (rest) |b| {
+            if (b != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) return out.toOwnedSlice(gpa);
     }
 }
 
@@ -214,6 +225,34 @@ test "gunzip round trips, reads members after another and refuses damage" {
     try std.testing.expectError(error.BadGzip, gunzip(gpa, aw.written()[0 .. aw.written().len / 2], 1 << 30));
     try std.testing.expectError(error.BadGzip, gunzip(gpa, "not gzip at all", 1 << 30));
     try std.testing.expectError(error.StreamTooLong, gunzip(gpa, aw.written(), 8));
+}
+
+test "gunzip reads over trailing zero padding" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    const data = "padded member\n";
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(a, 64);
+    var c = try flate.Compress.init(&aw.writer, window, .gzip, .best);
+    try c.writer.writeAll(data);
+    try c.finish();
+    const padded = try std.mem.concat(gpa, u8, &.{ aw.written(), &(@as([16]u8, @splat(0))) });
+    defer gpa.free(padded);
+    const got = try gunzip(gpa, padded, 1 << 30);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(data, got);
+
+    const two = try std.mem.concat(gpa, u8, &.{ aw.written(), aw.written() });
+    defer gpa.free(two);
+    const padded_two = try std.mem.concat(gpa, u8, &.{ two, &(@as([8]u8, @splat(0))) });
+    defer gpa.free(padded_two);
+    const both = try gunzip(gpa, padded_two, 1 << 30);
+    defer gpa.free(both);
+    try std.testing.expectEqual(@as(usize, 2 * data.len), both.len);
 }
 
 test "gzip does not publish a partial archive under the final name" {
