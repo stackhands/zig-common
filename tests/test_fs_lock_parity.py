@@ -690,6 +690,43 @@ class FsLockParity(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(int(lines[i][1]), int(probe_code), "argparse exit")
 
+    def test_errno_describe_and_frames(self):
+        """sys errno text against os.strerror for every errno the kernel
+        names, and the [Errno N] framing against str(OSError(...))."""
+        out = run_probe("errno")
+        checked_desc = checked_text = checked_frame = 0
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if parts[0] == "errno-desc":
+                n = int(parts[1])
+                got = bytes.fromhex(parts[2])
+                want = ("[Errno %d] %s" % (n, os.strerror(n))).encode()
+                self.assertEqual(want, got, "describeErrno %d" % n)
+                checked_desc += 1
+            elif parts[0] == "errno-text":
+                n = int(parts[1])
+                py = os.strerror(n)
+                if parts[2] == "NULL":
+                    # errnoText names fewer errnos than glibc: the null
+                    # contract, exercised where glibc has no name
+                    self.assertEqual(py, "Unknown error %d" % n, "errnoText null at %d" % n)
+                else:
+                    got = bytes.fromhex(parts[2])
+                    self.assertEqual(py.encode(), got, "errnoText %d" % n)
+                checked_text += 1
+            elif parts[0] == "errno-frame":
+                n = int(parts[1])
+                path = bytes.fromhex(parts[2])
+                got = bytes.fromhex(parts[3])
+                want = (
+                    "[Errno %d] %s: %r" % (n, os.strerror(n), os.fsdecode(path))
+                ).encode("utf-8", "surrogateescape")
+                self.assertEqual(want, got, "frame %d of %r" % (n, path))
+                checked_frame += 1
+        self.assertGreaterEqual(checked_desc, 150, "too few describeErrno cases")
+        self.assertGreaterEqual(checked_text, 150, "too few errnoText cases")
+        self.assertGreaterEqual(checked_frame, 90, "too few framing cases")
+
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
         names_a = sorted(os.listdir(root_a))

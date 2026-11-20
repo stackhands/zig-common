@@ -329,6 +329,32 @@ fn envCliMode() void {
     emit(&.{ "usage-exit", std.fmt.allocPrint(A, "{d}", .{cli.usage_exit}) catch unreachable });
 }
 
+/// `errno` mode: describeErrno and errnoText for every errno the
+/// kernel names on this platform, and the [Errno N] framing over tricky
+/// paths, compared with os.strerror and the str of an OSError.
+fn errnoMode() void {
+    var n: u16 = 0;
+    while (n <= 150) : (n += 1) {
+        const e: linux.E = @fromBackingInt(n);
+        const num = std.fmt.allocPrint(A, "{d}", .{n}) catch unreachable;
+        emit(&.{ "errno-desc", num, hexOf(sys.describeErrno(e)) });
+        if (sys.errnoText(e)) |t| {
+            emit(&.{ "errno-text", num, hexOf(t) });
+        } else {
+            emit(&.{ "errno-text", num, "NULL" });
+        }
+    }
+    // the errnos the mapped errors surface, over tricky paths
+    const frame_errnos = [_]u32{ 1, 2, 5, 11, 13, 17, 18, 20, 21, 26, 27, 28, 30, 32, 36, 38, 40, 8 };
+    const frame_paths = [_][]const u8{ "/no/such", "it's \"quoted\"", "a\xffb", "line\nbreak\ttab", "caf\xe9", "back\\slash" };
+    for (frame_errnos) |num| {
+        for (frame_paths) |p| {
+            const msg = pytext.osErrorErrno(A, @fromBackingInt(@intCast(num)), p) catch unreachable;
+            emit(&.{ "errno-frame", std.fmt.allocPrint(A, "{d}", .{num}) catch unreachable, hexOf(p), hexOf(msg) });
+        }
+    }
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -405,6 +431,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         gzipMode();
     } else if (std.mem.eql(u8, mode, "envcli")) {
         envCliMode();
+    } else if (std.mem.eql(u8, mode, "errno")) {
+        errnoMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {
