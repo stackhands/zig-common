@@ -92,7 +92,8 @@ pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.a
         const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         switch (linux.errno(rc)) {
             .SUCCESS => return,
-            .AGAIN, .INTR => {},
+            .INTR => continue,
+            .AGAIN => {},
             else => return mapped(rc),
         }
         var sleep_ms: i64 = 20;
@@ -302,7 +303,8 @@ pub const RootLock = struct {
             const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
             switch (linux.errno(rc)) {
                 .SUCCESS => return,
-                .AGAIN, .ACCES, .INTR => {},
+                .INTR => continue,
+                .AGAIN, .ACCES => {},
                 else => return mapped(rc),
             }
             if (try pause(d)) return error.Busy;

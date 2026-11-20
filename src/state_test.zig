@@ -106,6 +106,35 @@ test "failed local contenders keep the record lock" {
     try assertRemoteExcluded(root);
 }
 
+var eintr_left: u8 = 0;
+
+fn eintrFlock(fd: fsx.fd_t, op: i32) usize {
+    if (eintr_left > 0 and (op & std.posix.LOCK.NB) != 0) {
+        eintr_left -= 1;
+        return err(.INTR);
+    }
+    return linux.flock(fd, op);
+}
+
+test "an interrupted non-blocking flock is retried" {
+    const root = begin();
+    defer end(root);
+    eintr_left = 1;
+    state.lock_ops.flock = eintrFlock;
+    const held = try RootLock.acquire(A, root, 0);
+    held.release();
+    try testing.expectEqual(@as(u8, 0), eintr_left);
+
+    eintr_left = 1;
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const fd = (try state.openPrivate(dir, "extra", true)).?;
+    defer sys.close(fd);
+    try state.lockExclusive(fd, 0);
+    _ = linux.flock(fd, std.posix.LOCK.UN);
+    try testing.expectEqual(@as(u8, 0), eintr_left);
+}
+
 test "a second acquire by the holder keeps both locks" {
     const root = begin();
     defer end(root);
