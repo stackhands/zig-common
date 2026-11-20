@@ -40,7 +40,9 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
     }
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const tmp_name = try gpa.print(".{s}.{d}.{x:0>8}.tmp", .{ gz_name, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
+    const gz_parent = std.fs.path.dirname(gz_name) orelse ".";
+    const gz_base = std.fs.path.basename(gz_name);
+    const tmp_name = try gpa.print("{s}/.{s}.{d}.{x:0>8}.tmp", .{ gz_parent, gz_base, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
     defer gpa.free(tmp_name);
     const dst = try sys.openat(dir, tmp_name, .{
         .ACCMODE = .WRONLY,
@@ -107,7 +109,9 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
         return err;
     };
     done = true;
-    try sys.fsync(dir);
+    const parent_fd = try fsx.openDir(dir, gz_parent, true);
+    defer sys.close(parent_fd);
+    try sys.fsync(parent_fd);
 }
 
 /// The lines of a `.licensed-logs` list with every line found in `renames`
@@ -254,4 +258,28 @@ test "gzipInPlace refuses missing files, symlinks, directories, hard links, and 
     const gz = try sys.openat(dir, "orig.log.gz", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     sys.close(gz);
     try std.testing.expectError(error.Exists, gzipInPlace(gpa, io, dir, "orig.log"));
+}
+
+test "gzipInPlace handles nested paths like gzip -9 sub/file" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-sub-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+    _ = linux.mkdirat(dir, (try sys.z(&zb, "sub")).ptr, 0o700);
+    const src = try sys.openat(dir, "sub/nested.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try sys.writeAll(src, "nested\n");
+    sys.close(src);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try gzipInPlace(gpa, io, dir, "sub/nested.log");
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "sub/nested.log", false));
+    try std.testing.expect((fsx.statAt(dir, "sub/nested.log.gz", false) catch null) != null);
 }
