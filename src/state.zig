@@ -68,11 +68,14 @@ pub const LockError = Error || error{TimedOut};
 pub const LockCancelError = LockError || error{Canceled};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
-/// The deadline is read from the monotonic clock. A signal that cuts a
-/// sleep short does not consume the whole wait: the next check looks at
-/// the clock again. A failure other than contention is the flock error,
-/// with its errno in `sys.last_errno`.
-pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
+/// The timeout is u64 milliseconds, wide enough for the seconds callers
+/// like flock -w take: the largest a tool passes is 999_999_999 seconds,
+/// whose milliseconds a u32 could not hold. The deadline is read from
+/// the monotonic clock. A signal that cuts a sleep short does not
+/// consume the whole wait: the next check looks at the clock again. A
+/// failure other than contention is the flock error, with its errno in
+/// `sys.last_errno`.
+pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u64) LockError!void {
     return lockExclusiveCancel(fd, timeout_ms, null) catch |err| switch (err) {
         error.Canceled => unreachable,
         else => |e| return e,
@@ -81,8 +84,8 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
 
 /// Like `lockExclusive`, also stopping with `error.Canceled` if `cancel`
 /// becomes true while waiting.
-pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
-    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
+pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u64, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
+    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + @as(i64, @intCast(ms)) else null;
     if (deadline == null and cancel == null) {
         _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
         return;
@@ -118,6 +121,20 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
     };
 }
 
+/// Create `dir/name` with `bytes` at exactly `mode`, never replacing an
+/// existing name: the create is O_EXCL with O_NOFOLLOW, an existing
+/// name is `error.Exists`, and the mode is set on the descriptor so the
+/// umask cannot bite it. The name is created and closed in one step;
+/// nothing is renamed, so another name's file is never touched. A
+/// symbolic link at the name is refused without being followed, as
+/// `openPrivate` refuses one.
+pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode: u32) Error!void {
+    const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, 0o600);
+    defer sys.close(fd);
+    try sys.fchmod(fd, mode);
+    try sys.writeAll(fd, bytes);
+}
+
 /// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
 /// mode 0600, then renamed over the name.
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
@@ -137,6 +154,45 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
     try sys.fchmod(fd, 0o600);
     try sys.renameat(dir, tmp, dir, name);
     done = true;
+}
+
+test "createPrivateAt creates without clobbering" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-create-at-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(d);
+
+    // a fresh name at an exact mode under a restrictive umask
+    const old: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old);
+    try createPrivateAt(d, "new", "bytes\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(d, "new", false)).perm());
+
+    // an existing name is refused with its bytes untouched
+    try std.testing.expectError(error.Exists, createPrivateAt(d, "new", "second\n", 0o600));
+    const f = try fsx.openRegular(d, "new", false);
+    defer sys.close(f.fd);
+    const got = try fsx.readAll(gpa, f.fd, 100);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("bytes\n", got);
+
+    // a symbolic link at the name is refused, not followed
+    _ = linux.symlinkat("new", d, (try sys.z(&zb, "link")).ptr);
+    try std.testing.expectError(error.Exists, createPrivateAt(d, "link", "x\n", 0o600));
+
+    // a name under a directory the caller already holds is created there
+    var nb: [sys.path_max]u8 = undefined;
+    const nested_name = try std.mem.print(&nb, "{s}/nested", .{base});
+    try createPrivateAt(fsx.cwd, nested_name, "n\n", 0o600);
+    const nested = try fsx.openRegular(fsx.cwd, nested_name, false);
+    defer sys.close(nested.fd);
+    try std.testing.expectEqual(@as(u32, 0o600), nested.stat.perm());
 }
 
 test "a file that is not private is not read" {
@@ -245,11 +301,50 @@ test "lockExclusive waits out the timeout while signals arrive" {
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
-    for ([_]?u32{ null, 0, 50 }) |timeout| {
+    for ([_]?u64{ null, 0, 50 }) |timeout| {
         sys.last_errno = .SUCCESS;
         try std.testing.expectError(error.InvalidArgument, lockExclusive(-1, timeout));
         try std.testing.expectEqualStrings("[Errno 9] Bad file descriptor", sys.describe(error.InvalidArgument));
     }
+}
+
+test "lockExclusive takes the timeout flock -w seconds give" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-locku64-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+
+    // the 999_999_999 seconds a tool may pass, as milliseconds: wider
+    // than a u32 holds, and with the lock free it returns at once
+    const fd1 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    defer sys.close(fd1);
+    try lockExclusive(fd1, 999_999_999 * std.time.ms_per_s);
+
+    // with the lock held, a timeout past u32 range still waits for the
+    // release instead of wrapping to a deadline already past
+    const fd2 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    const Holder = struct {
+        var fd: fsx.fd_t = -1;
+        fn letGo() void {
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            _ = linux.flock(fd, std.posix.LOCK.UN);
+        }
+    };
+    Holder.fd = fd1;
+    const thread = try std.Thread.spawn(.{}, Holder.letGo, .{});
+    thread.join();
+    try lockExclusive(fd2, 500_000_000 * std.time.ms_per_s);
+    _ = linux.flock(fd2, std.posix.LOCK.UN);
 }
 
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
@@ -639,7 +734,7 @@ test "lockExclusive covers timeout 0, bounded timeout, and unsupported flock" {
     lock_ops.flock = Hooks.fail;
     for ([_]linux.E{ .OPNOTSUPP, .NOSYS }) |e| {
         Hooks.err_code = e;
-        for ([_]?u32{ null, 0, 25 }) |timeout| {
+        for ([_]?u64{ null, 0, 25 }) |timeout| {
             sys.last_errno = .SUCCESS;
             try std.testing.expectError(error.Unsupported, lockExclusive(fd2, timeout));
             try std.testing.expectEqual(e, sys.last_errno);

@@ -115,6 +115,15 @@ pub fn realpathFd(fd: fd_t, out: *[sys.path_max]u8) Error![]const u8 {
     return out[0..n];
 }
 
+/// The path of this program, as /proc/self/exe reports it, or null when
+/// the kernel does not report it whole: a failed read, an empty one, or
+/// one that filled the buffer.
+pub fn selfExe(out: *[sys.path_max]u8) ?[]const u8 {
+    const n = sys.call(linux.readlinkat, .{ linux.AT.FDCWD, "/proc/self/exe", out, out.len }) catch return null;
+    if (n == 0 or n >= out.len) return null;
+    return out[0..n];
+}
+
 /// realpath(1) with -e: every component must exist; symbolic links are
 /// followed.
 pub fn realpath(dir: fd_t, path: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
@@ -629,6 +638,13 @@ pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Al
         return path;
     }
     return error.Exists;
+}
+
+test "selfExe names this program as a readable regular file" {
+    var out: [sys.path_max]u8 = undefined;
+    const got = selfExe(&out) orelse return error.TestUnexpectedResult;
+    const st = try statAt(cwd, got, true);
+    try std.testing.expect(st.isReg());
 }
 
 test "mkdtemp creates private 0700 directories with distinct names" {

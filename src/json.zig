@@ -826,6 +826,74 @@ pub fn dumps(gpa: Allocator, v: Py, indent: usize, sort: bool) Allocator.Error![
     return out.toOwnedSlice(gpa);
 }
 
+fn dumpsCompactInner(out: *std.ArrayList(u8), gpa: Allocator, v: Py, sort: bool) Allocator.Error!void {
+    switch (v) {
+        .null => try out.appendSlice(gpa, "null"),
+        .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
+        .int => |i| {
+            var buf: [24]u8 = undefined;
+            try out.appendSlice(gpa, std.mem.print(&buf, "{d}", .{i}) catch unreachable);
+        },
+        .float => |f| try writeFloat(out, gpa, f),
+        .str => |s| try writeCacheString(out, gpa, s),
+        .list => |items| {
+            try out.append(gpa, '[');
+            for (items, 0..) |it, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try dumpsCompactInner(out, gpa, it, sort);
+            }
+            try out.append(gpa, ']');
+        },
+        .dict => |entries| {
+            if (entries.len == 0) return out.appendSlice(gpa, "{}");
+            const sorted = try gpa.dupe(Py.Entry, entries);
+            defer gpa.free(sorted);
+            if (sort) std.mem.sort(Py.Entry, sorted, {}, lessKey);
+            try out.append(gpa, '{');
+            for (sorted, 0..) |e, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try writeCacheString(out, gpa, e.key);
+                try out.appendSlice(gpa, ": ");
+                try dumpsCompactInner(out, gpa, e.value, sort);
+            }
+            try out.append(gpa, '}');
+        },
+    }
+}
+
+/// json.dumps(v, sort_keys=sort) with the separators of the default call,
+/// one line and no indent, ensure_ascii as Python's default. The compact
+/// form the tools print for the --json lines.
+pub fn dumpsCompact(gpa: Allocator, v: Py, sort: bool) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try dumpsCompactInner(&out, gpa, v, sort);
+    return out.toOwnedSlice(gpa);
+}
+
+test "dumpsCompact matches json.dumps with the default separators" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v: Py = .{ .dict = &.{
+        .{ .key = "b", .value = .{ .list = &.{ .{ .int = 1 }, .null, .{ .bool = true } } } },
+        .{ .key = "a", .value = .{ .str = "\u{e9}\xff" } },
+        .{ .key = "c", .value = .{ .dict = &.{} } },
+        .{ .key = "d", .value = .{ .list = &.{} } },
+        .{ .key = "e", .value = .{ .float = 2.0 } },
+        .{ .key = "f", .value = .{ .str = "" } },
+    } };
+    const s = try dumpsCompact(a, v, true);
+    try std.testing.expectEqualStrings(
+        "{\"a\": \"\\u00e9\\udcff\", \"b\": [1, null, true], \"c\": {}, \"d\": [], \"e\": 2.0, \"f\": \"\"}",
+        s,
+    );
+    const bare = try dumpsCompact(a, .{ .list = &.{} }, false);
+    try std.testing.expectEqualStrings("[]", bare);
+    const wrapped = try dumpsCompact(a, .{ .list = &.{.{ .dict = &.{.{ .key = "k", .value = .{ .str = "v" } }} }} }, false);
+    try std.testing.expectEqualStrings("[{\"k\": \"v\"}]", wrapped);
+}
+
 test "dumps matches json.dumps(indent=2, sort_keys=True)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

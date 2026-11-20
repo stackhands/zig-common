@@ -24,7 +24,7 @@ DEFAULT_PROBE = os.path.join(REPO, "zig-out", "bin", "parity_probe")
 
 # The kinds the probe must cover. A kind with no cases means the parity
 # is silently unchecked, so the counts are asserted, not just the lines.
-KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "float", "dumps", "strerror", "oserror")
+KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "float", "dumps", "strerror", "oserror", "dumpscompact")
 MIN_CASES = {
     "cache": 1500,
     "wire": 1500,
@@ -36,6 +36,7 @@ MIN_CASES = {
     "dumps": 90,
     "strerror": 300,
     "oserror": 100,
+    "dumpscompact": 24,
 }
 
 
@@ -85,6 +86,12 @@ def float_expected(data):
     return json.dumps(struct.unpack("<d", data)[0]).encode("ascii")
 
 
+def dumpscompact_expected(data, zig_out):
+    sort = data.decode("ascii")
+    parsed = json.loads(zig_out.decode("ascii"))
+    return json.dumps(parsed, sort_keys=sort == "true").encode("ascii")
+
+
 def dumps_expected(data, zig_out):
     indent, sort = data.decode("ascii").split(",")
     parsed = json.loads(zig_out.decode("ascii"))
@@ -118,7 +125,12 @@ class JsonPytextParity(unittest.TestCase):
                     bad.append((in_hex, out_hex, want))
                 continue
             zig_out = bytes.fromhex(out_hex)
-            want = expected_of(data, zig_out) if kind == "dumps" else expected_of(data)
+            if kind == "dumps":
+                want = dumps_expected(data, zig_out)
+            elif kind == "dumpscompact":
+                want = dumpscompact_expected(data, zig_out)
+            else:
+                want = expected_of(data)
             want_hex = want if isinstance(want, str) else want.hex()
             if want_hex != out_hex:
                 bad.append((in_hex, out_hex, want_hex))

@@ -92,6 +92,51 @@ fn osErrorCase(code: u16, path: []const u8) void {
     emit("oserror", in, out);
 }
 
+/// A seeded random Py document: dicts and lists over strings with
+/// escapes and raw bytes, ints and floats, for the compact fuzz.
+fn randomPyDoc(rand: std.Random, depth: usize) json.Py {
+    const kind = rand.uintLessThan(usize, if (depth >= 3) 4 else 8);
+    switch (kind) {
+        0 => return .{ .int = @intCast(rand.int(i64)) },
+        1 => return .{ .float = @bitCast(rand.int(u64)) },
+        2 => return .{ .str = randomJsonString(rand) },
+        3 => return if (rand.boolean()) .null else .{ .bool = rand.boolean() },
+        4 => {
+            const n = rand.uintLessThan(usize, 4);
+            const items = A.alloc(json.Py, n) catch unreachable;
+            for (items) |*it| it.* = randomPyDoc(rand, depth + 1);
+            return .{ .list = items };
+        },
+        else => {
+            const names = [_][]const u8{ "k", "a", "\xff", "\u{e9}z", "long-key-name" };
+            const n = 1 + rand.uintLessThan(usize, 3);
+            const entries = A.alloc(json.Py.Entry, n) catch unreachable;
+            for (entries) |*e| e.* = .{ .key = names[rand.uintLessThan(usize, names.len)], .value = randomPyDoc(rand, depth + 1) };
+            return .{ .dict = entries };
+        },
+    }
+}
+
+fn randomJsonString(rand: std.Random) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var n = rand.uintLessThan(usize, 9);
+    while (n > 0) : (n -= 1) {
+        switch (rand.uintLessThan(usize, 5)) {
+            0 => out.append(A, 'a' + @as(u8, @intCast(rand.uintLessThan(u8, 26)))) catch unreachable,
+            1 => out.append(A, 0x80 + @as(u8, @intCast(rand.uintLessThan(u8, 0x80)))) catch unreachable,
+            2 => out.appendSlice(A, "\\\"") catch unreachable,
+            3 => out.appendSlice(A, "\\ud83d\\ude00") catch unreachable,
+            else => out.append(A, '\n') catch unreachable,
+        }
+    }
+    return out.items;
+}
+
+fn dumpsCompactCase(doc: json.Py, sort: bool) void {
+    const out = json.dumpsCompact(A, doc, sort) catch unreachable;
+    emit("dumpscompact", if (sort) "true" else "false", out);
+}
+
 /// Named sequences around the UTF-8 validity rules and the characters
 /// the escapers treat specially.
 const named = [_][]const u8{
@@ -353,6 +398,15 @@ pub fn main(init: std.process.Init) !void {
         for ([_]usize{ 0, 1, 2, 10 }) |indent| {
             for ([_]bool{ true, false }) |sort| dumpsCase(doc, indent, sort);
         }
+    }
+
+    for (documents()) |doc| {
+        for ([_]bool{ true, false }) |sort| dumpsCompactCase(doc, sort);
+    }
+
+    for (0..100) |_| {
+        const doc = randomPyDoc(rand, 0);
+        for ([_]bool{ true, false }) |sort| dumpsCompactCase(doc, sort);
     }
 
     for (0..201) |code| strerrorCase(@intCast(code));
