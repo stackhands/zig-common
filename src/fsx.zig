@@ -3,6 +3,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
+const atomic = @import("atomic.zig");
+const pytext = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 /// A file descriptor, as `sys.fd_t`.
@@ -614,6 +616,30 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
 /// suffix, retrying on `error.Exists`, and return its path allocated from
 /// `gpa`. The caller owns the returned slice.
 pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Allocator.Error)![]u8 {
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    return mkdtempReport(gpa, dir, prefix, &why);
+}
+
+/// mkdtemp that names the directory it failed in: on failure `why` holds
+/// the OSError text Python gives, `pytext.osError` of the path. When the
+/// failure is the create itself, the path is the directory joined with the
+/// name it tried, random part included, in one repr as Python writes it.
+pub fn mkdtempReport(gpa: Allocator, dir: []const u8, prefix: []const u8, why: *atomic.Why) (Error || Allocator.Error)![]u8 {
+    return mkdtempReportInner(gpa, dir, prefix, why) catch |err| {
+        if (why.msg.len == 0) reportMkError(gpa, why, err, dir, null);
+        return err;
+    };
+}
+
+fn reportMkError(gpa: Allocator, why: *atomic.Why, err: anyerror, dir: []const u8, name: ?[]const u8) void {
+    why.deinit(gpa);
+    const path = if (name) |n| std.fs.path.join(gpa, &.{ dir, n }) catch return else dir;
+    defer if (name != null) gpa.free(path);
+    why.msg = pytext.osError(gpa, err, path) catch return;
+}
+
+fn mkdtempReportInner(gpa: Allocator, dir: []const u8, prefix: []const u8, why: *atomic.Why) (Error || Allocator.Error)![]u8 {
     const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
@@ -633,7 +659,10 @@ pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Al
                 gpa.free(path);
                 continue;
             },
-            else => return err,
+            else => {
+                reportMkError(gpa, why, err, dir, name);
+                return err;
+            },
         };
         return path;
     }
@@ -645,6 +674,62 @@ test "selfExe names this program as a readable regular file" {
     const got = selfExe(&out) orelse return error.TestUnexpectedResult;
     const st = try statAt(cwd, got, true);
     try std.testing.expect(st.isReg());
+}
+
+/// Fail unless `msg` is `pytext.osError` of `err` and the path a create
+/// tried, `dir` joined with `prefix` and eight characters of the random
+/// alphabet. Those characters need no escape and do not change the quote
+/// repr picks, so they are the eight bytes before the closing quote.
+fn expectTriedPath(gpa: Allocator, msg: []const u8, err: anyerror, dir: []const u8, prefix: []const u8) !void {
+    try std.testing.expect(msg.len > 9);
+    const rnd = msg[msg.len - 9 .. msg.len - 1];
+    for (rnd) |b| try std.testing.expect(std.ascii.isLower(b) or std.ascii.isDigit(b) or b == '_');
+    const name = try std.mem.concat(gpa, u8, &.{ prefix, rnd });
+    defer gpa.free(name);
+    const tried = try std.fs.path.join(gpa, &.{ dir, name });
+    defer gpa.free(tried);
+    const want = try pytext.osError(gpa, err, tried);
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, msg);
+}
+
+test "mkdtempReport names the path a failed create tried" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-mkdtemp-report-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer sys.unlinkat(cwd, sys.z(&zb, base) catch "", linux.AT.REMOVEDIR) catch {};
+
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    // a missing directory: the whole path the create tried is in one repr
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkdtempReport(gpa, missing, "pre-", &why));
+    try expectTriedPath(gpa, why.msg, error.NotFound, missing, "pre-");
+
+    // a quote in the directory makes repr pick the other quote for all of it
+    const quoted = try std.fmt.allocPrint(gpa, "{s}/it's", .{base});
+    defer gpa.free(quoted);
+    try std.testing.expectError(error.NotFound, mkdtempReport(gpa, quoted, "pre-", &why));
+    try std.testing.expect(std.mem.endsWith(u8, why.msg, "\""));
+    try expectTriedPath(gpa, why.msg, error.NotFound, quoted, "pre-");
+
+    // a file in the parent's place: ENOTDIR's errno text, the same path
+    const blocker = try std.fmt.allocPrint(gpa, "{s}/blocker", .{base});
+    defer gpa.free(blocker);
+    const fd = try sys.openat(cwd, blocker, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.writeAll(fd, "x") catch {};
+    sys.close(fd);
+    var zb2: [sys.path_max:0]u8 = undefined;
+    defer sys.unlinkat(cwd, sys.z(&zb2, blocker) catch "", 0) catch {};
+    const under = try std.fmt.allocPrint(gpa, "{s}/blocker/sub", .{base});
+    defer gpa.free(under);
+    try std.testing.expectError(error.NotDir, mkdtempReport(gpa, under, "pre-", &why));
+    try expectTriedPath(gpa, why.msg, error.NotDir, under, "pre-");
 }
 
 test "mkdtemp creates private 0700 directories with distinct names" {
