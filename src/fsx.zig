@@ -254,10 +254,8 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
         else => |e| return e,
     };
     if (existing) |st| if (regularTypeError(st)) |err| return err;
-    var rnd: [4]u8 = undefined;
-    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
     var tmp_buf: [sys.path_max]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, ".{s}.{d}.{x:0>8}.tmp", .{ std.fs.path.basename(name), linux.getpid(), std.mem.readInt(u32, &rnd, .little) }) catch return error.NameTooLong;
+    const tmp = try tmpName(name, &tmp_buf);
     const fd = try sys.openat(dir, tmp, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -282,7 +280,7 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
     try sys.fsync(fd);
     try sys.renameat(dir, tmp, dir, name);
     done = true;
-    try sys.fsync(dir);
+    try fsyncNameParent(dir, name);
     return fd;
 }
 
@@ -414,11 +412,22 @@ fn moveFaultsStep(faults: MoveFaults, step: []const u8) Error!void {
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    return std.fmt.bufPrint(out, ".{s}.{d}.{x:0>8}.tmp", .{
+    const parent = std.fs.path.dirname(base) orelse ".";
+    return std.fmt.bufPrint(out, "{s}/.{s}.{d}.{x:0>8}.tmp", .{
+        parent,
         std.fs.path.basename(base),
         linux.getpid(),
         std.mem.readInt(u32, &rnd, .little),
     }) catch error.NameTooLong;
+}
+
+/// Sync the directory that receives `name`, which is the parent of `name`
+/// when it is nested and `dir` itself otherwise.
+fn fsyncNameParent(dir: fd_t, name: []const u8) Error!void {
+    const parent = std.fs.path.dirname(name) orelse ".";
+    const parent_dir = try openDir(dir, parent, true);
+    defer sys.close(parent_dir);
+    try sys.fsync(parent_dir);
 }
 
 fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossPolicy) Error!void {
@@ -848,6 +857,61 @@ test "copyTo leaves an existing file unchanged when the write cannot finish" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings("OLDDATA\n", text);
     try std.testing.expectEqual(@as(u32, 0o640), got.stat.perm());
+}
+
+/// Scratch directory under `.zig-cache` whose `xdev` entry is a symlink to a
+/// directory on `/dev/shm`, so a nested destination crosses filesystems.
+const XdevFixture = struct {
+    gpa: Allocator,
+    base: []u8,
+    ext: []u8,
+    d: fd_t,
+
+    fn init(gpa: Allocator, tag: []const u8) !XdevFixture {
+        const shm = openDir(cwd, "/dev/shm", true) catch return error.SkipZigTest;
+        sys.close(shm);
+        var cwd_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &cwd_buf);
+        const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-{s}-{d}", .{ here, tag, linux.getpid() });
+        errdefer gpa.free(base);
+        const ext = try std.fmt.allocPrint(gpa, "/dev/shm/zig-common-{s}-{d}", .{ tag, linux.getpid() });
+        errdefer gpa.free(ext);
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+        const d = try openDir(cwd, base, false);
+        _ = linux.mkdirat(cwd, (try sys.z(&zb, ext)).ptr, 0o700);
+        _ = linux.symlinkat((try sys.z(&zb, ext)).ptr, d, "xdev");
+        return .{ .gpa = gpa, .base = base, .ext = ext, .d = d };
+    }
+
+    fn deinit(self: XdevFixture) void {
+        deleteTree(self.gpa, cwd, self.ext) catch {};
+        deleteTree(self.gpa, cwd, self.base) catch {};
+        sys.close(self.d);
+        self.gpa.free(self.ext);
+        self.gpa.free(self.base);
+    }
+};
+
+test "copyTo supports nested destinations across a symlinked mount" {
+    const gpa = std.testing.allocator;
+    const fx = try XdevFixture.init(gpa, "copyto-nested");
+    defer fx.deinit();
+    const d = fx.d;
+
+    const srcfd = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try sys.writeAll(srcfd, "nested\n");
+    sys.close(srcfd);
+    const src = try openRegular(d, "src", false);
+    defer sys.close(src.fd);
+
+    const outfd = try copyTo(src.fd, src.stat, d, "xdev/dest");
+    defer sys.close(outfd);
+    const got = try openRegular(d, "xdev/dest", false);
+    defer sys.close(got.fd);
+    const text = try readAll(gpa, got.fd, 64);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("nested\n", text);
 }
 
 test "appendLine does not leave a partial line when the write cannot finish" {
