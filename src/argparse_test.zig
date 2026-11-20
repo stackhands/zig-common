@@ -467,3 +467,29 @@ test "types.parsePyFloat and types.parseNonNegativeU128 edge cases" {
     try std.testing.expectError(error.NotAnInteger, argparse.types.parseNonNegativeU128("1__0"));
     try std.testing.expectError(error.NotAnInteger, argparse.types.parseNonNegativeU128("abc"));
 }
+
+test "differential regressions: registered short option with spaces and non-adjacent -- separator" {
+    const gpa = std.testing.allocator;
+
+    // When -f is registered, "-foo bar" is classified as an option token (matching -f),
+    // so a preceding value option rejects it with "expected one argument", while
+    // "-zoo bar" (unregistered -z, contains space) is accepted as a value.
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--state-root", "-foo bar" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument --state-root: expected one argument", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &validated_spec, &.{ "--state-root", "-zoo bar" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("-zoo bar", out.ok.value("state-root").?);
+    }
+
+    // When an option intervenes between a consumed positional and "--", the separator
+    // is not adjacent to the positional action and remains in unrecognized arguments.
+    {
+        var out = try argparse.parse(gpa, &top_spec, &.{ "status", "--state-root", "/s", "run1", "--json", "--", "--" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: -- --", out.usage_error.message);
+    }
+}

@@ -192,6 +192,7 @@ pub const Leftover = struct {
     token: []const u8,
     is_positional: bool,
     is_separator: bool = false,
+    argv_index: usize = 0,
 };
 
 /// Successfully parsed options, positionals, remainder, and optional subcommand result.
@@ -662,6 +663,26 @@ fn matchShortChar(spec: *const CommandSpec, c: u8) ?ShortTarget {
     return null;
 }
 
+fn isOptionToken(spec: *const CommandSpec, arg: []const u8) bool {
+    if (spec.policy.negative_numbers == .never) {
+        return arg.len >= 1 and arg[0] == '-';
+    }
+    if (arg.len < 2 or arg[0] != '-') return false;
+    if (spec.policy.double_dash == .terminate and std.mem.eql(u8, arg, "--")) return true;
+    if (arg[1] == '-') {
+        if (arg.len > 2) {
+            const eq = std.mem.findScalar(u8, arg, '=');
+            const name = arg[2 .. eq orelse arg.len];
+            if (matchLong(spec, name) != .none) return true;
+        }
+    } else if (spec.policy.short_clusters) {
+        if (matchShortChar(spec, arg[1]) != null) return true;
+    } else if (arg.len == 2) {
+        if (matchShortChar(spec, arg[1]) != null) return true;
+    }
+    return optionLike(arg, spec.policy.negative_numbers);
+}
+
 const ClusterItem = struct {
     target: ShortTarget,
     explicit: ?[]const u8 = null,
@@ -693,17 +714,17 @@ fn checkUnrecognized(
     try all.appendSlice(gpa, top_extra);
 
     var consumed = consumed_positionals;
-    var last_consumed: ?usize = null;
+    var last_consumed_argv: ?usize = null;
     var dropped = keep_separator;
-    for (leftovers, 0..) |item, idx| {
+    for (leftovers) |item| {
         if (item.is_positional and consumed > 0) {
             consumed -= 1;
-            last_consumed = idx;
+            last_consumed_argv = item.argv_index;
             continue;
         }
         if (item.is_separator and !dropped) {
-            const adjacent_after = last_consumed != null and idx == last_consumed.? + 1;
-            const optional_empty = consumed_positionals == 0 and !keep_separator and last_consumed == null;
+            const adjacent_after = last_consumed_argv != null and item.argv_index == last_consumed_argv.? + 1;
+            const optional_empty = consumed_positionals == 0 and !keep_separator and last_consumed_argv == null;
             if (consumed > 0 or adjacent_after or optional_empty) {
                 dropped = true;
                 continue;
@@ -812,8 +833,8 @@ fn parseCommand(
                 remainder = argv[i..];
                 break;
             }
-            try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true });
-            for (argv[i + 1 ..]) |p| {
+            try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true, .argv_index = i });
+            for (argv[i + 1 ..], 0..) |p, pi| {
                 if (try validatePositionalChoice(gpa, spec, pos.items.len, p)) |err_out| {
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
@@ -821,7 +842,7 @@ fn parseCommand(
                     return err_out;
                 }
                 try pos.append(gpa, p);
-                try leftovers.append(gpa, .{ .token = p, .is_positional = true });
+                try leftovers.append(gpa, .{ .token = p, .is_positional = true, .argv_index = i + 1 + pi });
             }
             break;
         }
@@ -907,7 +928,7 @@ fn parseCommand(
                                 var val: []const u8 = undefined;
                                 if (it.explicit) |ev| {
                                     val = ev;
-                                } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                                } else if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
                                     i += 1;
                                     val = argv[i];
                                 } else if (o.kind == .optional_value) {
@@ -938,7 +959,7 @@ fn parseCommand(
                     }
                     if (unknown_tail) |t| {
                         try scratch.append(gpa, t);
-                        try leftovers.append(gpa, .{ .token = t, .is_positional = false });
+                        try leftovers.append(gpa, .{ .token = t, .is_positional = false, .argv_index = i });
                     }
                     continue;
                 }
@@ -959,7 +980,7 @@ fn parseCommand(
                             opt_seen[k] = true;
                             if (o.kind != .flag) {
                                 var val: []const u8 = "";
-                                if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                                if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
                                     i += 1;
                                     val = argv[i];
                                 } else if (o.kind != .optional_value) {
@@ -1061,7 +1082,7 @@ fn parseCommand(
                     var val: []const u8 = undefined;
                     if (eq) |e| {
                         val = arg[e + 1 ..];
-                    } else if (i + 1 < argv.len and !optionLike(argv[i + 1], spec.policy.negative_numbers)) {
+                    } else if (i + 1 < argv.len and !isOptionToken(spec, argv[i + 1])) {
                         i += 1;
                         val = argv[i];
                     } else if (o.kind == .optional_value) {
@@ -1108,12 +1129,12 @@ fn parseCommand(
                 return err_out;
             }
             try pos.append(gpa, arg);
-            try leftovers.append(gpa, .{ .token = arg, .is_positional = true });
+            try leftovers.append(gpa, .{ .token = arg, .is_positional = true, .argv_index = i });
             continue;
         }
 
         // 5. Unrecognized option-like token.
-        try leftovers.append(gpa, .{ .token = arg, .is_positional = false });
+        try leftovers.append(gpa, .{ .token = arg, .is_positional = false, .argv_index = i });
     }
 
     // Subcommand dispatch when this parser defines subcommands.
