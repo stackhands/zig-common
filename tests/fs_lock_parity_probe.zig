@@ -355,6 +355,135 @@ fn errnoMode() void {
     }
 }
 
+/// `copyedges` mode: copyTo and moveAcross edge cases the test set up
+/// around the probe's working directory and on a second device under
+/// /dev/shm: cross-device moves, a read-only destination, a symlinked
+/// destination, a write the file-size limit stops, and a source removed
+/// after its descriptor was opened.
+fn copyEdgesMode() void {
+    const shm = "/dev/shm/zc-parity-copyedges-probe";
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, shm) catch unreachable).ptr, 0o755);
+
+    const shm_dir = fsx.openDir(fsx.cwd, shm, false) catch unreachable;
+    defer sys.close(shm_dir);
+
+    // the fixture inside the second device: a victim the link points
+    // at, the link itself, and a read-only directory
+    const victim_fd = sys.openat(shm_dir, "victim", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch unreachable;
+    sys.writeAll(victim_fd, "keep me\n") catch unreachable;
+    sys.close(victim_fd);
+    _ = linux.symlinkat("victim", shm_dir, (sys.z(&zb, "moved-link") catch unreachable).ptr);
+    _ = linux.mkdirat(shm_dir, (sys.z(&zb, "ro") catch unreachable).ptr, 0o755);
+    {
+        const ro_z = sys.z(&zb, "ro") catch unreachable;
+        _ = linux.fchmodat(shm_dir, ro_z.ptr, 0o555);
+    }
+
+    const dir = fsx.openDir(fsx.cwd, ".", false) catch unreachable;
+    defer sys.close(dir);
+    const ro_dir = fsx.openDir(fsx.cwd, "ro", false) catch unreachable;
+    defer sys.close(ro_dir);
+
+    const case = struct {
+        fn emitCase(name: []const u8, result: []const u8) void {
+            emit(&.{ "copyedges", hexOf(name), result });
+        }
+    };
+
+    // copyTo into a read-only directory
+    {
+        const src = fsx.openRegular(fsx.cwd, "src", false) catch unreachable;
+        defer sys.close(src.fd);
+        const out = fsx.copyTo(src.fd, src.stat, ro_dir, "new");
+        if (out) |fd| {
+            sys.close(fd);
+            case.emitCase("copy-ro", "OK");
+        } else |e| {
+            case.emitCase("copy-ro", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // copyTo onto a symlink: the documented refusal
+    {
+        const src = fsx.openRegular(fsx.cwd, "src", false) catch unreachable;
+        defer sys.close(src.fd);
+        const out = fsx.copyTo(src.fd, src.stat, dir, "dst-link");
+        if (out) |fd| {
+            sys.close(fd);
+            case.emitCase("copy-link", "OK");
+        } else |e| {
+            case.emitCase("copy-link", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // moveAcross over EXDEV: the copy fallback publishes and removes
+    {
+        const result = fsx.moveAcross(A, dir, "src", shm_dir, "moved", .{});
+        if (result) |_| {
+            case.emitCase("move-exdev", "OK");
+        } else |e| {
+            case.emitCase("move-exdev", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // moveAcross over EXDEV into the read-only directory
+    {
+        const result = fsx.moveAcross(A, dir, "victim2", shm_dir, "ro/moved", .{});
+        if (result) |_| {
+            case.emitCase("move-exdev-ro", "OK");
+        } else |e| {
+            case.emitCase("move-exdev-ro", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // moveAcross over EXDEV onto a symlink replaces it, as os.replace
+    {
+        const result = fsx.moveAcross(A, dir, "victim2", shm_dir, "moved-link", .{});
+        if (result) |_| {
+            case.emitCase("move-exdev-link", "OK");
+        } else |e| {
+            case.emitCase("move-exdev-link", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // a write the file-size limit stops keeps the old bytes
+    {
+        const ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+        var prev: linux.Sigaction = undefined;
+        _ = linux.sigaction(.XFSZ, &ign, &prev);
+        defer _ = linux.sigaction(.XFSZ, &prev, null);
+        var old: linux.rlimit = undefined;
+        if (linux.errno(linux.prlimit(0, .FSIZE, null, &old)) != .SUCCESS) unreachable;
+        const lim: linux.rlimit = .{ .cur = 8, .max = old.max };
+        if (linux.errno(linux.prlimit(0, .FSIZE, &lim, null)) != .SUCCESS) unreachable;
+        defer _ = linux.prlimit(0, .FSIZE, &old, null);
+        const src = fsx.openRegular(fsx.cwd, "fsize-src", false) catch unreachable;
+        defer sys.close(src.fd);
+        const out = fsx.copyTo(src.fd, src.stat, dir, "fsize-dst");
+        if (out) |fd| {
+            sys.close(fd);
+            case.emitCase("copy-fsize", "OK");
+        } else |e| {
+            case.emitCase("copy-fsize", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+
+    // a source removed after its descriptor was opened copies in full
+    {
+        const src = fsx.openRegular(fsx.cwd, "unlink-src", false) catch unreachable;
+        defer sys.close(src.fd);
+        sys.unlinkat(fsx.cwd, "unlink-src", 0) catch unreachable;
+        const out = fsx.copyTo(src.fd, src.stat, dir, "unlinked-dst");
+        if (out) |fd| {
+            sys.close(fd);
+            case.emitCase("copy-unlinked", "OK");
+        } else |e| {
+            case.emitCase("copy-unlinked", std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable);
+        }
+    }
+}
+
 fn effectsMode() void {
     // copyTo and moveAcross end with a directory fsync, so they take a
     // real descriptor rather than the AT.FDCWD alias.
@@ -433,6 +562,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         envCliMode();
     } else if (std.mem.eql(u8, mode, "errno")) {
         errnoMode();
+    } else if (std.mem.eql(u8, mode, "copyedges")) {
+        copyEdgesMode();
     } else if (std.mem.eql(u8, mode, "try-lock")) {
         tryLockMode(arg2 orelse return error.InvalidArgument);
     } else if (std.mem.eql(u8, mode, "hold-lock")) {

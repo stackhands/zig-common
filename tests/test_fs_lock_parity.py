@@ -727,6 +727,125 @@ class FsLockParity(unittest.TestCase):
         self.assertGreaterEqual(checked_text, 150, "too few errnoText cases")
         self.assertGreaterEqual(checked_frame, 90, "too few framing cases")
 
+    def test_copy_and_rename_edges(self):
+        """copyTo and moveAcross edges against shutil and os: cross-device
+        moves, a read-only destination, a symlinked destination, a
+        destination that cannot take the whole write and a source removed
+        after its descriptor was opened."""
+        if not os.path.isdir("/dev/shm"):
+            self.skipTest("no /dev/shm for a second device")
+
+        def run_edge_cases(root, other, is_probe):
+            """Both sides run the same sequence; the reference uses the
+            Python calls the tools replaced."""
+            results = {}
+
+            # the fixture the probe's copyedges mode expects in its
+            # working directory; the second-device fixture under
+            # /dev/shm the probe builds itself
+            for name, content, mode in (
+                ("src", b"move me across\n", 0o640),
+                ("victim2", b"second source\n", 0o640),
+                ("victim", b"keep me\n", 0o644),
+                ("fsize-src", b"x" * 64, 0o644),
+                ("fsize-dst", b"precious\n", 0o644),
+                ("unlink-src", b"still readable\n", 0o644),
+            ):
+                fd = os.open(os.path.join(root, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                try:
+                    os.write(fd, content)
+                finally:
+                    os.close(fd)
+                os.chmod(os.path.join(root, name), mode)
+            os.symlink("victim", os.path.join(root, "dst-link"))
+            os.mkdir(os.path.join(root, "ro"), 0o755)
+            os.chmod(os.path.join(root, "ro"), 0o555)
+            _ = other
+
+        with tempfile.TemporaryDirectory() as probe_root, tempfile.TemporaryDirectory() as python_root:
+            if os.stat(probe_root).st_dev == os.stat("/dev/shm").st_dev:
+                self.skipTest("/dev/shm is on the same device as the temporary directory")
+            shm_probe = "/dev/shm/zc-parity-copyedges-probe"
+            shm_python = "/dev/shm/zc-parity-copyedges-python"
+            for p in (shm_probe, shm_python):
+                shutil.rmtree(p, ignore_errors=True)
+                os.mkdir(p, 0o755)
+            run_edge_cases(probe_root, shm_probe, True)
+            run_edge_cases(python_root, shm_python, False)
+            try:
+                # the probe runs its cases in its own tree
+                out = run_probe("copyedges", cwd=probe_root)
+                cases = {}
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    cases[bytes.fromhex(parts[1]).decode()] = parts[2]
+
+                # the reference, mirroring the documented library
+                # behavior with the Python calls the tools replaced
+                try:
+                    fd = os.open(
+                        os.path.join(python_root, "ro", ".t.tmp"),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    )
+                except PermissionError as exc:
+                    self.assertEqual(exc.errno, errno.EACCES)
+                    self.assertEqual(cases["copy-ro"], "ERR:AccessDenied")
+                else:
+                    self.fail("read-only dir accepted a new file")
+
+                # copyTo onto a symlink: the documented refusal, where
+                # shutil.copy2 would follow the link
+                self.assertEqual(cases["copy-link"], "ERR:SymLink")
+                self.assertTrue(os.path.islink(os.path.join(python_root, "dst-link")))
+
+                # os.replace over two filesystems: EXDEV, which the
+                # documented fallback turns into a copy
+                try:
+                    os.replace(
+                        os.path.join(python_root, "src"),
+                        os.path.join(shm_python, "moved"),
+                    )
+                except OSError as exc:
+                    self.assertEqual(exc.errno, errno.EXDEV)
+
+                # moveAcross over EXDEV: os.replace refuses; the
+                # documented fallback copies, publishes and removes
+                self.assertEqual(cases["move-exdev"], "OK")
+
+                # moveAcross over EXDEV into a read-only directory
+                self.assertEqual(cases["move-exdev-ro"], "ERR:AccessDenied")
+
+                # moveAcross over EXDEV onto a symlink replaces it, as
+                # os.replace would on one filesystem
+                self.assertEqual(cases["move-exdev-link"], "OK")
+                self.assertFalse(os.path.islink(os.path.join(shm_probe, "moved-link")))
+
+                # a write the file-size limit stops keeps the old bytes
+                # and leaves no temporary behind; EFBIG is not in the
+                # named error set and surfaces as Unexpected
+                self.assertEqual(cases["copy-fsize"], "ERR:Unexpected")
+                with open(os.path.join(probe_root, "fsize-dst"), "rb") as f:
+                    self.assertEqual(f.read(), b"precious\n")
+
+                # a source removed after its descriptor was opened still
+                # copies in full, as the open descriptor keeps the data
+                self.assertEqual(cases["copy-unlinked"], "OK")
+                with open(os.path.join(probe_root, "unlinked-dst"), "rb") as f:
+                    self.assertEqual(f.read(), b"still readable\n")
+
+                # the cross-device move published the source's bytes and
+                # mode, and removed the source
+                with open(os.path.join(shm_probe, "moved"), "rb") as f:
+                    self.assertEqual(f.read(), b"move me across\n")
+                self.assertEqual(stat.S_IMODE(os.stat(os.path.join(shm_probe, "moved")).st_mode), 0o640)
+                self.assertFalse(os.path.exists(os.path.join(probe_root, "src")))
+            finally:
+                for p in (shm_probe, shm_python):
+                    ro = os.path.join(p, "ro")
+                    if os.path.isdir(ro):
+                        os.chmod(ro, 0o755)
+                    shutil.rmtree(p, ignore_errors=True)
+
     def assert_trees_equal(self, a, b):
         root_a, root_b = os.fsencode(a), os.fsencode(b)
         names_a = sorted(os.listdir(root_a))
