@@ -325,9 +325,10 @@ pub const RootLock = struct {
     /// a symbolic link there is NotDir. Each lock file is opened relative to
     /// that descriptor with O_NOFOLLOW, created mode 0600, only when its name
     /// is absent or a regular file of this user with one link, and its
-    /// descriptor must be that file. The gate is checked again once both
-    /// locks are held, right before it is truncated. Allocates nothing;
-    /// `gpa` stays for source compatibility.
+    /// descriptor must be that file. An accepted descriptor is tightened to
+    /// mode 0600. The gate is checked again once both locks are held, right
+    /// before it is truncated. Allocates nothing; `gpa` stays for source
+    /// compatibility.
     pub fn acquire(gpa: Allocator, state_root: []const u8, timeout_ms: ?u32) AcquireError!RootLock {
         _ = gpa;
         const atomic = @import("atomic.zig");
@@ -366,7 +367,10 @@ pub const RootLock = struct {
             else => |e| return e,
         });
         errdefer sys.close(fd);
-        if (try isSoleLink(dir, name, fd)) return fd;
+        if (try isSoleLink(dir, name, fd)) {
+            try sys.fchmod(fd, 0o600);
+            return fd;
+        }
         sys.close(fd);
         return null;
     }
