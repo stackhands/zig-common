@@ -479,6 +479,7 @@ fn keep(i: usize, bytes: []const u8, out: *std.ArrayList(u8), err_buf: *std.Arra
 /// then reaps the child and its status is lost, which is `error.NoChild`.
 pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp, opts: Options) Error!Result {
     if (exe.len == 0 or exe[0] != '/') return error.NotAbsolute;
+    if (argv.len == 0) return error.InvalidArgument;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -794,6 +795,11 @@ test "groupAlive stays true for a live group while signals arrive" {
 test "run refuses a relative program" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.NotAbsolute, run(gpa, "sh", &.{"sh"}, no_env, .{}));
+}
+
+test "run rejects an empty argv" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidArgument, run(gpa, "/bin/true", &.{}, no_env, .{}));
 }
 
 /// Run `body` in a forked child, which may close the descriptors the test
