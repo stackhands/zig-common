@@ -492,6 +492,29 @@ test "an earlier duplicate that cannot decode is dropped" {
     try std.testing.expectEqualStrings("kept", py.dict[0].value.str);
 }
 
+test "a raw byte in a dropped duplicate still refuses the document" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // the strict consumers decode the whole text before json.loads, so
+    // the raw byte refuses the document even in the member the
+    // duplicates rule drops
+    const v = try parse(a, "{\"k\": \"kept\", \"d\": \"a\x80b\", \"d\": \"kept\"}");
+    try std.testing.expectError(error.Encoding, toPy(a, v));
+
+    // a lone surrogate escape in a dropped member stays dropped, as
+    // json.loads keeps the last value and never carries it
+    const v2 = try parse(a, "{\"k\": \"kept\", \"d\": \"\\ud800\", \"d\": \"kept\"}");
+    const py2 = try toPy(a, v2);
+    try std.testing.expectEqual(@as(usize, 2), py2.dict.len);
+
+    // a raw byte in the key of an object nested in a dropped member
+    // refuses the same way
+    const v3 = try parse(a, "{\"d\": {\"a\x80\": 1}, \"d\": 1}");
+    try std.testing.expectError(error.Encoding, toPy(a, v3));
+}
+
 test "parse objects, duplicates and nesting" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -575,6 +598,29 @@ pub const Py = union(enum) {
     }
 };
 
+/// The raw bytes of a dropped member's value must still be valid
+/// UTF-8, as the consumers decode the whole document strictly before
+/// json.loads; escapes are ASCII and stay fine, so only a raw byte
+/// that is not UTF-8 refuses here.
+fn validateRawStrings(v: Value) error{Encoding}!void {
+    switch (v) {
+        .string => |raw| {
+            var i: usize = 0;
+            while (i < raw.len) {
+                const ch = text.nextChar(raw[i..]);
+                if (ch.cp == null) return error.Encoding;
+                i += ch.len;
+            }
+        },
+        .array => |items| for (items) |it| try validateRawStrings(it),
+        .object => |members| for (members) |mem| {
+            try validateRawStrings(.{ .string = mem.key });
+            try validateRawStrings(mem.value);
+        },
+        else => {},
+    }
+}
+
 /// A number as json.loads reads it: an int when the text has no fraction or
 /// exponent, a float otherwise. An int that does not fit an i64, which
 /// Python keeps exact, cannot be represented and is an error, not a
@@ -620,7 +666,14 @@ pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
             }
             var m: std.StringArrayHashMapUnmanaged(Py) = .empty;
             for (members, 0..) |mem, i| {
-                if (!kept[i]) continue;
+                if (!kept[i]) {
+                    // The strict consumers decode the whole text before
+                    // json.loads, so a raw byte that is not UTF-8
+                    // refuses the document even here; escapes stay
+                    // fine, the value is only dropped, not carried.
+                    try validateRawStrings(mem.value);
+                    continue;
+                }
                 try m.put(arena, keys[i], try toPy(arena, mem.value));
             }
             const out = try arena.alloc(Py.Entry, m.count());
