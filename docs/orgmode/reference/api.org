@@ -30,6 +30,7 @@ Error set: [[zig:zig_common.sys.Error]].
 | [[zig:zig_common.sys.z]]               | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.openat]]          | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.close]]           | none                          |
+| [[zig:zig_common.sys.keepAboveStdio]]  | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.read]]            | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.writeAll]]        | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.fchmod]]          | [[zig:zig_common.sys.Error]]  |
