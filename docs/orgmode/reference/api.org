@@ -123,7 +123,7 @@ Error sets: [[zig:zig_common.state.Error]], [[zig:zig_common.state.RootLock.Acqu
 | Function                                    | Error set                                         |
 |---------------------------------------------+---------------------------------------------------|
 | [[zig:zig_common.state.RootLock.acquire]]   | [[zig:zig_common.state.RootLock.AcquireError]]    |
-| [[zig:zig_common.state.RootLock.release]]   | none                                              |
+| [[zig:zig_common.state.RootLock.release]]   | [[zig:zig_common.state.Error]]                    |
 | [[zig:zig_common.state.privateOk]]          | none                                              |
 | [[zig:zig_common.state.openPrivate]]        | [[zig:zig_common.state.Error]]                    |
 | [[zig:zig_common.state.lockExclusive]]      | [[zig:zig_common.state.LockError]]                |
