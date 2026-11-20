@@ -68,11 +68,14 @@ pub const LockError = Error || error{TimedOut};
 pub const LockCancelError = LockError || error{Canceled};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
-/// The deadline is read from the monotonic clock. A signal that cuts a
-/// sleep short does not consume the whole wait: the next check looks at
-/// the clock again. A failure other than contention is the flock error,
-/// with its errno in `sys.last_errno`.
-pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
+/// The timeout is u64 milliseconds, wide enough for the seconds callers
+/// like flock -w take: the largest a tool passes is 999_999_999 seconds,
+/// whose milliseconds a u32 could not hold. The deadline is read from
+/// the monotonic clock. A signal that cuts a sleep short does not
+/// consume the whole wait: the next check looks at the clock again. A
+/// failure other than contention is the flock error, with its errno in
+/// `sys.last_errno`.
+pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u64) LockError!void {
     return lockExclusiveCancel(fd, timeout_ms, null) catch |err| switch (err) {
         error.Canceled => unreachable,
         else => |e| return e,
@@ -81,8 +84,8 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
 
 /// Like `lockExclusive`, also stopping with `error.Canceled` if `cancel`
 /// becomes true while waiting.
-pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
-    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
+pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u64, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
+    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + @as(i64, @intCast(ms)) else null;
     if (deadline == null and cancel == null) {
         _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
         return;
@@ -244,11 +247,50 @@ test "lockExclusive waits out the timeout while signals arrive" {
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
-    for ([_]?u32{ null, 0, 50 }) |timeout| {
+    for ([_]?u64{ null, 0, 50 }) |timeout| {
         sys.last_errno = .SUCCESS;
         try std.testing.expectError(error.InvalidArgument, lockExclusive(-1, timeout));
         try std.testing.expectEqualStrings("[Errno 9] Bad file descriptor", sys.describe(error.InvalidArgument));
     }
+}
+
+test "lockExclusive takes the timeout flock -w seconds give" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-locku64-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+
+    // the 999_999_999 seconds a tool may pass, as milliseconds: wider
+    // than a u32 holds, and with the lock free it returns at once
+    const fd1 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    defer sys.close(fd1);
+    try lockExclusive(fd1, 999_999_999 * std.time.ms_per_s);
+
+    // with the lock held, a timeout past u32 range still waits for the
+    // release instead of wrapping to a deadline already past
+    const fd2 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    const Holder = struct {
+        var fd: fsx.fd_t = -1;
+        fn letGo() void {
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            _ = linux.flock(fd, std.posix.LOCK.UN);
+        }
+    };
+    Holder.fd = fd1;
+    const thread = try std.Thread.spawn(.{}, Holder.letGo, .{});
+    thread.join();
+    try lockExclusive(fd2, 500_000_000 * std.time.ms_per_s);
+    _ = linux.flock(fd2, std.posix.LOCK.UN);
 }
 
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
@@ -637,7 +679,7 @@ test "lockExclusive covers timeout 0, bounded timeout, and unsupported flock" {
     lock_ops.flock = Hooks.fail;
     for ([_]linux.E{ .OPNOTSUPP, .NOSYS }) |e| {
         Hooks.err_code = e;
-        for ([_]?u32{ null, 0, 25 }) |timeout| {
+        for ([_]?u64{ null, 0, 25 }) |timeout| {
             sys.last_errno = .SUCCESS;
             try std.testing.expectError(error.Unsupported, lockExclusive(fd2, timeout));
             try std.testing.expectEqual(e, sys.last_errno);
