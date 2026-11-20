@@ -23,6 +23,9 @@ pub const UnknownMode = enum {
     collect,
     /// Ignore unknown options and extra tokens without error.
     ignore,
+    /// Treat unrecognized option-like tokens as positional arguments while
+    /// still rejecting positionals past the declared slots.
+    positional,
 };
 
 /// How a bare `--` token is treated while scanning options.
@@ -141,6 +144,10 @@ pub const PositionalArity = enum {
     required_one,
     /// Zero or one optional positional argument (`nargs="?"`).
     optional_one,
+    /// Zero or more positional arguments, intermixed with options (`nargs="*"`).
+    zero_or_more,
+    /// One or more positional arguments, intermixed with options (`nargs="+"`).
+    one_or_more,
     /// Capture `--` or the first non-option token and everything after (`argparse.REMAINDER`).
     remainder,
 };
@@ -153,6 +160,8 @@ pub const PositionalSpec = struct {
     arity: PositionalArity = .required_one,
     /// Optional static set of allowed values, validated eagerly on parse.
     choices: ?[]const []const u8 = null,
+    /// Skip empty (`""`) positional tokens instead of filling this slot.
+    ignore_empty: bool = false,
 };
 
 /// Subcommand binding a command name to its own `CommandSpec`.
@@ -571,14 +580,30 @@ fn validateOptionValue(
     return null;
 }
 
+fn positionalSpecAt(spec: *const CommandSpec, pos_index: usize) ?PositionalSpec {
+    var slot: usize = 0;
+    for (spec.positionals) |p| {
+        switch (p.arity) {
+            .remainder => continue,
+            .zero_or_more, .one_or_more => {
+                if (pos_index >= slot) return p;
+            },
+            .required_one, .optional_one => {
+                if (pos_index == slot) return p;
+                slot += 1;
+            },
+        }
+    }
+    return null;
+}
+
 fn validatePositionalChoice(
     gpa: Allocator,
     spec: *const CommandSpec,
     pos_index: usize,
     val: []const u8,
 ) Allocator.Error!?ParseOutcome {
-    if (pos_index >= spec.positionals.len) return null;
-    const p = spec.positionals[pos_index];
+    const p = positionalSpecAt(spec, pos_index) orelse return null;
     const allowed = p.choices orelse return null;
     for (allowed) |c| {
         if (std.mem.eql(u8, c, val)) return null;
@@ -693,6 +718,24 @@ fn hasRemainder(spec: *const CommandSpec) bool {
     return false;
 }
 
+fn hasVariadicPositional(spec: *const CommandSpec) bool {
+    for (spec.positionals) |p| {
+        if (p.arity == .zero_or_more or p.arity == .one_or_more) return true;
+    }
+    return false;
+}
+
+fn ignoresEmptyAt(spec: *const CommandSpec, pos_index: usize) bool {
+    var slot: usize = 0;
+    for (spec.positionals) |p| {
+        if (p.arity == .remainder) return false;
+        if (p.arity == .zero_or_more or p.arity == .one_or_more) return p.ignore_empty;
+        if (slot == pos_index) return p.ignore_empty;
+        slot += 1;
+    }
+    return false;
+}
+
 fn nonRemainderPositionals(spec: *const CommandSpec) usize {
     var n: usize = 0;
     for (spec.positionals) |p| if (p.arity != .remainder) {
@@ -708,6 +751,7 @@ fn checkUnrecognized(
     leftovers: []const Leftover,
     consumed_positionals: usize,
     keep_separator: bool,
+    variadic: bool,
 ) Allocator.Error!?ParseOutcome {
     var all: std.ArrayList([]const u8) = .empty;
     defer all.deinit(gpa);
@@ -725,7 +769,7 @@ fn checkUnrecognized(
         if (item.is_separator and !dropped) {
             const adjacent_after = last_consumed_argv != null and item.argv_index == last_consumed_argv.? + 1;
             const optional_empty = consumed_positionals == 0 and !keep_separator and last_consumed_argv == null;
-            if (consumed > 0 or adjacent_after or optional_empty) {
+            if (variadic or consumed > 0 or adjacent_after or optional_empty) {
                 dropped = true;
                 continue;
             }
@@ -835,6 +879,7 @@ fn parseCommand(
             }
             try leftovers.append(gpa, .{ .token = "--", .is_positional = false, .is_separator = true, .argv_index = i });
             for (argv[i + 1 ..], 0..) |p, pi| {
+                if (p.len == 0 and ignoresEmptyAt(spec, pos.items.len)) continue;
                 if (try validatePositionalChoice(gpa, spec, pos.items.len, p)) |err_out| {
                     gpa.free(opt_seen);
                     gpa.free(opt_values);
@@ -1122,6 +1167,7 @@ fn parseCommand(
                 remainder = argv[i..];
                 break;
             }
+            if (arg.len == 0 and ignoresEmptyAt(spec, pos.items.len)) continue;
             if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
                 gpa.free(opt_seen);
                 gpa.free(opt_values);
@@ -1134,6 +1180,17 @@ fn parseCommand(
         }
 
         // 5. Unrecognized option-like token.
+        if (spec.policy.unknown == .positional) {
+            if (try validatePositionalChoice(gpa, spec, pos.items.len, arg)) |err_out| {
+                gpa.free(opt_seen);
+                gpa.free(opt_values);
+                own_state = false;
+                return err_out;
+            }
+            try pos.append(gpa, arg);
+            try leftovers.append(gpa, .{ .token = arg, .is_positional = true, .argv_index = i });
+            continue;
+        }
         try leftovers.append(gpa, .{ .token = arg, .is_positional = false, .argv_index = i });
     }
 
@@ -1213,7 +1270,7 @@ fn parseCommand(
     }
     var req_pos_count: usize = 0;
     for (spec.positionals) |p| {
-        if (p.arity == .required_one) {
+        if (p.arity == .required_one or p.arity == .one_or_more) {
             if (pos.items.len <= req_pos_count) {
                 try missing_names.append(gpa, try gpa.dupe(u8, p.name));
             }
@@ -1234,11 +1291,12 @@ fn parseCommand(
     }
 
     // Check merged unrecognized arguments unless unknown tokens are ignored.
-    if (spec.policy.unknown == .collect) {
+    if (spec.policy.unknown != .ignore) {
+        const variadic = hasVariadicPositional(spec);
         const pos_slots = nonRemainderPositionals(spec);
-        const consumed_pos = @min(pos.items.len, pos_slots);
-        const keep_sep = pos_slots == 0 and !is_remainder;
-        if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep)) |err_out| {
+        const consumed_pos = if (variadic) pos.items.len else @min(pos.items.len, pos_slots);
+        const keep_sep = !variadic and pos_slots == 0 and !is_remainder;
+        if (try checkUnrecognized(gpa, top_spec, top_extra, leftovers.items, consumed_pos, keep_sep, variadic)) |err_out| {
             gpa.free(opt_seen);
             gpa.free(opt_values);
             own_state = false;

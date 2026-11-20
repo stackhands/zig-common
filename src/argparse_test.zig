@@ -493,3 +493,146 @@ test "differential regressions: registered short option with spaces and non-adja
         try std.testing.expectEqualStrings("unrecognized arguments: -- --", out.usage_error.message);
     }
 }
+
+test "variadic positional arities zero_or_more and one_or_more" {
+    const gpa = std.testing.allocator;
+
+    const star_spec: argparse.CommandSpec = .{
+        .prog = "star",
+        .usage = "usage: star [--json] [files ...]\n",
+        .help = "usage: star\n",
+        .options = &.{.{ .name = "json", .kind = .flag }},
+        .positionals = &.{.{ .name = "files", .arity = .zero_or_more }},
+    };
+    const plus_spec: argparse.CommandSpec = .{
+        .prog = "plus",
+        .usage = "usage: plus [--json] first rest...\n",
+        .help = "usage: plus\n",
+        .options = &.{.{ .name = "json", .kind = .flag }},
+        .positionals = &.{
+            .{ .name = "first", .arity = .required_one },
+            .{ .name = "rest", .arity = .one_or_more, .choices = &.{ "a", "b", "c" } },
+        },
+    };
+
+    // zero_or_more accepts zero, one, or many intermixed with flags and --
+    {
+        var out = try argparse.parse(gpa, &star_spec, &.{});
+        defer out.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), out.ok.positionals.len);
+    }
+    {
+        var out = try argparse.parse(gpa, &star_spec, &.{ "f1", "--json", "f2", "--", "--flag" });
+        defer out.deinit(gpa);
+        try std.testing.expect(out.ok.seen("json"));
+        try std.testing.expectEqual(@as(usize, 3), out.ok.positionals.len);
+        try std.testing.expectEqualStrings("f1", out.ok.positionals[0]);
+        try std.testing.expectEqualStrings("f2", out.ok.positionals[1]);
+        try std.testing.expectEqualStrings("--flag", out.ok.positionals[2]);
+    }
+    {
+        var out = try argparse.parse(gpa, &star_spec, &.{ "f1", "--json", "--" });
+        defer out.deinit(gpa);
+        try std.testing.expect(out.ok.seen("json"));
+        try std.testing.expectEqual(@as(usize, 1), out.ok.positionals.len);
+        try std.testing.expectEqualStrings("f1", out.ok.positionals[0]);
+    }
+
+    // required_one + one_or_more requires at least two positionals and validates choices on all variadic slots
+    {
+        var out = try argparse.parse(gpa, &plus_spec, &.{});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("the following arguments are required: first, rest", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &plus_spec, &.{"x"});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("the following arguments are required: rest", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &plus_spec, &.{ "x", "a", "--json", "c" });
+        defer out.deinit(gpa);
+        try std.testing.expect(out.ok.seen("json"));
+        try std.testing.expectEqual(@as(usize, 3), out.ok.positionals.len);
+        try std.testing.expectEqualStrings("x", out.ok.positionals[0]);
+        try std.testing.expectEqualStrings("a", out.ok.positionals[1]);
+        try std.testing.expectEqualStrings("c", out.ok.positionals[2]);
+    }
+    {
+        var out = try argparse.parse(gpa, &plus_spec, &.{ "x", "a", "bad" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("argument rest: invalid choice: 'bad' (choose from 'a', 'b', 'c')", out.usage_error.message);
+    }
+}
+
+test "UnknownMode.positional routes unknown dash tokens to positionals and rejects overflow" {
+    const gpa = std.testing.allocator;
+
+    const failed_spec: argparse.CommandSpec = .{
+        .prog = "tool failed",
+        .usage = "usage: tool failed [--syslog TARGET] STATUS NAME LOGDIR [TMP]\n",
+        .help = "usage: tool failed\n",
+        .add_help = false,
+        .policy = .{
+            .allow_abbrev = false,
+            .unknown = .positional,
+            .double_dash = .ignore,
+            .negative_numbers = .never,
+            .short_clusters = false,
+        },
+        .options = &.{
+            .{ .name = "syslog", .kind = .value },
+        },
+        .positionals = &.{
+            .{ .name = "STATUS", .arity = .required_one },
+            .{ .name = "NAME", .arity = .required_one },
+            .{ .name = "LOGDIR", .arity = .required_one },
+            .{ .name = "TMP", .arity = .optional_one },
+        },
+    };
+
+    // Unknown dash tokens like -1 and --bogus become positionals.
+    {
+        var out = try argparse.parse(gpa, &failed_spec, &.{ "-1", "Foo", "--bogus", "--syslog", "udp://127.0.0.1:514" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("udp://127.0.0.1:514", out.ok.value("syslog").?);
+        try std.testing.expectEqual(@as(usize, 3), out.ok.positionals.len);
+        try std.testing.expectEqualStrings("-1", out.ok.positionals[0]);
+        try std.testing.expectEqualStrings("Foo", out.ok.positionals[1]);
+        try std.testing.expectEqualStrings("--bogus", out.ok.positionals[2]);
+    }
+    // Positionals beyond the four declared slots are still rejected.
+    {
+        var out = try argparse.parse(gpa, &failed_spec, &.{ "1", "Foo", "dir", "tmp", "--extra" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: --extra", out.usage_error.message);
+    }
+}
+
+test "argparse: PositionalSpec.ignore_empty skips empty tokens only while slot is unfilled" {
+    const gpa = std.testing.allocator;
+    const spec: argparse.CommandSpec = .{
+        .prog = "tool",
+        .usage = "usage: tool FILE\n",
+        .help = "usage: tool FILE\n",
+        .add_help = false,
+        .positionals = &.{
+            .{ .name = "FILE", .arity = .required_one, .ignore_empty = true },
+        },
+    };
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "", "a.log" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("a.log", out.ok.positional(0).?);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{""});
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("the following arguments are required: FILE", out.usage_error.message);
+    }
+    {
+        var out = try argparse.parse(gpa, &spec, &.{ "a.log", "" });
+        defer out.deinit(gpa);
+        try std.testing.expectEqualStrings("unrecognized arguments: ", out.usage_error.message);
+    }
+}
