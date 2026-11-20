@@ -179,6 +179,148 @@ const prolog_spec: argparse.CommandSpec = .{
     },
 };
 
+const intermixed_spec: argparse.CommandSpec = .{
+    .prog = "imix",
+    .usage = "usage: imix [-h] [--json] [--prefix PREFIX] first files [files ...]\n",
+    .help =
+    \\usage: imix [-h] [--json] [--prefix PREFIX] first files [files ...]
+    \\
+    \\positional arguments:
+    \\  first
+    \\  files
+    \\
+    \\options:
+    \\  -h, --help       show this help message and exit
+    \\  --json
+    \\  --prefix PREFIX
+    \\
+    ,
+    .options = &.{
+        .{ .name = "json", .kind = .flag },
+        .{ .name = "prefix", .kind = .value },
+    },
+    .positionals = &.{
+        .{ .name = "first", .arity = .required_one },
+        .{ .name = "files", .arity = .one_or_more },
+    },
+};
+
+const native_rotate_spec: argparse.CommandSpec = .{
+    .prog = "native rotate",
+    .usage = "usage: native rotate\n",
+    .help = "usage: native rotate\n",
+    .add_help = false,
+    .policy = .native_exact,
+    .options = &.{
+        .{ .name = "dry-run", .kind = .flag },
+        .{ .name = "compress-after", .kind = .value },
+        .{ .name = "target", .kind = .value, .allow_empty = false },
+        .{ .name = "module", .kind = .value, .allow_empty = false, .allow_dash_value = false },
+    },
+    .positionals = &.{
+        .{ .name = "ROOT", .arity = .required_one },
+    },
+};
+
+const native_failed_spec: argparse.CommandSpec = .{
+    .prog = "native failed",
+    .usage = "usage: native failed\n",
+    .help = "usage: native failed\n",
+    .add_help = false,
+    .policy = .{
+        .allow_abbrev = false,
+        .unknown = .positional,
+        .double_dash = .ignore,
+        .negative_numbers = .any,
+        .short_clusters = false,
+        .special_action = .immediate_exit,
+        .flag_explicit_as_unknown = true,
+        .unknown_before_required = true,
+        .fail_fast = true,
+    },
+    .options = &.{
+        .{ .name = "syslog", .kind = .value },
+    },
+    .positionals = &.{
+        .{ .name = "STATUS", .arity = .required_one },
+        .{ .name = "NAME", .arity = .required_one },
+        .{ .name = "LOGDIR", .arity = .required_one },
+        .{ .name = "TMP", .arity = .optional_one },
+    },
+};
+
+const native_used_spec: argparse.CommandSpec = .{
+    .prog = "native used",
+    .usage = "usage: native used\n",
+    .help = "usage: native used\n",
+    .add_help = false,
+    .policy = .native_exact,
+    .options = &.{
+        .{ .name = "json", .kind = .flag },
+        .{ .name = "prefix", .kind = .value, .required = true, .allow_empty = false, .allow_dash_value = false },
+    },
+    .positionals = &.{
+        .{ .name = "FILE", .arity = .one_or_more },
+    },
+};
+
+const native_prescan_spec: argparse.CommandSpec = .{
+    .prog = "native prescan",
+    .usage = "usage: native prescan\n",
+    .help = "prescan help\n",
+    .version = "prescan 1.0\n",
+    .add_help = true,
+    .policy = .{
+        .allow_abbrev = false,
+        .unknown = .collect,
+        .double_dash = .ignore,
+        .negative_numbers = .any,
+        .short_clusters = false,
+        .special_action = .prescan,
+        .flag_explicit_as_unknown = true,
+        .unknown_before_required = true,
+        .fail_fast = true,
+    },
+    .options = &.{
+        .{ .name = "format", .kind = .value, .allow_empty = false },
+    },
+    .positionals = &.{
+        .{ .name = "RUN", .arity = .required_one, .ignore_empty = true },
+    },
+};
+
+const native_mutex_spec: argparse.CommandSpec = .{
+    .prog = "native mutex",
+    .usage = "usage: native mutex\n",
+    .help = "usage: native mutex\n",
+    .add_help = false,
+    .policy = .native_exact,
+    .options = &.{
+        .{ .name = "unused", .kind = .flag },
+        .{ .name = "active", .kind = .flag },
+        .{ .name = "json", .kind = .flag },
+    },
+    .mutually_exclusive = &.{.{ .options = &.{ "unused", "active" } }},
+    .positionals = &.{
+        .{ .name = "FILE", .arity = .one_or_more },
+    },
+};
+
+const native_spec: argparse.CommandSpec = .{
+    .prog = "native",
+    .usage = "usage: native\n",
+    .help = "native help\n",
+    .version = "native 1.0\n",
+    .policy = .native_exact,
+    .subcommands = &.{
+        .{ .name = "rotate", .command = &native_rotate_spec },
+        .{ .name = "failed", .command = &native_failed_spec },
+        .{ .name = "used", .command = &native_used_spec },
+        .{ .name = "prescan", .command = &native_prescan_spec },
+        .{ .name = "mutex", .command = &native_mutex_spec },
+    },
+};
+
 fn appendHex(out: *std.ArrayList(u8), gpa: std.mem.Allocator, bytes: []const u8) !void {
     const digits = "0123456789abcdef";
     try out.append(gpa, '"');
@@ -278,6 +420,95 @@ fn formatParsedProlog(out: *std.ArrayList(u8), gpa: std.mem.Allocator, p: *const
     try out.appendSlice(gpa, "}\n");
 }
 
+fn formatParsedIntermixed(out: *std.ArrayList(u8), gpa: std.mem.Allocator, p: *const argparse.Parsed) !void {
+    try out.print(gpa, "{{\"kind\":\"ok\",\"json\":{s},\"prefix\":", .{if (p.seen("json")) "true" else "false"});
+    try appendOptHex(out, gpa, p.value("prefix"));
+    try out.appendSlice(gpa, ",\"first\":");
+    try appendOptHex(out, gpa, p.positional(0));
+    try out.appendSlice(gpa, ",\"files\":");
+    const rest: []const []const u8 = if (p.positionals.len > 1) p.positionals[1..] else &.{};
+    try appendHexList(out, gpa, rest);
+    try out.appendSlice(gpa, "}\n");
+}
+
+fn formatParsedNative(out: *std.ArrayList(u8), gpa: std.mem.Allocator, p: *const argparse.Parsed) !void {
+    const sub_name = p.subcommand_name orelse "";
+    const sub = p.subcommand().?;
+    try out.print(gpa, "{{\"kind\":\"ok\",\"command\":\"{s}\"", .{sub_name});
+    if (std.mem.eql(u8, sub_name, "rotate")) {
+        try out.print(gpa, ",\"dry_run\":{s},\"compress_after\":", .{if (sub.seen("dry-run")) "true" else "false"});
+        try appendOptHex(out, gpa, sub.value("compress-after"));
+        try out.appendSlice(gpa, ",\"target\":");
+        try appendOptHex(out, gpa, sub.value("target"));
+        try out.appendSlice(gpa, ",\"module\":");
+        try appendOptHex(out, gpa, sub.value("module"));
+        try out.appendSlice(gpa, ",\"root\":");
+        try appendOptHex(out, gpa, sub.positional(0));
+    } else if (std.mem.eql(u8, sub_name, "failed")) {
+        try out.appendSlice(gpa, ",\"syslog\":");
+        try appendOptHex(out, gpa, sub.value("syslog"));
+        try out.appendSlice(gpa, ",\"pos\":");
+        try appendHexList(out, gpa, sub.positionals);
+    } else if (std.mem.eql(u8, sub_name, "used")) {
+        try out.print(gpa, ",\"json\":{s},\"prefix\":", .{if (sub.seen("json")) "true" else "false"});
+        try appendOptHex(out, gpa, sub.value("prefix"));
+        try out.appendSlice(gpa, ",\"files\":");
+        try appendHexList(out, gpa, sub.positionals);
+    } else if (std.mem.eql(u8, sub_name, "prescan")) {
+        try out.appendSlice(gpa, ",\"format\":");
+        try appendOptHex(out, gpa, sub.value("format"));
+        try out.appendSlice(gpa, ",\"run\":");
+        try appendOptHex(out, gpa, sub.positional(0));
+    } else if (std.mem.eql(u8, sub_name, "mutex")) {
+        try out.print(gpa, ",\"unused\":{s},\"active\":{s},\"json\":{s},\"files\":", .{
+            if (sub.seen("unused")) "true" else "false",
+            if (sub.seen("active")) "true" else "false",
+            if (sub.seen("json")) "true" else "false",
+        });
+        try appendHexList(out, gpa, sub.positionals);
+    }
+    try out.appendSlice(gpa, "}\n");
+}
+
+fn formatNativeError(out: *std.ArrayList(u8), gpa: std.mem.Allocator, uerr: *const argparse.UsageError) !void {
+    try out.print(gpa, "{{\"kind\":\"usage_error\",\"exit_code\":{d},\"err_kind\":\"{s}\"", .{
+        uerr.exit_code,
+        @tagName(uerr.kind),
+    });
+    switch (uerr.kind) {
+        .missing_subcommand => {},
+        .unknown_subcommand,
+        .unknown_option,
+        .extra_positional,
+        .missing_value,
+        .ambiguous_option,
+        .missing_required,
+        => |tok| {
+            try out.appendSlice(gpa, ",\"token\":");
+            try appendHex(out, gpa, tok);
+        },
+        .unexpected_value => |uv| {
+            try out.appendSlice(gpa, ",\"option\":");
+            try appendHex(out, gpa, uv.option);
+            try out.appendSlice(gpa, ",\"value\":");
+            try appendHex(out, gpa, uv.value);
+        },
+        .invalid_value => |iv| {
+            try out.appendSlice(gpa, ",\"name\":");
+            try appendHex(out, gpa, iv.name);
+            try out.appendSlice(gpa, ",\"value\":");
+            try appendHex(out, gpa, iv.value);
+        },
+        .mutually_exclusive => |me| {
+            try out.appendSlice(gpa, ",\"option\":");
+            try appendHex(out, gpa, me.option);
+            try out.appendSlice(gpa, ",\"conflict\":");
+            try appendHex(out, gpa, me.conflict);
+        },
+    }
+    try out.appendSlice(gpa, "}\n");
+}
+
 fn readAllStdin(gpa: std.mem.Allocator) ![]u8 {
     var data: std.ArrayList(u8) = .empty;
     errdefer data.deinit(gpa);
@@ -340,7 +571,16 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const is_prolog = std.mem.eql(u8, mode, "prolog");
-        const spec = if (is_prolog) &prolog_spec else &py314_spec;
+        const is_intermixed = std.mem.eql(u8, mode, "intermixed");
+        const is_native = std.mem.eql(u8, mode, "native");
+        const spec = if (is_prolog)
+            &prolog_spec
+        else if (is_intermixed)
+            &intermixed_spec
+        else if (is_native)
+            &native_spec
+        else
+            &py314_spec;
         var outcome = try argparse.parse(gpa, spec, argv.items);
         defer outcome.deinit(gpa);
 
@@ -348,6 +588,10 @@ pub fn main(init: std.process.Init) !void {
             .ok => |*p| {
                 if (is_prolog) {
                     try formatParsedProlog(&out, gpa, p);
+                } else if (is_intermixed) {
+                    try formatParsedIntermixed(&out, gpa, p);
+                } else if (is_native) {
+                    try formatParsedNative(&out, gpa, p);
                 } else {
                     try formatParsedPy314(&out, gpa, p);
                 }
@@ -358,11 +602,15 @@ pub fn main(init: std.process.Init) !void {
                 try out.appendSlice(gpa, "}\n");
             },
             .usage_error => |*uerr| {
-                const stderr_txt = try uerr.formatStderr(gpa);
-                defer gpa.free(stderr_txt);
-                try out.print(gpa, "{{\"kind\":\"usage_error\",\"exit_code\":{d},\"stderr\":", .{uerr.exit_code});
-                try appendHex(&out, gpa, stderr_txt);
-                try out.appendSlice(gpa, "}\n");
+                if (is_native) {
+                    try formatNativeError(&out, gpa, uerr);
+                } else {
+                    const stderr_txt = try uerr.formatStderr(gpa);
+                    defer gpa.free(stderr_txt);
+                    try out.print(gpa, "{{\"kind\":\"usage_error\",\"exit_code\":{d},\"stderr\":", .{uerr.exit_code});
+                    try appendHex(&out, gpa, stderr_txt);
+                    try out.appendSlice(gpa, "}\n");
+                }
             },
         }
     }
