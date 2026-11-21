@@ -412,12 +412,30 @@ const MoveFaults = struct {
     force_cross_device_rename: bool = false,
     reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
     fail_fn: ?*const fn (?*anyopaque, []const u8) ?Error = null,
+    trace_fn: ?*const fn (?*anyopaque, MoveCall) void = null,
     ctx: ?*anyopaque = null,
+};
+
+/// A rename or directory sync that moveAcross completed; the descriptor of
+/// a sync is open only while the trace runs.
+const MoveCall = union(enum) {
+    rename,
+    fsync: fd_t,
 };
 
 fn moveFaultsStep(faults: MoveFaults, step: []const u8) Error!void {
     if (faults.reach_fn) |f| f(faults.ctx, step);
     if (faults.fail_fn) |f| if (f(faults.ctx, step)) |err| return err;
+}
+
+fn moveRename(faults: MoveFaults, old_dir: fd_t, old_name: []const u8, new_dir: fd_t, new_name: []const u8) Error!void {
+    try sys.renameat(old_dir, old_name, new_dir, new_name);
+    if (faults.trace_fn) |f| f(faults.ctx, .rename);
+}
+
+fn moveFsync(faults: MoveFaults, dir: fd_t) Error!void {
+    try sys.fsync(dir);
+    if (faults.trace_fn) |f| f(faults.ctx, .{ .fsync = dir });
 }
 
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
@@ -543,24 +561,24 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     }
 
     try moveFaultsStep(faults, "move.publish");
-    try sys.renameat(dst_dir, tmp, dst_dir, dst_name);
+    try moveRename(faults, dst_dir, tmp, dst_dir, dst_name);
     published = true;
-    try sys.fsync(dst_dir);
+    try moveFsync(faults, dst_dir);
     try moveFaultsStep(faults, "move.remove-source");
     if (src.isDir()) {
         try deleteTree(gpa, src_dir, src_name);
     } else {
         try sys.unlinkat(src_dir, src_name, 0);
     }
-    try sys.fsync(src_dir);
+    try moveFsync(faults, src_dir);
 }
 
 fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
     try moveFaultsStep(faults, "move.rename");
     if (!faults.force_cross_device_rename) {
-        if (sys.renameat(src_dir, src_name, dst_dir, dst_name)) |_| {
-            try sys.fsync(dst_dir);
-            if (src_dir != dst_dir) try sys.fsync(src_dir);
+        if (moveRename(faults, src_dir, src_name, dst_dir, dst_name)) |_| {
+            try moveFsync(faults, dst_dir);
+            if (src_dir != dst_dir) try moveFsync(faults, src_dir);
             return;
         } else |err| switch (err) {
             error.CrossDevice => {},
@@ -1630,6 +1648,96 @@ const MoveProbe = struct {
         self.seen.deinit(std.testing.allocator);
     }
 };
+
+/// The renames and directory syncs one moveAcross call makes, in order. A
+/// sync is kept as the device and inode of the directory it flushed.
+const MoveTrace = struct {
+    calls: [16]Call = undefined,
+    len: usize = 0,
+
+    const Call = union(enum) {
+        rename,
+        fsync: struct { dev: u64, ino: u64 },
+    };
+
+    fn record(ctx: ?*anyopaque, call: MoveCall) void {
+        const self: *MoveTrace = @ptrCast(@alignCast(ctx.?));
+        if (self.len == self.calls.len) return;
+        self.calls[self.len] = switch (call) {
+            .rename => .rename,
+            .fsync => |fd| if (fstat(fd)) |st| .{ .fsync = .{ .dev = st.dev, .ino = st.ino } } else |_| .{ .fsync = .{ .dev = 0, .ino = 0 } },
+        };
+        self.len += 1;
+    }
+
+    fn faults(self: *MoveTrace, cross_device: bool) MoveFaults {
+        return .{ .force_cross_device_rename = cross_device, .trace_fn = record, .ctx = self };
+    }
+
+    fn sync(dir: Stat) Call {
+        return .{ .fsync = .{ .dev = dir.dev, .ino = dir.ino } };
+    }
+
+    fn expectCalls(self: *const MoveTrace, want: []const Call) !void {
+        try std.testing.expectEqualSlices(Call, want, self.calls[0..self.len]);
+    }
+};
+
+/// Scratch directory under `.zig-cache` for the moveAcross trace tests.
+const MoveScratch = struct {
+    gpa: Allocator,
+    base: []u8,
+    d: fd_t,
+
+    fn init(gpa: Allocator, tag: []const u8) !MoveScratch {
+        var cwd_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &cwd_buf);
+        const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-{s}-{d}", .{ here, tag, linux.getpid() });
+        errdefer gpa.free(base);
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+        return .{ .gpa = gpa, .base = base, .d = try openDir(cwd, base, false) };
+    }
+
+    fn deinit(self: MoveScratch) void {
+        deleteTree(self.gpa, cwd, self.base) catch {};
+        sys.close(self.d);
+        self.gpa.free(self.base);
+    }
+
+    fn put(self: MoveScratch, name: []const u8) !void {
+        const fd = try sys.openat(self.d, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+        defer sys.close(fd);
+        try sys.writeAll(fd, "moved\n");
+    }
+
+    fn expectMoved(self: MoveScratch, src: []const u8, dst: []const u8) !void {
+        try std.testing.expectError(error.NotFound, statAt(self.d, src, false));
+        const got = try openRegular(self.d, dst, false);
+        defer sys.close(got.fd);
+        const text = try readAll(self.gpa, got.fd, 64);
+        defer self.gpa.free(text);
+        try std.testing.expectEqualStrings("moved\n", text);
+    }
+};
+
+test "moveAcross traces the rename and the directory syncs that publish it" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-trace");
+    defer s.deinit();
+    const root = try fstat(s.d);
+
+    try s.put("src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "dst", .{}, renamed.faults(false));
+    try s.expectMoved("src", "dst");
+    try renamed.expectCalls(&.{ .rename, MoveTrace.sync(root) });
+
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "dst", s.d, "src", .{}, copied.faults(true));
+    try s.expectMoved("dst", "src");
+    try copied.expectCalls(&.{ .rename, MoveTrace.sync(root), MoveTrace.sync(root) });
+}
 
 test "moveAcross falls back on EXDEV and removes the source after publish" {
     const gpa = std.testing.allocator;
