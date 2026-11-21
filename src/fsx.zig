@@ -445,6 +445,14 @@ fn moveFsyncNameParent(faults: MoveFaults, dir: fd_t, name: []const u8) Error!vo
     try moveFsync(faults, parent_dir);
 }
 
+/// Whether `a_dir/a_name` and `b_dir/b_name` name entries of the same
+/// directory by the same path. False does not mean the directories differ.
+fn sameNameParent(a_dir: fd_t, a_name: []const u8, b_dir: fd_t, b_name: []const u8) bool {
+    const a = std.fs.path.dirname(a_name) orelse ".";
+    const b = std.fs.path.dirname(b_name) orelse ".";
+    return a_dir == b_dir and std.mem.eql(u8, a, b);
+}
+
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
@@ -577,7 +585,7 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     } else {
         try sys.unlinkat(src_dir, src_name, 0);
     }
-    try moveFsync(faults, src_dir);
+    try moveFsyncNameParent(faults, src_dir, src_name);
 }
 
 fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
@@ -585,7 +593,7 @@ fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_d
     if (!faults.force_cross_device_rename) {
         if (moveRename(faults, src_dir, src_name, dst_dir, dst_name)) |_| {
             try moveFsyncNameParent(faults, dst_dir, dst_name);
-            if (src_dir != dst_dir) try moveFsync(faults, src_dir);
+            if (!sameNameParent(src_dir, src_name, dst_dir, dst_name)) try moveFsyncNameParent(faults, src_dir, src_name);
             return;
         } else |err| switch (err) {
             error.CrossDevice => {},
@@ -1782,6 +1790,41 @@ test "moveAcross syncs the parent that receives a nested destination" {
     try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/copied", .{}, copied.faults(true));
     try s.expectMoved("src", "sub/copied");
     try std.testing.expect(copied.syncedAfterPublish(sub));
+}
+
+test "moveAcross syncs the source parent beside a nested destination" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-nested-src");
+    defer s.deinit();
+    const root = try fstat(s.d);
+    const sub = try s.mkdir("sub");
+    const a = try s.mkdir("a");
+
+    try s.put("src");
+    var flat = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/flat", .{}, flat.faults(false));
+    try s.expectMoved("src", "sub/flat");
+    try std.testing.expect(flat.syncedAfterPublish(sub));
+    try std.testing.expect(flat.syncedAfterPublish(root));
+
+    try s.put("a/src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/renamed", .{}, renamed.faults(false));
+    try s.expectMoved("a/src", "sub/renamed");
+    try std.testing.expect(renamed.syncedAfterPublish(sub));
+    try std.testing.expect(renamed.syncedAfterPublish(a));
+
+    try s.put("a/src");
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/copied", .{}, copied.faults(true));
+    try s.expectMoved("a/src", "sub/copied");
+    try std.testing.expect(copied.syncedAfterPublish(sub));
+    try std.testing.expect(copied.syncedAfterPublish(a));
+
+    var beside = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "sub/copied", s.d, "sub/beside", .{}, beside.faults(false));
+    try s.expectMoved("sub/copied", "sub/beside");
+    try beside.expectCalls(&.{ .rename, MoveTrace.sync(sub) });
 }
 
 test "moveAcross falls back on EXDEV and removes the source after publish" {
