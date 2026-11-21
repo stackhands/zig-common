@@ -1,1 +1,0 @@
-Prepare `zig-common` `0.11.0` in `COMPAT.md` for callers adopting `syslog`. A release is now `cog bump` on a release branch: `cog.toml` sets the version in `build.zig.zon` and refuses a version without a `COMPAT.md` row.
