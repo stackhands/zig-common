@@ -60,8 +60,9 @@ jobs:
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'
 
-  # Every tool built and tested against this commit of the library, with its
-  # pinned zig-common replaced by this checkout.
+  # Every tool's main built and tested against this commit of the library.
+  # zig build --fork puts this checkout in place of the zig-common the tool
+  # pins and leaves its build.zig.zon alone: eb-local's SBOM tests read it.
   tools:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -70,7 +71,14 @@ jobs:
       matrix:
         include:
           - repo: stackhands/eb-keep-logs
-            ref: zig
+            # tests/test_metrics.sh checks the metrics file with promtool, and
+            # the schema tests need jsonschema, as in the tool's own CI.
+            promtool: true
+          - repo: stackhands/eb-local
+            # Its command-line suite runs against the test artifact.
+            args: -Dtest-ops=true
+          - repo: stackhands/eb-staged-rebuild
+          - repo: stackhands/eessi-arch-guard
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,21 +88,30 @@ jobs:
         with:
           persist-credentials: false
           repository: ${{ matrix.repo }}
-          ref: ${{ matrix.ref }}
+          ref: main
           path: tool
+      # eb-local's command-line suite is Python, run with the version its own
+      # CI uses.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
-      - name: point the tool at this checkout
-        working-directory: tool
+      - name: Install promtool 3.7.3 and jsonschema
+        if: matrix.promtool
         run: |
-          python3 - <<'PY'
-          import re
-          p = "build.zig.zon"
-          s = open(p).read()
-          s, n = re.subn(r"\.zig_common = \.\{[^}]*\}", '.zig_common = .{ .path = "../zig-common" }', s)
-          assert n == 1, "no zig_common dependency"
-          open(p, "w").write(s)
-          PY
+          archive=prometheus-3.7.3.linux-amd64.tar.gz
+          curl -fsSLO "https://github.com/prometheus/prometheus/releases/download/v3.7.3/${archive}"
+          echo "fc9e5da126817438cf2820d9a7206c75e3122802ba8d20add3a6219a59ca6913  ${archive}" | sha256sum -c -
+          tar -xzf "${archive}"
+          sudo install -m 0755 prometheus-3.7.3.linux-amd64/promtool /usr/local/bin/promtool
+          pip install jsonschema
       - working-directory: tool
-        run: zig build test --summary all
+        env:
+          ARGS: ${{ matrix.args }}
+          # setup-zig points the local cache at the workspace root. The tools'
+          # tests make their scratch directories under ./.zig-cache, as a
+          # checkout of the tool alone has it, so the cache goes back there.
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/tool/.zig-cache
+        run: zig build $ARGS test --summary all --fork="$GITHUB_WORKSPACE/zig-common"
