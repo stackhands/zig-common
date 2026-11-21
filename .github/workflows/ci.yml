@@ -56,6 +56,11 @@ jobs:
           fi
           zig build tempdir-probe
           python3 tests/test_gettempdir_parity.py
+      - name: parity with python 3.14 argparse calls
+        run: |
+          python3 -c "import sys; assert sys.version_info >= (3, 14), 'argparse parity needs Python 3.14+; found ' + sys.version.split()[0]"
+          zig build argparse-parity-probe
+          python3 tests/test_argparse_parity.py
       - name: no site names in the tree
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'
