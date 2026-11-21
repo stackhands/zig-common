@@ -25,6 +25,28 @@ pub const GzipError = sys.Error || Allocator.Error || error{WriteFailed};
 /// A file with other hard links, a symbolic link, a non-regular file and an
 /// existing `name.gz` are refused, as gzip refuses them.
 pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) GzipError!void {
+    var failed_at: GzipStep = undefined;
+    return gzipInPlaceAtStep(gpa, io, dir, name, &failed_at);
+}
+
+/// The step of `gzipInPlaceAtStep` an error came from. Every error shares
+/// one set, so the error alone cannot say whether the log was compressed.
+pub const GzipStep = enum {
+    /// Up to renaming the archive into place and removing the original.
+    /// The original is where it was, and this call left no `name.gz`.
+    archive,
+    /// Opening the archive's directory and syncing it, after both renames.
+    /// `name.gz` is in place and the original is gone; only whether that
+    /// survives a crash is in doubt.
+    directory_sync,
+};
+
+/// `gzipInPlace`, which also sets `failed_at` to the step an error came
+/// from. It reads `.archive` until the archive is in place and the original
+/// removed, and `.directory_sync` from right before the final sync of the
+/// archive's directory.
+pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8, failed_at: *GzipStep) GzipError!void {
+    failed_at.* = .archive;
     const src = try fsx.openRegular(dir, name, false);
     defer sys.close(src.fd);
     if (src.stat.nlink > 1) return error.TooManyLinks;
@@ -109,6 +131,7 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
         return err;
     };
     done = true;
+    failed_at.* = .directory_sync;
     const parent_fd = try fsx.openDir(dir, gz_parent, true);
     defer sys.close(parent_fd);
     try sys.fsync(parent_fd);
@@ -385,4 +408,77 @@ test "gzipInPlace handles nested paths like gzip -9 sub/file" {
     try gzipInPlace(gpa, io, dir, "sub/nested.log");
     try std.testing.expectError(error.NotFound, fsx.statAt(dir, "sub/nested.log", false));
     try std.testing.expect((fsx.statAt(dir, "sub/nested.log.gz", false) catch null) != null);
+}
+
+/// A fresh directory under `.zig-cache` for one test; `buf` holds its path.
+fn testDir(buf: *[sys.path_max]u8, tag: []const u8) ![]const u8 {
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(buf, "{s}/.zig-cache/zig-common-logs-{s}-{d}", .{ here, tag, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    return base;
+}
+
+fn writeLog(dir: fsx.fd_t, name: []const u8) !void {
+    const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+    defer sys.close(fd);
+    try sys.writeAll(fd, "a log\n");
+}
+
+test "gzipInPlaceAtStep reports archive when the log is left as it was" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try testDir(&pb, "step-archive");
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "kept.log");
+    try writeLog(dir, "kept.log.gz");
+    var failed_at: GzipStep = .directory_sync;
+    try std.testing.expectError(error.Exists, gzipInPlaceAtStep(gpa, io, dir, "kept.log", &failed_at));
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+    try std.testing.expect((try fsx.statAt(dir, "kept.log", false)).isReg());
+
+    failed_at = .directory_sync;
+    try std.testing.expectError(error.NotFound, gzipInPlaceAtStep(gpa, io, dir, "missing.log", &failed_at));
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+}
+
+test "gzipInPlaceAtStep reports directory_sync when only the directory sync fails" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try testDir(&pb, "step-sync");
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    // The source and the temporary archive take the two lowest free
+    // descriptors. With the limit right above them, every step up to the
+    // removal of the original has the descriptors it needs, and the open of
+    // the directory for its sync is the first call refused one.
+    const first = try sys.openat(fsx.cwd, "/dev/null", .{}, 0);
+    const second = try sys.openat(fsx.cwd, "/dev/null", .{}, 0);
+    sys.close(first);
+    sys.close(second);
+    var saved: linux.rlimit = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prlimit(0, .NOFILE, null, &saved)));
+    const tight: linux.rlimit = .{ .cur = @intCast(second + 1), .max = saved.max };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prlimit(0, .NOFILE, &tight, null)));
+    var failed_at: GzipStep = .archive;
+    const got = gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    _ = linux.prlimit(0, .NOFILE, &saved, null);
+    try std.testing.expectError(error.Unexpected, got);
+    try std.testing.expectEqual(linux.E.MFILE, sys.last_errno);
+    try std.testing.expectEqual(GzipStep.directory_sync, failed_at);
+    var gz_buf: [sys.path_max]u8 = undefined;
+    var gz_z: [sys.path_max:0]u8 = undefined;
+    try std.testing.expect(archiveIntact((try sys.z(&gz_z, try std.mem.print(&gz_buf, "{s}/a.log.gz", .{base}))).ptr));
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
 }

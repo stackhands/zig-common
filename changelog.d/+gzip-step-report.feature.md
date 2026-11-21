@@ -1,0 +1,1 @@
+`logs.gzipInPlaceAtStep` compresses a log as `logs.gzipInPlace` does, and on an error sets a `logs.GzipStep` that says whether the error came before the archive was in place (`archive`) or from the sync of its directory afterwards (`directory_sync`). `gzipInPlace` keeps its signature and calls it.
