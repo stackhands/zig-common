@@ -545,7 +545,7 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     try moveFaultsStep(faults, "move.publish");
     try sys.renameat(dst_dir, tmp, dst_dir, dst_name);
     published = true;
-    try sys.fsync(dst_dir);
+    try fsyncNameParent(dst_dir, dst_name);
     try moveFaultsStep(faults, "move.remove-source");
     if (src.isDir()) {
         try deleteTree(gpa, src_dir, src_name);
@@ -559,7 +559,7 @@ fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_d
     try moveFaultsStep(faults, "move.rename");
     if (!faults.force_cross_device_rename) {
         if (sys.renameat(src_dir, src_name, dst_dir, dst_name)) |_| {
-            try sys.fsync(dst_dir);
+            try fsyncNameParent(dst_dir, dst_name);
             if (src_dir != dst_dir) try sys.fsync(src_dir);
             return;
         } else |err| switch (err) {
@@ -1698,6 +1698,25 @@ test "moveAcross keeps the source when publish fails before rename" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings("payload\n", text);
     try std.testing.expectError(error.NotFound, statAt(d, "dst", false));
+}
+
+test "moveAcross handles nested destinations across a symlinked mount" {
+    const gpa = std.testing.allocator;
+    const fx = try XdevFixture.init(gpa, "move-nested");
+    defer fx.deinit();
+    const d = fx.d;
+
+    const src = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try sys.writeAll(src, "moved\n");
+    sys.close(src);
+
+    try moveAcross(gpa, d, "src", d, "xdev/dest", .{});
+    try std.testing.expectError(error.NotFound, statAt(d, "src", false));
+    const got = try openRegular(d, "xdev/dest", false);
+    defer sys.close(got.fd);
+    const text = try readAll(gpa, got.fd, 64);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("moved\n", text);
 }
 
 test "fsx public helpers return expected errors on bad paths and descriptors" {
