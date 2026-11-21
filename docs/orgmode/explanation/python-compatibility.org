@@ -27,6 +27,8 @@ A cache entry the other build cannot read is a miss on every task, and a journal
 Text stays bytes, read as Python reads them.
 A Python tool decodes a byte string from the system with surrogateescape, so a byte that is not UTF-8 becomes one character, U+DC80 to U+DCFF, which encodes back to the same byte.
 [[zig:zig_common.pytext.nextChar]] reads a byte string as that decoder does, and [[zig:zig_common.pytext.pyStrip]], [[zig:zig_common.pytext.pySplit]], [[zig:zig_common.pytext.shellQuote]] and [[zig:zig_common.json.pyTextLess]], Python's string order, work on those characters.
+[[zig:zig_common.pytext.decimalToAscii]] writes the decimal digits of any script as ASCII digits, as =float()= and =int()= read their text, from a table that =tools/gen_pytext_nd.py= generates from =unicodedata=.
+The table is pinned to Unicode 16.0.0, the data of Python 3.14, and its parity test compares it only under a Python with that data.
 
 JSON strings come in the two encodings the tools used:
 

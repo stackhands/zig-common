@@ -1,0 +1,1 @@
+Add `fsx.mkstemp` to create a private `0600` file with a random suffix under a given directory. The file is open for reading and writing. As in Python, a relative directory is made absolute, so the path is absolute. A refused open reports its path, so the caller can format the error as Python does.
