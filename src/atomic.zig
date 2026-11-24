@@ -609,7 +609,10 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         // os.fstat names no path. Record that before the cleanup calls.
         const failed = failOs(a, why, err, null, null);
         sys.close(fd);
-        // Created above with O_EXCL, so it is this call's file.
+        // Created above with O_EXCL, so it is this call's file. A failed
+        // cleanup must not replace the errno the message was built from.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
         sys.unlinkat(fsx.cwd, tmp, 0) catch {};
         return failed;
     };
@@ -671,7 +674,13 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
     var done = false;
     defer {
         sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (!done) {
+            // The temporary name may already be gone. That failure is not
+            // the call the caller is reporting.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     // openat applies the umask to the create, so the exact mode the
     // caller names is set on the descriptor before anything is written
@@ -685,6 +694,10 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
 }
 
 fn discard(tmp: []const u8, created: fsx.Stat) void {
+    // stat or unlink can fail when the temporary name was removed
+    // already. That failure is not the call the caller is reporting.
+    const saved = sys.last_errno;
+    defer sys.last_errno = saved;
     const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
     if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
 }

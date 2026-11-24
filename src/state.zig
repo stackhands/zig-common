@@ -24,6 +24,15 @@ threadlocal var os_text_len: usize = 0;
 threadlocal var os_path: [sys.path_max]u8 = undefined;
 threadlocal var os_path_len: usize = 0;
 
+/// The OSError recorded for the latest `RootLock.acquire` on this thread.
+/// Null when that acquire has not failed, or failed for a reason that is
+/// not an operating-system error. `text` is Python's "[Errno N] ..." line
+/// without a filename. `path` is the file that call would name, or empty
+/// when it names none, such as a write or a lock on an open descriptor.
+///
+/// Both slices refer to thread-local storage. The next `RootLock.acquire`
+/// on this thread reuses that storage, so copy them before calling it
+/// again.
 pub fn osFailure() ?OsFailure {
     if (!os_noted) return null;
     return .{ .text = os_text[0..os_text_len], .path = os_path[0..os_path_len] };
@@ -64,10 +73,6 @@ fn notedUnder(err: Error, root: []const u8, name: []const u8) Error {
     }
     os_path_len = n;
     return err;
-}
-
-fn noteErrno(e: linux.E, path: ?[]const u8) void {
-    noteText(sys.describeErrno(e), path);
 }
 
 /// Regular, owned by `uid`, one link, mode & 0o077 == 0.
@@ -477,8 +482,10 @@ pub const RootLock = struct {
                 .AGAIN, .ACCES => if (deadline_ms) |d| {
                     if (try pause(d)) return error.Busy;
                 } else {
-                    noteErrno(linux.errno(rc), null);
-                    return error.Unexpected;
+                    // F_SETLKW does not treat these as contention. Return the
+                    // mapped error so describe agrees with the snapshot:
+                    // EAGAIN is Unexpected, EACCES is AccessDenied.
+                    return noted(mapped(rc), null);
                 },
                 else => return noted(mapped(rc), null),
             }
