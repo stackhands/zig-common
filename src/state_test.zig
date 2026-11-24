@@ -8,6 +8,7 @@ const state = @import("state.zig");
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 const atomic = @import("atomic.zig");
+const test_support = @import("test_support.zig");
 const testing = std.testing;
 const RootLock = state.RootLock;
 
@@ -35,16 +36,6 @@ fn end(root: []const u8) void {
 
 fn err(e: linux.E) usize {
     return @bitCast(-@as(isize, @backingInt(e)));
-}
-
-fn fdCount(gpa: std.mem.Allocator) usize {
-    const fd = fsx.openDir(fsx.cwd, "/proc/self/fd", true) catch unreachable;
-    defer sys.close(fd);
-    var it = fsx.DirIter.init(gpa, fd) catch unreachable;
-    defer it.deinit(gpa);
-    var n: usize = 0;
-    while (it.next() catch null) |_| n += 1;
-    return n - 1; // the directory's own descriptor
 }
 
 fn waitExit(pid: isize) u32 {
@@ -173,7 +164,7 @@ test "acquisition errors release the descriptors and the gate" {
     const root = begin();
     defer end(root);
     inline for (.{ "flock", "fcntl", "ftruncate", "write" }) |target| {
-        const before = fdCount(A);
+        const before = try test_support.fdCount(A);
         if (comptime std.mem.eql(u8, target, "flock")) state.lock_ops.flock = eioFlock;
         if (comptime std.mem.eql(u8, target, "fcntl")) state.lock_ops.fcntl = eioFcntl;
         if (comptime std.mem.eql(u8, target, "ftruncate")) state.lock_ops.ftruncate = eioFtruncate;
@@ -186,7 +177,7 @@ test "acquisition errors release the descriptors and the gate" {
         try testing.expectEqualStrings("", failure.path);
         try testing.expectEqualStrings("[Errno 5] Input/output error", failure.text);
         state.lock_ops.* = .{};
-        try testing.expectEqual(before, fdCount(A));
+        try testing.expectEqual(before, try test_support.fdCount(A));
         try acquireAndRelease(root);
     }
 }
@@ -287,11 +278,11 @@ test "a release error still closes both layers" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    const before = fdCount(A);
+    const before = try test_support.fdCount(A);
     state.lock_ops.fcntl = eioFcntl;
     holder.release();
     state.lock_ops.* = .{};
-    try testing.expectEqual(before - 2, fdCount(A));
+    try testing.expectEqual(before - 2, try test_support.fdCount(A));
     try acquireAndRelease(root);
 }
 
@@ -420,9 +411,9 @@ test "a hard link planted while the gate is awaited stops the truncate" {
     try createFile(dir, ".lock", "secret");
     plant_dir = dir;
     state.lock_ops.flock = linkThenFlock;
-    const before = fdCount(gpa);
+    const before = try test_support.fdCount(gpa);
     try testing.expectError(error.GateNotPrivate, RootLock.acquire(gpa, root, 0));
-    try testing.expectEqual(before, fdCount(gpa));
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
     try expectContents(gpa, dir, "alias", "secret");
     state.lock_ops.* = .{};
     try sys.unlinkat(dir, "alias", 0);

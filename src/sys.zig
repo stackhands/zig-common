@@ -536,3 +536,74 @@ test "keepAboveStdio moves descriptors 0, 1 and 2 above 2 with close-on-exec" {
     _ = try call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
     try std.testing.expectEqual(@as(i32, 0), status);
 }
+
+test "keepAboveStdio reports duplication failure when the descriptor table is full" {
+    // A limit of 3 makes F_DUPFD with a minimum of 3 return EINVAL. The
+    // soft limit stays above that, and the child fills every slot it
+    // allows, so the failure is EMFILE. The limit is restored before
+    // the child exits.
+    const Child = struct {
+        fn run() u8 {
+            var saved: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &saved)) != .SUCCESS) return 20;
+            if (linux.errno(linux.fcntl(0, linux.F.GETFD, 0)) != .SUCCESS) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch return 21;
+                if (fd != 0) {
+                    if (linux.errno(linux.dup2(fd, 0)) != .SUCCESS) {
+                        close(fd);
+                        return 22;
+                    }
+                    close(fd);
+                }
+            }
+            if (saved.max < 4) return 23;
+            const cap = @min(saved.max, @as(linux.rlim_t, 8));
+            const tightened: linux.rlimit = .{ .cur = cap, .max = saved.max };
+            if (linux.errno(linux.setrlimit(.NOFILE, &tightened)) != .SUCCESS) return 24;
+            defer _ = linux.setrlimit(.NOFILE, &saved);
+
+            var extras: [16]fd_t = undefined;
+            var n_extra: usize = 0;
+            defer for (extras[0..n_extra]) |fd| close(fd);
+
+            var hit = false;
+            while (n_extra < extras.len) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch |err| {
+                    if (err == error.Unexpected and last_errno == .MFILE) {
+                        hit = true;
+                        break;
+                    }
+                    return 25;
+                };
+                if (@as(linux.rlim_t, @intCast(fd)) >= cap) {
+                    close(fd);
+                    return 26;
+                }
+                extras[n_extra] = fd;
+                n_extra += 1;
+            }
+            if (!hit) return 27;
+
+            const low: fd_t = 0;
+            if (keepAboveStdio(low)) |_| {
+                return 28;
+            } else |err| {
+                // EMFILE is not its own error. The call reports it as
+                // Unexpected, and last_errno keeps the kernel's value.
+                if (err != error.Unexpected or last_errno != .MFILE) return 29;
+                if (!std.mem.eql(u8, describe(err), "[Errno 24] Too many open files")) return 30;
+            }
+            // On error the original descriptor is left open.
+            if (linux.errno(linux.fcntl(low, linux.F.GETFD, 0)) != .SUCCESS) return 31;
+
+            if (linux.errno(linux.setrlimit(.NOFILE, &saved)) != .SUCCESS) return 32;
+            var back: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &back)) != .SUCCESS) return 33;
+            if (back.cur != saved.cur or back.max != saved.max) return 34;
+            return 0;
+        }
+    };
+
+    const test_support = @import("test_support.zig");
+    try test_support.expectChildPasses(Child.run);
+}
