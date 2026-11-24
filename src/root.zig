@@ -13,6 +13,8 @@ pub const cli = @import("cli.zig");
 pub const argparse = @import("argparse.zig");
 /// The environment as the C library sees it.
 pub const env = @import("env.zig");
+/// Install-location names a child command clears.
+pub const env_scrub = @import("env_scrub.zig");
 /// Private state files in a directory other users may write.
 pub const state = @import("state.zig");
 /// JSON as the Python tools these programs replace read and wrote it.
