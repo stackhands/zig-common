@@ -191,6 +191,40 @@ test "acquisition errors release the descriptors and the gate" {
     }
 }
 
+test "a blocking record lock records EAGAIN and EACCES" {
+    const root = begin();
+    defer end(root);
+    const Hooks = struct {
+        var code: linux.E = .AGAIN;
+        fn fail(_: fsx.fd_t, _: i32, _: usize) usize {
+            return err(code);
+        }
+    };
+    defer state.lock_ops.* = .{};
+    state.lock_ops.fcntl = Hooks.fail;
+    for ([_]linux.E{ .AGAIN, .ACCES }) |code| {
+        Hooks.code = code;
+        sys.last_errno = .SUCCESS;
+        if (RootLock.acquire(A, root, null)) |_| {
+            return error.TestUnexpectedResult;
+        } else |failed| {
+            const failure = state.osFailure() orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings("", failure.path);
+            try testing.expectEqualStrings(sys.describeErrno(code), failure.text);
+            try testing.expectEqual(code, sys.last_errno);
+            // describe of the returned error must name this errno. Returning
+            // Unexpected for EACCES makes it print an I/O error instead.
+            const sys_err = sys.asError(failed) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(failure.text, sys.describe(sys_err));
+            switch (code) {
+                .AGAIN => try testing.expectEqual(error.Unexpected, sys_err),
+                .ACCES => try testing.expectEqual(error.AccessDenied, sys_err),
+                else => unreachable,
+            }
+        }
+    }
+}
+
 test "a short pid write does not reuse a stale errno" {
     const root = begin();
     defer end(root);

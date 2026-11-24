@@ -75,10 +75,6 @@ fn notedUnder(err: Error, root: []const u8, name: []const u8) Error {
     return err;
 }
 
-fn noteErrno(e: linux.E, path: ?[]const u8) void {
-    noteText(sys.describeErrno(e), path);
-}
-
 /// Regular, owned by `uid`, one link, mode & 0o077 == 0.
 pub fn privateOk(st: fsx.Stat, uid: linux.uid_t) bool {
     return st.isReg() and st.uid == uid and st.nlink == 1 and st.mode & 0o077 == 0;
@@ -486,8 +482,10 @@ pub const RootLock = struct {
                 .AGAIN, .ACCES => if (deadline_ms) |d| {
                     if (try pause(d)) return error.Busy;
                 } else {
-                    noteErrno(linux.errno(rc), null);
-                    return error.Unexpected;
+                    // F_SETLKW does not treat these as contention. Return the
+                    // mapped error so describe agrees with the snapshot:
+                    // EAGAIN is Unexpected, EACCES is AccessDenied.
+                    return noted(mapped(rc), null);
                 },
                 else => return noted(mapped(rc), null),
             }
