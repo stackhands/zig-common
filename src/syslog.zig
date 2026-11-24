@@ -55,10 +55,6 @@ pub const Identity = struct {
     sd_name: []const u8,
 };
 
-/// The identity the functions without an `Identity` argument write. They
-/// predate `Identity` and are removed in 0.13.0; a caller names its own.
-pub const legacy_identity: Identity = .{ .app = "eb-keep-logs", .sd_name = "ebKeepLogs" };
-
 fn trimWs(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
 }
@@ -179,18 +175,6 @@ fn utcTimestamp(arena: Allocator) []const u8 {
     }) catch "1970-01-01T00:00:00.000000Z";
 }
 
-/// `formatRfc5424For` with `legacy_identity`. Removed in 0.13.0.
-pub fn formatRfc5424(
-    arena: Allocator,
-    severity: u8,
-    msgid: []const u8,
-    params: []const Param,
-    msg: []const u8,
-    pen: []const u8,
-) Allocator.Error![]u8 {
-    return formatRfc5424For(arena, legacy_identity, severity, msgid, params, msg, pen);
-}
-
 /// One RFC 5424 message from `id`: header, one structured-data element
 /// `[<sd_name>@<pen> key="value"...]`, and `msg` on one line.
 pub fn formatRfc5424For(
@@ -231,17 +215,6 @@ fn journalKv(arena: Allocator, out: *std.ArrayList(u8), key: []const u8, value: 
     } else {
         try out.print(arena, "{s}={s}\n", .{ key, value });
     }
-}
-
-/// `formatJournaldFor` with `legacy_identity`. Removed in 0.13.0.
-pub fn formatJournald(
-    arena: Allocator,
-    severity: u8,
-    msgid: []const u8,
-    fields: []const JournalField,
-    msg: []const u8,
-) Allocator.Error![]u8 {
-    return formatJournaldFor(arena, legacy_identity, severity, msgid, fields, msg);
 }
 
 /// One native journald datagram from `id`: MESSAGE, PRIORITY,
@@ -456,19 +429,6 @@ pub fn send(arena: Allocator, target: Target, payload: []const u8) bool {
     };
 }
 
-/// `emitFor` with `legacy_identity`. Removed in 0.13.0.
-pub fn emit(
-    arena: Allocator,
-    target: Target,
-    severity: u8,
-    msgid: []const u8,
-    params: []const Param,
-    jfields: []const JournalField,
-    msg: []const u8,
-) bool {
-    return emitFor(arena, legacy_identity, target, severity, msgid, params, jfields, msg);
-}
-
 /// Format one event from `id` for `target` and send it. Best effort: false
 /// when it could not be formatted or delivered, and never an error.
 pub fn emitFor(
@@ -500,11 +460,12 @@ test "parseTarget accepts unix, journald, udp and tcp" {
     try std.testing.expect(parseTarget("tcp://host:0") == null);
 }
 
-test "formatRfc5424 escapes structured data values and uses configured PEN" {
+test "formatRfc5424For escapes structured data values and uses configured PEN" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const msg = try formatRfc5424(a, 4, "EB_KEEP_FAILED", &.{
+    const id: Identity = .{ .app = "eb-keep-logs", .sd_name = "ebKeepLogs" };
+    const msg = try formatRfc5424For(a, id, 4, "EB_KEEP_FAILED", &.{
         .{ .key = "cmd", .value = "failed" },
         .{ .key = "name", .value = "a\"b\\c]d" },
     }, "kept 1", "55555");
@@ -526,10 +487,6 @@ test "the formatters write the identity they are given" {
     try std.testing.expect(std.mem.find(u8, line, "eb-keep-logs") == null);
     const datagram = try formatJournaldFor(a, id, 6, "EVENT", &.{}, "hello");
     try std.testing.expect(std.mem.find(u8, datagram, "SYSLOG_IDENTIFIER=some-tool\n") != null);
-    // The entry points without an identity keep writing the one they always did.
-    const legacy = try formatRfc5424(a, 6, "EVENT", &.{}, "hello", "32473");
-    try std.testing.expect(std.mem.find(u8, legacy, " eb-keep-logs ") != null);
-    try std.testing.expect(std.mem.find(u8, legacy, "[ebKeepLogs@32473] hello") != null);
 }
 
 test "send reports false for a target nobody listens on" {

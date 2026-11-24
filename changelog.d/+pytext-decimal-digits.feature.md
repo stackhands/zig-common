@@ -1,1 +1,0 @@
-Add `pytext.decimalDigit` and `pytext.decimalToAscii`. They read the decimal digits of every script as Python's `float()` and `int()` do. A generator script under tools builds the table from `unicodedata`, and the table is pinned to Unicode 16.0.0, the data of Python 3.14.
