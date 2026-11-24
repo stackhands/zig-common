@@ -1,0 +1,1 @@
+`syslog`: `formatRfc5424`, `formatJournald` and `emit`, the functions without an `Identity`, are removed, with the identity they wrote; call `formatRfc5424For`, `formatJournaldFor` and `emitFor` with the caller's own `Identity`, `.{ .app = "eb-keep-logs", .sd_name = "ebKeepLogs" }` for the events they sent.

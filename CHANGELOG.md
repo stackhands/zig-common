@@ -6,7 +6,7 @@
 
 ### Features
 
-- `syslog`: `Identity` names the program and the structured-data identifier of an event; `formatRfc5424For`, `formatJournaldFor` and `emitFor` take one, and `send` delivers an already formatted payload, for a tool with formatting of its own. The functions without an identity keep writing `eb-keep-logs`, as 0.11.0 did, and are removed in 0.13.0.
+- `syslog`: `Identity` names the program and the structured-data identifier of an event; `formatRfc5424For`, `formatJournaldFor` and `emitFor` take one, and `send` delivers an already formatted payload, for a tool with formatting of its own. The functions without an identity keep writing `eb-keep-logs`, as 0.11.0 did, until 0.13.0 removes them.
 
 ### Miscellaneous
 
