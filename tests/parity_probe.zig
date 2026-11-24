@@ -342,6 +342,26 @@ fn errnoStdin() !void {
     try sys.writeAll(1, all.items);
 }
 
+/// pytext.decimalToAscii over every code point that UTF-8 can carry, in
+/// blocks of 1024 so that the case set stays small, and over a few strings
+/// with bytes that are not UTF-8.
+fn digitCases() void {
+    var cp: u32 = 0;
+    while (cp < 0x110000) : (cp += 1024) {
+        var buf: std.ArrayList(u8) = .empty;
+        var c = cp;
+        while (c < cp + 1024) : (c += 1) {
+            if (c >= 0xd800 and c <= 0xdfff) continue;
+            var enc: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(c), &enc) catch unreachable;
+            buf.appendSlice(A, enc[0..n]) catch unreachable;
+        }
+        emit("digits", buf.items, pytext.decimalToAscii(A, buf.items) catch unreachable);
+    }
+    const odd = [_][]const u8{ "\xff", "\xd9\xa3\xff\xd9\xa4", "\xd9", "\xf0\x9d\x9f", "\xef\xbc\x91\xe0\x80\xef\xbc\x92", "1_0", "" };
+    for (odd) |in| emit("digits", in, pytext.decimalToAscii(A, in) catch unreachable);
+}
+
 pub fn main(init: std.process.Init) !void {
     arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     A = arena_state.allocator();
@@ -391,6 +411,7 @@ pub fn main(init: std.process.Init) !void {
         textCases(buf);
     }
 
+    digitCases();
     for (edge_floats) |f| floatCaseBits(@bitCast(f));
     for (0..2000) |_| floatCaseBits(rand.int(u64));
 

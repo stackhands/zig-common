@@ -93,7 +93,10 @@ test "failed local contenders keep the record lock" {
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
     defer holder.release();
-    for (0..4) |_| try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
+    for (0..4) |_| {
+        try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
+        try testing.expect(state.osFailure() == null);
+    }
     try assertRemoteExcluded(root);
 }
 
@@ -150,6 +153,9 @@ fn eioFtruncate(_: fsx.fd_t, _: i64) usize {
 fn eioWrite(_: fsx.fd_t, _: []const u8) usize {
     return err(.IO);
 }
+fn shortWrite(_: fsx.fd_t, bytes: []const u8) usize {
+    return bytes.len - 1;
+}
 fn eioOpen(_: fsx.fd_t, _: [*:0]const u8) usize {
     return err(.IO);
 }
@@ -167,10 +173,60 @@ test "acquisition errors release the descriptors and the gate" {
             l.release();
             return error.TestUnexpectedResult;
         } else |_| {}
+        const failure = state.osFailure() orelse unreachable;
+        try testing.expectEqualStrings("", failure.path);
+        try testing.expectEqualStrings("[Errno 5] Input/output error", failure.text);
         state.lock_ops.* = .{};
         try testing.expectEqual(before, try test_support.fdCount(A));
         try acquireAndRelease(root);
     }
+}
+
+test "a blocking record lock records EAGAIN and EACCES" {
+    const root = begin();
+    defer end(root);
+    const Hooks = struct {
+        var code: linux.E = .AGAIN;
+        fn fail(_: fsx.fd_t, _: i32, _: usize) usize {
+            return err(code);
+        }
+    };
+    defer state.lock_ops.* = .{};
+    state.lock_ops.fcntl = Hooks.fail;
+    for ([_]linux.E{ .AGAIN, .ACCES }) |code| {
+        Hooks.code = code;
+        sys.last_errno = .SUCCESS;
+        if (RootLock.acquire(A, root, null)) |_| {
+            return error.TestUnexpectedResult;
+        } else |failed| {
+            const failure = state.osFailure() orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings("", failure.path);
+            try testing.expectEqualStrings(sys.describeErrno(code), failure.text);
+            try testing.expectEqual(code, sys.last_errno);
+            // describe of the returned error must name this errno. Returning
+            // Unexpected for EACCES makes it print an I/O error instead.
+            const sys_err = sys.asError(failed) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(failure.text, sys.describe(sys_err));
+            switch (code) {
+                .AGAIN => try testing.expectEqual(error.Unexpected, sys_err),
+                .ACCES => try testing.expectEqual(error.AccessDenied, sys_err),
+                else => unreachable,
+            }
+        }
+    }
+}
+
+test "a short pid write does not reuse a stale errno" {
+    const root = begin();
+    defer end(root);
+    const initialized = try RootLock.acquire(A, root, 0);
+    initialized.release();
+    sys.last_errno = .DQUOT;
+    state.lock_ops.write = shortWrite;
+    try testing.expectError(error.NoSpace, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings("", failure.path);
+    try testing.expectEqualStrings("[Errno 28] No space left on device", failure.text);
 }
 
 test "a sidecar open failure releases the local gate" {
@@ -178,8 +234,28 @@ test "a sidecar open failure releases the local gate" {
     defer end(root);
     state.lock_ops.open_sidecar = eioOpen;
     try testing.expectError(error.Unexpected, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings(try A.print("{s}/.lock.posix", .{root}), failure.path);
+    try testing.expectEqualStrings("[Errno 5] Input/output error", failure.text);
     state.lock_ops.* = .{};
     try acquireAndRelease(root);
+}
+
+fn oPathOpen(dir: fsx.fd_t, name: [*:0]const u8) usize {
+    return linux.openat(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+}
+
+test "an fchmod failure carries no filename" {
+    const root = begin();
+    defer end(root);
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try createFile(dir, ".lock.posix", "");
+    state.lock_ops.open_sidecar = oPathOpen;
+    try testing.expectError(error.InvalidArgument, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings("", failure.path);
+    try testing.expectEqualStrings("[Errno 9] Bad file descriptor", failure.text);
 }
 
 test "a forked child's release does not unlock the parent" {
@@ -220,6 +296,7 @@ test "a hard-linked sidecar is refused" {
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.linkat(linux.AT.FDCWD, (try sys.z(&za, sidecar)).ptr, linux.AT.FDCWD, (try sys.z(&zb, try A.print("{s}/sidecar-alias", .{root}))).ptr, 0);
     try testing.expectError(error.NotPrivate, RootLock.acquire(A, root, 0));
+    try testing.expect(state.osFailure() == null);
 }
 
 test "a timed acquire does not wait forever" {
@@ -321,6 +398,7 @@ test "a gate hard-linked to another file is refused and the file keeps its bytes
     try createFile(dir, "victim", "secret");
     _ = try sys.call(linux.linkat, .{ dir, "victim", dir, ".lock", @as(u32, 0) });
     try testing.expectError(error.GateNotPrivate, RootLock.acquire(gpa, root, 0));
+    try testing.expect(state.osFailure() == null);
     try expectContents(gpa, dir, "victim", "secret");
 }
 

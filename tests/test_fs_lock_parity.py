@@ -8,7 +8,9 @@ effects run twice, once through the library on one fixture tree and
 once through the Python reference calls on an identical one, and the
 two trees plus the surfaced errnos are compared; realpath is compared
 with os.path.realpath(strict=True); flock exclusive and try semantics
-are exercised in both directions with fcntl.flock.
+are exercised in both directions with fcntl.flock. Atomic-write and
+state-lock failures are compared with str() of the OSError the same
+operation raises.
 
 Run with `python3 tests/test_fs_lock_parity.py` from a checkout that has
 the probe built; the test builds it when zig is on PATH and the binary
@@ -19,7 +21,9 @@ import fcntl
 import gzip
 import json
 import os
+import resource
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -278,6 +282,81 @@ def py_replace_contents(root, name, data):
         return "ERR:" + BY_ERRNO.get(exc.errno, "Errno%d" % exc.errno)
 
 
+def zig_temp_for(path):
+    """The temporary name atomicWrite uses beside `path`."""
+    parent = os.path.dirname(path)
+    if parent == "":
+        parent = "."
+    return parent + "/." + os.path.basename(path) + ".new"
+
+
+def _in_dir(root, fn):
+    old = os.getcwd()
+    os.chdir(root)
+    try:
+        return fn()
+    finally:
+        os.chdir(old)
+
+
+def _relax(root):
+    """Let a temporary tree be removed after a mode-0555 case."""
+    for dirpath, dirnames, _ in os.walk(root):
+        for name in dirnames:
+            path = os.path.join(dirpath, name)
+            try:
+                os.chmod(path, 0o755)
+            except OSError:
+                pass
+
+
+def track(test, root):
+    """Remove `root` after restoring directory modes.
+
+    Cleanup runs last in, first out. rmtree is registered first so the
+    mode restore runs before it. The other order deletes a mode-0555
+    directory first and leaves the tree behind.
+    """
+    test.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    test.addCleanup(_relax, root)
+
+
+def fresh_dir():
+    root = tempfile.mkdtemp()
+    return root
+
+
+def run_oserror(fn):
+    """str() of the OSError `fn` raises, and the exception itself."""
+    try:
+        fn()
+    except OSError as exc:
+        return str(exc), exc
+    raise AssertionError("the reference operation succeeded")
+
+
+# zig's sys.Error name for the errno of a real OSError. EFBIG is not one
+# of the named errors and surfaces as Unexpected, as the copy tests do.
+ZIG_ERR = {
+    errno.EACCES: "AccessDenied",
+    errno.EPERM: "AccessDenied",
+    errno.ENOENT: "NotFound",
+    errno.ENOTDIR: "NotDir",
+    errno.EISDIR: "IsDir",
+    errno.EEXIST: "Exists",
+    errno.EFBIG: "Unexpected",
+    errno.ENOSPC: "NoSpace",
+    errno.EROFS: "ReadOnly",
+}
+
+
+def rendered_oserror(text, path):
+    """str(OSError) from the text and path osFailure keeps apart."""
+    if path == "":
+        return text
+    return text + ": " + repr(path)
+
+
 def py_append_line(root, name, line):
     """The documented appendLine behavior: one appended line, a symlink or
     non-regular target refused, a new file 0666 less the umask."""
@@ -495,8 +574,9 @@ class FsLockParity(unittest.TestCase):
     def test_atomic_replace_append(self):
         probe_root = tempfile.mkdtemp()
         python_root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, probe_root, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, python_root, ignore_errors=True)
+        # The fixture leaves ro/ at mode 0555. Restore that before rmtree.
+        track(self, probe_root)
+        track(self, python_root)
         make_atomic_fixture(python_root)
         make_atomic_fixture(probe_root)
 
@@ -520,13 +600,281 @@ class FsLockParity(unittest.TestCase):
         want.append(("appendline", "ro/ap-new", py_append_line(python_root, "ro/ap-new", "x")))
         want.append(("appendline", "ap-fifo", py_append_line(python_root, "ap-fifo", "x")))
 
-        for (g_op, g_arg, g_res), (w_op, w_name, w_res) in zip(got, want):
+        for parts, (w_op, w_name, w_res) in zip(got, want):
+            g_op, g_arg, g_res = parts[0], parts[1], parts[2]
             self.assertEqual(g_op, w_op)
             self.assertEqual(bytes.fromhex(g_arg), enc(w_name))
             self.assertEqual(g_res, w_res, "%s %s" % (w_op, w_name))
+            if w_op == "atomicwrite" and w_name == "ro/aw-new" and g_res != "OK":
+                got_msg = bytes.fromhex(parts[3]).decode("utf-8", "surrogateescape")
+                ref = fresh_dir()
+                track(self, ref)
+
+                def open_temp():
+                    os.mkdir("ro", 0o755)
+                    os.chmod("ro", 0o555)
+                    os.open(
+                        zig_temp_for("ro/aw-new"),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+
+                want_msg, _ = _in_dir(ref, lambda: run_oserror(open_temp))
+                self.assertEqual(got_msg, want_msg, "atomic write names the temporary file")
 
         # the two trees must agree, mode bits under the umask included
         self.assert_trees_equal(probe_root, python_root)
+
+    def _osfail(self):
+        root = fresh_dir()
+        track(self, root)
+        out = run_probe("osfail", cwd=root)
+        cases = {}
+        for line in out.splitlines():
+            parts = line.split("\t")
+            self.assertEqual(parts[0], "osfail")
+            cases[parts[1]] = parts
+        return cases
+
+    def _rootlock(self):
+        root = fresh_dir()
+        track(self, root)
+        out = run_probe("rootlock", cwd=root)
+        cases = {}
+        for line in out.splitlines():
+            parts = line.split("\t")
+            self.assertEqual(parts[0], "rootlock")
+            cases[parts[1]] = parts
+        return cases
+
+    def _assert_osfail(self, name, reference):
+        parts = self._osfail()[name]
+        if parts[2] == "SKIP":
+            # open-ro and mkdir-ro skip only when this process is root.
+            # write-fsize skips when RLIMIT_FSIZE cannot be lowered.
+            if name in ("open-ro", "mkdir-ro"):
+                self.assertEqual(os.geteuid(), 0)
+            return
+        want, exc = reference()
+        self.assertEqual(parts[2], "ERR:" + ZIG_ERR[exc.errno], name)
+        got = bytes.fromhex(parts[3]).decode("utf-8", "surrogateescape")
+        self.assertEqual(got, want, name)
+
+    def _assert_rootlock(self, name, reference):
+        parts = self._rootlock()[name]
+        if parts[2] == "SKIP":
+            self.assertEqual(os.geteuid(), 0)
+            return
+        want, exc = reference()
+        self.assertEqual(parts[2], "ERR:" + ZIG_ERR[exc.errno], name)
+        self.assertNotEqual(parts[3], "NONE", name)
+        text = bytes.fromhex(parts[3]).decode("utf-8", "surrogateescape")
+        path = bytes.fromhex(parts[4]).decode("utf-8", "surrogateescape")
+        self.assertEqual(rendered_oserror(text, path), want, name)
+        filename = "" if exc.filename is None else os.fsdecode(exc.filename)
+        self.assertEqual(path, filename, name)
+
+    def test_open_names_the_temporary_file(self):
+        """A failed open names the temporary file, as os.open does."""
+
+        def reference():
+            root = fresh_dir()
+            track(self, root)
+
+            def op():
+                os.mkdir("ro", 0o755)
+                os.chmod("ro", 0o555)
+                os.open(
+                    zig_temp_for("ro/new"),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_osfail("open-ro", reference)
+
+    def test_write_names_no_file(self):
+        """A failed write names no file, as os.write on the descriptor does."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                previous = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+                soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+                fd = None
+                try:
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (8, hard))
+                    fd = os.open(
+                        "fsize-out",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    data = b"x" * 64
+                    off = 0
+                    while off < len(data):
+                        n = os.write(fd, data[off:])
+                        if n == 0:
+                            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+                        off += n
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+                    signal.signal(signal.SIGXFSZ, previous)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_osfail("write-fsize", reference)
+
+    def test_rename_names_both_files(self):
+        """A failed rename names the temporary file and the destination."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                os.mkdir("adir", 0o755)
+                fd = os.open("./.adir.new", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                os.close(fd)
+                os.replace("./.adir.new", "adir")
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_osfail("rename-dir", reference)
+
+    def test_makedirs_names_the_failing_ancestor(self):
+        """A missing parent names the mkdir that failed, not the leaf."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                os.symlink("nowhere", "gone")
+                os.makedirs("gone/a/b", exist_ok=True)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_osfail("missing-ancestor", reference)
+
+    def test_mkdir_permission_names_the_failing_ancestor(self):
+        """A refused mkdir names that ancestor, not the requested leaf."""
+
+        def reference():
+            root = fresh_dir()
+            track(self, root)
+
+            def op():
+                os.mkdir("ro", 0o755)
+                os.chmod("ro", 0o555)
+                os.makedirs("ro/a/b", exist_ok=True)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_osfail("mkdir-ro", reference)
+
+    def test_rootlock_preflight_matches_oserror(self):
+        """A non-directory state root matches open(O_DIRECTORY)."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                fd = os.open("fileroot", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                os.close(fd)
+                os.open("fileroot", os.O_RDONLY | os.O_DIRECTORY)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_rootlock("file-root", reference)
+
+    def test_rootlock_dangling_root_matches_oserror(self):
+        """A dangling state root matches open of that link as a directory."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                os.symlink("nowhere", "dangling")
+                os.open("dangling", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_rootlock("dangling-root", reference)
+
+    def test_rootlock_names_the_failing_ancestor(self):
+        """Creating a state root names the mkdir that failed."""
+
+        def reference():
+            root = fresh_dir()
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+            def op():
+                os.symlink("nowhere", "gone")
+                os.makedirs("gone/a/b", exist_ok=True)
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_rootlock("ancestor", reference)
+
+    def test_rootlock_gate_names_the_lock_file(self):
+        """A refused gate open names STATE_ROOT/.lock, not the root alone."""
+
+        def reference():
+            root = fresh_dir()
+            track(self, root)
+
+            def op():
+                os.mkdir("gate", 0o755)
+                os.chmod("gate", 0o555)
+                os.open(
+                    "gate/.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    0o600,
+                )
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_rootlock("gate-ro", reference)
+
+    def test_rootlock_sidecar_names_the_lock_file(self):
+        """A refused sidecar open names STATE_ROOT/.lock.posix."""
+
+        def reference():
+            root = fresh_dir()
+            track(self, root)
+
+            def op():
+                os.mkdir("side", 0o755)
+                fd = os.open(
+                    "side/.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                os.close(fd)
+                os.chmod("side", 0o555)
+                os.open(
+                    "side/.lock.posix",
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    0o600,
+                )
+
+            return _in_dir(root, lambda: run_oserror(op))
+
+        self._assert_rootlock("sidecar-ro", reference)
+
+    def test_rootlock_non_os_refusal_has_no_oserror(self):
+        """A directory planted at the gate is not reported as an OSError."""
+        parts = self._rootlock()["gate-dir"]
+        self.assertEqual(parts[2], "ERR:GateNotPrivate")
+        self.assertEqual(parts[3], "NONE")
+        self.assertEqual(parts[4], "NONE")
 
     def test_which_shutil(self):
         with tempfile.TemporaryDirectory() as probe_root, tempfile.TemporaryDirectory() as python_root:
