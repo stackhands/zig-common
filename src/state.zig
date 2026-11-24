@@ -24,6 +24,15 @@ threadlocal var os_text_len: usize = 0;
 threadlocal var os_path: [sys.path_max]u8 = undefined;
 threadlocal var os_path_len: usize = 0;
 
+/// The OSError recorded for the latest `RootLock.acquire` on this thread.
+/// Null when that acquire has not failed, or failed for a reason that is
+/// not an operating-system error. `text` is Python's "[Errno N] ..." line
+/// without a filename. `path` is the file that call would name, or empty
+/// when it names none, such as a write or a lock on an open descriptor.
+///
+/// Both slices refer to thread-local storage. The next `RootLock.acquire`
+/// on this thread reuses that storage, so copy them before calling it
+/// again.
 pub fn osFailure() ?OsFailure {
     if (!os_noted) return null;
     return .{ .text = os_text[0..os_text_len], .path = os_path[0..os_path_len] };
