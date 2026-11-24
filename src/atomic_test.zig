@@ -1756,6 +1756,27 @@ fn closedOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mo
     return rc;
 }
 
+/// Remove the open file, then fail the write with EIO. Cleanup's later
+/// stat or unlink fails with ENOENT, a different errno.
+fn ioAfterUnlink(fd: sys.fd_t, _: []const u8) usize {
+    var buf: [sys.path_max]u8 = undefined;
+    const path = fsx.realpathFd(fd, &buf) catch unreachable;
+    sys.unlinkat(fsx.cwd, path, 0) catch unreachable;
+    return err(.IO);
+}
+
+/// Open the temporary file, remove it, and close the descriptor. The
+/// following fstat fails with EBADF and the cleanup unlink with ENOENT.
+fn closeAndUnlink(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
+    const rc = linux.openat(dir, path, flags, mode);
+    if (linux.errno(rc) != .SUCCESS) return rc;
+    const fd: sys.fd_t = @intCast(rc);
+    const un = linux.unlinkat(dir, path, 0);
+    sys.close(fd);
+    if (linux.errno(un) != .SUCCESS) return un;
+    return rc;
+}
+
 var stale_path: []const u8 = "";
 var parent_path: []const u8 = "";
 var moved_parent_path: []const u8 = "";
@@ -1808,6 +1829,45 @@ test "OSError messages cover write, fsync, fstat, and stale unlink failures" {
     atomic.ops.geteuid = replaceStaleWithDirectory;
     try testing.expectError(error.IsDir, write(path, "new", replace));
     try testing.expectEqualStrings(try A.print("[Errno 21] Is a directory: '{s}'", .{tmp}), last_why);
+}
+
+test "discard keeps the errno when its stat fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    // The write hook removes the temporary file, so discard's stat is ENOENT.
+    atomic.ops.write = ioAfterUnlink;
+    try testing.expectError(error.Unexpected, write(path, "new", replace));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqualStrings("[Errno 5] Input/output error", last_why);
+}
+
+test "fstat cleanup keeps the errno when its unlink fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    // The open hook closes the descriptor and removes the file, so fstat is
+    // EBADF and the cleanup unlink is ENOENT.
+    atomic.ops.openat = closeAndUnlink;
+    try testing.expectError(error.InvalidArgument, write(path, "new", replace));
+    try testing.expectEqual(linux.E.BADF, sys.last_errno);
+    try testing.expectEqualStrings("[Errno 9] Bad file descriptor", last_why);
+}
+
+test "atomicWriteAt cleanup keeps the errno when its unlink fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    atomic.ops.write = ioAfterUnlink;
+    const dfd = try fsx.openDir(fsx.cwd, dir, false);
+    defer sys.close(dfd);
+    try testing.expectError(error.Unexpected, atomic.atomicWriteAt(A, dfd, "at", "new", 0o644));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
 }
 
 test "a parent fsync failure carries no filename and keeps its errno" {
