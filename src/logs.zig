@@ -13,6 +13,10 @@ const flate = std.compress.flate;
 /// path per line. `renameInList` gives its text after files are renamed.
 pub const licensed_list = ".licensed-logs";
 
+/// The longest a single path component may be on a Linux filesystem
+/// holding log files: ext4, xfs, btrfs and tmpfs all share this limit.
+const name_component_max = 255;
+
 /// The errors of `gzipInPlace`: the `sys.Error` of a failed call,
 /// `error.OutOfMemory`, or `error.WriteFailed` from writing the
 /// compressed stream.
@@ -42,7 +46,21 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
     const gz_parent = std.fs.path.dirname(gz_name) orelse ".";
     const gz_base = std.fs.path.basename(gz_name);
-    const tmp_name = try gpa.print("{s}/.{s}.{d}.{x:0>8}.tmp", .{ gz_parent, gz_base, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
+    const pid = linux.getpid();
+    const suffix = std.mem.readInt(u32, &rnd, .little);
+    // A name this program's own `name.gz` already fits in one path
+    // component can still leave the temporary file holding both that name
+    // and the pid and random suffix guarding it from a concurrent or a
+    // retried run over that component's own limit. The suffix alone is
+    // already enough to keep two temporary files from colliding in `dir`,
+    // so a name that would overflow is left out of the temporary one
+    // rather than failing a compression this program's own final name
+    // would otherwise have gone on to complete.
+    const tagged_len = std.fmt.count(".{s}.{d}.{x:0>8}.tmp", .{ gz_base, pid, suffix });
+    const tmp_name = if (tagged_len <= name_component_max)
+        try gpa.print("{s}/.{s}.{d}.{x:0>8}.tmp", .{ gz_parent, gz_base, pid, suffix })
+    else
+        try gpa.print("{s}/.{d}.{x:0>8}.tmp", .{ gz_parent, pid, suffix });
     defer gpa.free(tmp_name);
     const dst = try sys.openat(dir, tmp_name, .{
         .ACCMODE = .WRONLY,
@@ -385,4 +403,38 @@ test "gzipInPlace handles nested paths like gzip -9 sub/file" {
     try gzipInPlace(gpa, io, dir, "sub/nested.log");
     try std.testing.expectError(error.NotFound, fsx.statAt(dir, "sub/nested.log", false));
     try std.testing.expect((fsx.statAt(dir, "sub/nested.log.gz", false) catch null) != null);
+}
+
+test "gzipInPlace compresses a name its own temporary file alone would overflow" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-long-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+
+    // 240 bytes: short enough that `gzip -9` on the real reference
+    // compressor takes it (its own overhead is the 3 bytes of `.gz`), long
+    // enough that adding a pid and a random suffix on top overflows one
+    // path component's 255-byte limit no matter how many digits the
+    // running process's own pid happens to have.
+    var name_buf: [240]u8 = undefined;
+    @memset(&name_buf, 'a');
+    const name = &name_buf;
+    const src = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try sys.writeAll(src, "a log with a long name\n");
+    sys.close(src);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try gzipInPlace(gpa, io, dir, name);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, name, false));
+    var gz_buf: [244]u8 = undefined;
+    const gz_name = try std.fmt.bufPrint(&gz_buf, "{s}.gz", .{name});
+    try std.testing.expect((fsx.statAt(dir, gz_name, false) catch null) != null);
 }

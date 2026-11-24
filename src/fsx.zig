@@ -3,6 +3,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
+const atomic = @import("atomic.zig");
+const pytext = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 /// A file descriptor, as `sys.fd_t`.
@@ -410,12 +412,45 @@ const MoveFaults = struct {
     force_cross_device_rename: bool = false,
     reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
     fail_fn: ?*const fn (?*anyopaque, []const u8) ?Error = null,
+    trace_fn: ?*const fn (?*anyopaque, MoveCall) void = null,
     ctx: ?*anyopaque = null,
+};
+
+/// A rename or directory sync that moveAcross completed; the descriptor of
+/// a sync is open only while the trace runs.
+const MoveCall = union(enum) {
+    rename,
+    fsync: fd_t,
 };
 
 fn moveFaultsStep(faults: MoveFaults, step: []const u8) Error!void {
     if (faults.reach_fn) |f| f(faults.ctx, step);
     if (faults.fail_fn) |f| if (f(faults.ctx, step)) |err| return err;
+}
+
+fn moveRename(faults: MoveFaults, old_dir: fd_t, old_name: []const u8, new_dir: fd_t, new_name: []const u8) Error!void {
+    try sys.renameat(old_dir, old_name, new_dir, new_name);
+    if (faults.trace_fn) |f| f(faults.ctx, .rename);
+}
+
+fn moveFsync(faults: MoveFaults, dir: fd_t) Error!void {
+    try sys.fsync(dir);
+    if (faults.trace_fn) |f| f(faults.ctx, .{ .fsync = dir });
+}
+
+/// `fsyncNameParent` for moveAcross, reported to its trace.
+fn moveFsyncNameParent(faults: MoveFaults, dir: fd_t, name: []const u8) Error!void {
+    const parent_dir = try openDir(dir, std.fs.path.dirname(name) orelse ".", true);
+    defer sys.close(parent_dir);
+    try moveFsync(faults, parent_dir);
+}
+
+/// Whether `a_dir/a_name` and `b_dir/b_name` name entries of the same
+/// directory by the same path. False does not mean the directories differ.
+fn sameNameParent(a_dir: fd_t, a_name: []const u8, b_dir: fd_t, b_name: []const u8) bool {
+    const a = std.fs.path.dirname(a_name) orelse ".";
+    const b = std.fs.path.dirname(b_name) orelse ".";
+    return a_dir == b_dir and std.mem.eql(u8, a, b);
 }
 
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
@@ -541,24 +576,24 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     }
 
     try moveFaultsStep(faults, "move.publish");
-    try sys.renameat(dst_dir, tmp, dst_dir, dst_name);
+    try moveRename(faults, dst_dir, tmp, dst_dir, dst_name);
     published = true;
-    try sys.fsync(dst_dir);
+    try moveFsyncNameParent(faults, dst_dir, dst_name);
     try moveFaultsStep(faults, "move.remove-source");
     if (src.isDir()) {
         try deleteTree(gpa, src_dir, src_name);
     } else {
         try sys.unlinkat(src_dir, src_name, 0);
     }
-    try sys.fsync(src_dir);
+    try moveFsyncNameParent(faults, src_dir, src_name);
 }
 
 fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
     try moveFaultsStep(faults, "move.rename");
     if (!faults.force_cross_device_rename) {
-        if (sys.renameat(src_dir, src_name, dst_dir, dst_name)) |_| {
-            try sys.fsync(dst_dir);
-            if (src_dir != dst_dir) try sys.fsync(src_dir);
+        if (moveRename(faults, src_dir, src_name, dst_dir, dst_name)) |_| {
+            try moveFsyncNameParent(faults, dst_dir, dst_name);
+            if (!sameNameParent(src_dir, src_name, dst_dir, dst_name)) try moveFsyncNameParent(faults, src_dir, src_name);
             return;
         } else |err| switch (err) {
             error.CrossDevice => {},
@@ -610,18 +645,49 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
     done = true;
 }
 
+/// Eight random characters from `a-z`, `0-9` and `_`, the alphabet of
+/// Python's `tempfile`.
+fn randomName() Error![8]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    var rnd: [8]u8 = undefined;
+    // A name from bytes getrandom did not fill would not be random.
+    const got = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    if (got != rnd.len) return error.Unexpected;
+    for (&rnd) |*b| b.* = alphabet[b.* % alphabet.len];
+    return rnd;
+}
+
 /// Create a private 0700 directory `{dir}/{prefix}XXXXXXXX` with a random
 /// suffix, retrying on `error.Exists`, and return its path allocated from
 /// `gpa`. The caller owns the returned slice.
 pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Allocator.Error)![]u8 {
-    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    return mkdtempReport(gpa, dir, prefix, &why);
+}
+
+/// mkdtemp that names the directory it failed in: on failure `why` holds
+/// the OSError text Python gives, `pytext.osError` of the path. When the
+/// failure is the create itself, the path is the directory joined with the
+/// name it tried, random part included, in one repr as Python writes it.
+pub fn mkdtempReport(gpa: Allocator, dir: []const u8, prefix: []const u8, why: *atomic.Why) (Error || Allocator.Error)![]u8 {
+    return mkdtempReportInner(gpa, dir, prefix, why) catch |err| {
+        if (why.msg.len == 0) reportMkError(gpa, why, err, dir, null);
+        return err;
+    };
+}
+
+fn reportMkError(gpa: Allocator, why: *atomic.Why, err: anyerror, dir: []const u8, name: ?[]const u8) void {
+    why.deinit(gpa);
+    const path = if (name) |n| std.fs.path.join(gpa, &.{ dir, n }) catch return else dir;
+    defer if (name != null) gpa.free(path);
+    why.msg = pytext.osError(gpa, err, path) catch return;
+}
+
+fn mkdtempReportInner(gpa: Allocator, dir: []const u8, prefix: []const u8, why: *atomic.Why) (Error || Allocator.Error)![]u8 {
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
-        var rnd: [8]u8 = undefined;
-        // A name from bytes getrandom did not fill would not be random.
-        const got = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-        if (got != rnd.len) return error.Unexpected;
-        for (&rnd) |*b| b.* = alphabet[b.* % alphabet.len];
+        const rnd = try randomName();
         const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, rnd });
         defer gpa.free(name);
         const path = try std.fs.path.join(gpa, &.{ dir, name });
@@ -633,7 +699,10 @@ pub fn mkdtemp(gpa: Allocator, dir: []const u8, prefix: []const u8) (Error || Al
                 gpa.free(path);
                 continue;
             },
-            else => return err,
+            else => {
+                reportMkError(gpa, why, err, dir, name);
+                return err;
+            },
         };
         return path;
     }
@@ -645,6 +714,62 @@ test "selfExe names this program as a readable regular file" {
     const got = selfExe(&out) orelse return error.TestUnexpectedResult;
     const st = try statAt(cwd, got, true);
     try std.testing.expect(st.isReg());
+}
+
+/// Fail unless `msg` is `pytext.osError` of `err` and the path a create
+/// tried, `dir` joined with `prefix` and eight characters of the random
+/// alphabet. Those characters need no escape and do not change the quote
+/// repr picks, so they are the eight bytes before the closing quote.
+fn expectTriedPath(gpa: Allocator, msg: []const u8, err: anyerror, dir: []const u8, prefix: []const u8) !void {
+    try std.testing.expect(msg.len > 9);
+    const rnd = msg[msg.len - 9 .. msg.len - 1];
+    for (rnd) |b| try std.testing.expect(std.ascii.isLower(b) or std.ascii.isDigit(b) or b == '_');
+    const name = try std.mem.concat(gpa, u8, &.{ prefix, rnd });
+    defer gpa.free(name);
+    const tried = try std.fs.path.join(gpa, &.{ dir, name });
+    defer gpa.free(tried);
+    const want = try pytext.osError(gpa, err, tried);
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, msg);
+}
+
+test "mkdtempReport names the path a failed create tried" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-mkdtemp-report-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer sys.unlinkat(cwd, sys.z(&zb, base) catch "", linux.AT.REMOVEDIR) catch {};
+
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    // a missing directory: the whole path the create tried is in one repr
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkdtempReport(gpa, missing, "pre-", &why));
+    try expectTriedPath(gpa, why.msg, error.NotFound, missing, "pre-");
+
+    // a quote in the directory makes repr pick the other quote for all of it
+    const quoted = try std.fmt.allocPrint(gpa, "{s}/it's", .{base});
+    defer gpa.free(quoted);
+    try std.testing.expectError(error.NotFound, mkdtempReport(gpa, quoted, "pre-", &why));
+    try std.testing.expect(std.mem.endsWith(u8, why.msg, "\""));
+    try expectTriedPath(gpa, why.msg, error.NotFound, quoted, "pre-");
+
+    // a file in the parent's place: ENOTDIR's errno text, the same path
+    const blocker = try std.fmt.allocPrint(gpa, "{s}/blocker", .{base});
+    defer gpa.free(blocker);
+    const fd = try sys.openat(cwd, blocker, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.writeAll(fd, "x") catch {};
+    sys.close(fd);
+    var zb2: [sys.path_max:0]u8 = undefined;
+    defer sys.unlinkat(cwd, sys.z(&zb2, blocker) catch "", 0) catch {};
+    const under = try std.fmt.allocPrint(gpa, "{s}/blocker/sub", .{base});
+    defer gpa.free(under);
+    try std.testing.expectError(error.NotDir, mkdtempReport(gpa, under, "pre-", &why));
+    try expectTriedPath(gpa, why.msg, error.NotDir, under, "pre-");
 }
 
 test "mkdtemp creates private 0700 directories with distinct names" {
@@ -679,6 +804,369 @@ test "mkdtemp creates private 0700 directories with distinct names" {
     const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
     defer gpa.free(missing);
     try std.testing.expectError(error.NotFound, mkdtemp(gpa, missing, "pre-"));
+}
+
+/// A file `mkstemp` made.
+pub const TempFile = struct {
+    /// Open for reading and writing, close-on-exec.
+    fd: fd_t,
+    /// The path, allocated from the `gpa` given to `mkstemp`.
+    path: []u8,
+};
+
+/// `tempfile.mkstemp(prefix=prefix, dir=dir)`: a new file
+/// `{dir}/{prefix}XXXXXXXX` with a random suffix, mode 0600, opened for
+/// reading and writing without following a link. Like Python, it makes
+/// `dir` absolute with `absPath` first, so the path is absolute for a
+/// relative `dir` too. Python tries 10000 names and goes on only after a
+/// name that exists. When the open fails with another error, `failed`
+/// receives the path that was refused, for the caller to format with
+/// `pytext.osError`, as Python's error names it. It is null when no name
+/// was tried or when every name existed.
+pub fn mkstemp(gpa: Allocator, dir: []const u8, prefix: []const u8, failed: *?[]u8) (Error || Allocator.Error)!TempFile {
+    failed.* = null;
+    const abs = try absPath(gpa, dir);
+    defer gpa.free(abs);
+    var tries: usize = 0;
+    while (tries < 10000) : (tries += 1) {
+        const rnd = try randomName();
+        const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, rnd });
+        defer gpa.free(name);
+        const path = try std.fs.path.join(gpa, &.{ abs, name });
+        const fd = sys.openat(cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600) catch |err| switch (err) {
+            error.Exists => {
+                gpa.free(path);
+                continue;
+            },
+            else => {
+                failed.* = path;
+                return err;
+            },
+        };
+        return .{ .fd = fd, .path = path };
+    }
+    return error.Exists;
+}
+
+test "mkstemp makes a private file and names the path it was refused" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-mkstemp-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, base) catch {};
+
+    var failed: ?[]u8 = null;
+    const made = try mkstemp(gpa, base, "pre-", &failed);
+    defer gpa.free(made.path);
+    defer sys.close(made.fd);
+    try std.testing.expect(failed == null);
+    const expected_prefix = try std.fmt.allocPrint(gpa, "{s}/pre-", .{base});
+    defer gpa.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, made.path, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, made.path.len);
+    const st = try fstat(made.fd);
+    try std.testing.expect(st.isReg());
+    try std.testing.expectEqual(@as(u32, 0o600), st.perm());
+    try sys.writeAll(made.fd, "x");
+
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{base});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkstemp(gpa, missing, "pre-", &failed));
+    defer if (failed) |p| gpa.free(p);
+    const path = failed orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, path, missing));
+    try std.testing.expectEqual(missing.len + "/pre-".len + 8, path.len);
+}
+
+test "mkstemp makes a relative directory absolute as Python does" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &cwd_buf);
+    var rb: [sys.path_max]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rb, ".zig-cache/zig-common-mkstemp-rel-{d}", .{linux.getpid()});
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, rel)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, rel) catch {};
+    const abs = try std.fs.path.join(gpa, &.{ here, rel });
+    defer gpa.free(abs);
+
+    var failed: ?[]u8 = null;
+    const dotted = try std.fmt.allocPrint(gpa, "./{s}/../{s}", .{ rel, std.fs.path.basename(rel) });
+    defer gpa.free(dotted);
+    const made = try mkstemp(gpa, dotted, "pre-", &failed);
+    defer gpa.free(made.path);
+    defer sys.close(made.fd);
+    const expected_prefix = try std.fmt.allocPrint(gpa, "{s}/pre-", .{abs});
+    defer gpa.free(expected_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, made.path, expected_prefix));
+    try std.testing.expectEqual(expected_prefix.len + 8, made.path.len);
+
+    const missing = try std.fmt.allocPrint(gpa, "{s}/missing", .{rel});
+    defer gpa.free(missing);
+    try std.testing.expectError(error.NotFound, mkstemp(gpa, missing, "pre-", &failed));
+    defer if (failed) |p| gpa.free(p);
+    const refused = failed orelse return error.TestUnexpectedResult;
+    const missing_prefix = try std.fmt.allocPrint(gpa, "{s}/missing/pre-", .{abs});
+    defer gpa.free(missing_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, refused, missing_prefix));
+    try std.testing.expectEqual(missing_prefix.len + 8, refused.len);
+}
+
+/// The directories `tempfile.gettempdir` tries, in its order: the values of
+/// TMPDIR, TEMP and TMP that are set and not empty, then `/tmp`,
+/// `/var/tmp` and `/usr/tmp`, then the working directory, or "." when that
+/// cannot be read. `env` is anything with `get(name) ?[]const u8`, such as
+/// `Env` or a string map. The strings are as given, not made absolute. The
+/// last one, the working directory, is a copy allocated from `gpa`;
+/// `freeTempDirCandidates` frees it with the list.
+pub fn tempDirCandidates(gpa: Allocator, env: anytype) Allocator.Error![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(gpa);
+    for ([_][]const u8{ "TMPDIR", "TEMP", "TMP" }) |name| {
+        const v = env.get(name) orelse continue;
+        if (v.len > 0) try list.append(gpa, v);
+    }
+    try list.appendSlice(gpa, &.{ "/tmp", "/var/tmp", "/usr/tmp" });
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try gpa.dupe(u8, getcwd(&buf) catch ".");
+    errdefer gpa.free(here);
+    try list.append(gpa, here);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Free a list `tempDirCandidates` returned, with the copy at its end.
+pub fn freeTempDirCandidates(gpa: Allocator, candidates: []const []const u8) void {
+    gpa.free(candidates[candidates.len - 1]);
+    gpa.free(candidates);
+}
+
+/// `os.getcwd()`: the working directory as the kernel names it, which is an
+/// error when the directory has been removed.
+fn getcwd(buf: *[sys.path_max]u8) Error![]const u8 {
+    const n = try sys.call(linux.getcwd, .{ buf, buf.len });
+    return buf[0..n -| 1];
+}
+
+/// `tempfile._get_default_tempdir`'s probe of one directory: a new file with
+/// a random name, `blat` written to it, closed and removed. Python tries
+/// 100 names, goes on only after a name that exists, and gives up on the
+/// directory at any other error. A short write is not an error there.
+fn tempDirUsable(gpa: Allocator, dir: []const u8) bool {
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        const rnd = randomName() catch return false;
+        const path = std.fs.path.join(gpa, &.{ dir, &rnd }) catch return false;
+        defer gpa.free(path);
+        const fd = sys.openat(cwd, path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600) catch |err| switch (err) {
+            error.Exists => continue,
+            else => return false,
+        };
+        const wrote = if (sys.call(linux.write, .{ fd, "blat", 4 })) |_| true else |_| false;
+        sys.close(fd);
+        sys.unlinkat(cwd, path, 0) catch return false;
+        return wrote;
+    }
+    return false;
+}
+
+/// The directory `_get_default_tempdir` probes for `candidate`, as a copy
+/// allocated from `gpa`: "." as it is, any other value made absolute and
+/// normalized like `os.path.abspath`. A relative value needs `os.getcwd()`,
+/// and Python lets its error out of gettempdir.
+fn tempDirPath(gpa: Allocator, candidate: []const u8) (Error || Allocator.Error)![]u8 {
+    if (std.mem.eql(u8, candidate, ".")) return gpa.dupe(u8, candidate);
+    if (candidate[0] == '/') return normPath(gpa, candidate);
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try getcwd(&buf);
+    const joined = try std.mem.concat(gpa, u8, &.{ here, "/", candidate });
+    defer gpa.free(joined);
+    return normPath(gpa, joined);
+}
+
+/// `tempfile.gettempdir`: the first of `tempDirCandidates` that takes the
+/// probe file, made absolute and normalized like `os.path.abspath`. Python
+/// keeps the answer for the life of the process, and so does `path` here:
+/// a later call returns it without looking at the environment or the
+/// directory again. A failure is not kept; each call tries again.
+///
+/// `path` and `message` are allocated from the `gpa` given to `get` and
+/// owned by the `TempDir`; `deinit` frees them. Nothing else a call
+/// allocates outlives it.
+pub const TempDir = struct {
+    /// The directory once one has been found.
+    path: ?[]const u8 = null,
+    /// After `error.NoTempDir`, `str()` of the FileNotFoundError Python
+    /// raises, "[Errno 2] No usable temporary directory found in [...]",
+    /// with the candidates as repr writes them, or "[Errno 2] No such file
+    /// or directory" when a relative value needed a working directory that
+    /// was removed. Each failed call replaces it.
+    message: []const u8 = "",
+
+    /// Free `path` and `message` and reset `td`.
+    pub fn deinit(td: *TempDir, gpa: Allocator) void {
+        if (td.path) |p| gpa.free(p);
+        if (td.message.len > 0) gpa.free(td.message);
+        td.* = .{};
+    }
+
+    /// The directory, from the cache or by trying the candidates.
+    pub fn get(td: *TempDir, gpa: Allocator, env: anytype) error{ NoTempDir, OutOfMemory }![]const u8 {
+        if (td.path) |p| return p;
+        const candidates = try tempDirCandidates(gpa, env);
+        defer freeTempDirCandidates(gpa, candidates);
+        for (candidates) |candidate| {
+            const dir = tempDirPath(gpa, candidate) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |e| {
+                    td.setMessage(gpa, try gpa.dupe(u8, sys.describe(e)));
+                    return error.NoTempDir;
+                },
+            };
+            if (tempDirUsable(gpa, dir)) {
+                td.path = dir;
+                return dir;
+            }
+            gpa.free(dir);
+        }
+        td.setMessage(gpa, try noTempDirMessage(gpa, candidates));
+        return error.NoTempDir;
+    }
+
+    fn setMessage(td: *TempDir, gpa: Allocator, message: []const u8) void {
+        if (td.message.len > 0) gpa.free(td.message);
+        td.message = message;
+    }
+};
+
+fn noTempDirMessage(gpa: Allocator, candidates: []const []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "[Errno 2] No usable temporary directory found in [");
+    for (candidates, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try pytext.reprStr(&out, gpa, c);
+    }
+    try out.append(gpa, ']');
+    return out.toOwnedSlice(gpa);
+}
+
+test "tempDirCandidates follows tempfile's order and skips empty values" {
+    const gpa = std.testing.allocator;
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMP", "/m");
+    try env.put(gpa, "TMPDIR", "rel/./dir/");
+    try env.put(gpa, "TEMP", "");
+    const got = try tempDirCandidates(gpa, env);
+    defer freeTempDirCandidates(gpa, got);
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &buf);
+    const want = [_][]const u8{ "rel/./dir/", "/m", "/tmp", "/var/tmp", "/usr/tmp", here };
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+    const bare = try tempDirCandidates(gpa, std.StringHashMapUnmanaged([]const u8).empty);
+    defer freeTempDirCandidates(gpa, bare);
+    try std.testing.expectEqual(@as(usize, 4), bare.len);
+}
+
+test "TempDir takes the first usable candidate and keeps it" {
+    const gpa = std.testing.allocator;
+    var buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &buf);
+    var pb: [sys.path_max]u8 = undefined;
+    const base = try std.fmt.bufPrint(&pb, "{s}/.zig-cache/zig-common-tempdir-{d}", .{ here, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer deleteTree(gpa, cwd, base) catch {};
+
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    const unnormalized = try std.fmt.allocPrint(gpa, "{s}/./sub/..//", .{base});
+    defer gpa.free(unnormalized);
+    try env.put(gpa, "TMPDIR", "/nonexistent-zig-common-dir");
+    try env.put(gpa, "TEMP", unnormalized);
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+    try std.testing.expectEqualStrings(base, try td.get(gpa, env));
+
+    try env.put(gpa, "TEMP", "/nonexistent-zig-common-dir");
+    try std.testing.expectEqualStrings(base, try td.get(gpa, env));
+
+    var fresh: TempDir = .{};
+    defer fresh.deinit(gpa);
+    const system = try fresh.get(gpa, env);
+    try std.testing.expect(!std.mem.eql(u8, system, base));
+    try std.testing.expect(system[0] == '/');
+}
+
+test "TempDir frees what its failed calls allocate" {
+    // std.testing.allocator fails the test on a leak, so each candidate
+    // that fails, each join of a relative value and each replaced message
+    // must be freed, and deinit must free what the TempDir keeps.
+    const gpa = std.testing.allocator;
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMPDIR", "/nonexistent-zig-common-dir/./x/..");
+    try env.put(gpa, "TEMP", "relative-zig-common-missing");
+    try env.put(gpa, "TMP", "it's");
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+
+    {
+        // Under a file size limit of 0 with SIGXFSZ ignored, every probe
+        // write fails with EFBIG, so every candidate fails, twice over.
+        var lim: linux.rlimit = undefined;
+        try std.testing.expectEqual(@as(usize, 0), linux.getrlimit(.FSIZE, &lim));
+        const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+        var old: linux.Sigaction = undefined;
+        _ = linux.sigaction(linux.SIG.XFSZ, &ignore, &old);
+        defer _ = linux.sigaction(linux.SIG.XFSZ, &old, null);
+        const zero: linux.rlimit = .{ .cur = 0, .max = lim.max };
+        try std.testing.expectEqual(@as(usize, 0), linux.setrlimit(.FSIZE, &zero));
+        defer _ = linux.setrlimit(.FSIZE, &lim);
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+    }
+    try std.testing.expect(td.path == null);
+    try std.testing.expect(std.mem.startsWith(u8, td.message, "[Errno 2] No usable temporary directory found in ['/nonexistent-zig-common-dir/./x/..', 'relative-zig-common-missing', \"it's\", '/tmp', "));
+
+    {
+        // A relative value under a removed working directory replaces the
+        // message with the error of os.getcwd().
+        var here_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &here_buf);
+        var hz: [sys.path_max:0]u8 = undefined;
+        const here_z = try sys.z(&hz, here);
+        var gb: [sys.path_max]u8 = undefined;
+        const gone = try std.fmt.bufPrint(&gb, "{s}/.zig-cache/zig-common-tempdir-gone-{d}", .{ here, linux.getpid() });
+        var gz: [sys.path_max:0]u8 = undefined;
+        const gone_z = try sys.z(&gz, gone);
+        try std.testing.expectEqual(@as(usize, 0), linux.mkdirat(cwd, gone_z.ptr, 0o700));
+        try std.testing.expectEqual(@as(usize, 0), linux.chdir(gone_z.ptr));
+        defer _ = linux.chdir(here_z.ptr);
+        try sys.unlinkat(cwd, gone, linux.AT.REMOVEDIR);
+        try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+        try std.testing.expectEqualStrings("[Errno 2] No such file or directory", td.message);
+    }
+
+    try env.put(gpa, "TMPDIR", "/tmp/./");
+    const dir = try td.get(gpa, env);
+    try std.testing.expectEqualStrings("/tmp", dir);
+    try std.testing.expectEqual(dir.ptr, (try td.get(gpa, env)).ptr);
+}
+
+test "the temporary directory message quotes candidates as repr does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const msg = try noTempDirMessage(a, &.{ "/tmp", "it's", "a\"b'c\n", "\xff" });
+    try std.testing.expectEqualStrings(
+        "[Errno 2] No usable temporary directory found in ['/tmp', \"it's\", 'a\"b\\'c\\n', '\\udcff']",
+        msg,
+    );
 }
 
 /// The `d_type` values of a directory entry, as `std.os.linux.DT`:
@@ -1175,6 +1663,169 @@ const MoveProbe = struct {
         self.seen.deinit(std.testing.allocator);
     }
 };
+
+/// The renames and directory syncs one moveAcross call makes, in order. A
+/// sync is kept as the device and inode of the directory it flushed.
+const MoveTrace = struct {
+    calls: [16]Call = undefined,
+    len: usize = 0,
+
+    const Call = union(enum) {
+        rename,
+        fsync: struct { dev: u64, ino: u64 },
+    };
+
+    fn record(ctx: ?*anyopaque, call: MoveCall) void {
+        const self: *MoveTrace = @ptrCast(@alignCast(ctx.?));
+        if (self.len == self.calls.len) return;
+        self.calls[self.len] = switch (call) {
+            .rename => .rename,
+            .fsync => |fd| if (fstat(fd)) |st| .{ .fsync = .{ .dev = st.dev, .ino = st.ino } } else |_| .{ .fsync = .{ .dev = 0, .ino = 0 } },
+        };
+        self.len += 1;
+    }
+
+    fn faults(self: *MoveTrace, cross_device: bool) MoveFaults {
+        return .{ .force_cross_device_rename = cross_device, .trace_fn = record, .ctx = self };
+    }
+
+    fn sync(dir: Stat) Call {
+        return .{ .fsync = .{ .dev = dir.dev, .ino = dir.ino } };
+    }
+
+    fn expectCalls(self: *const MoveTrace, want: []const Call) !void {
+        try std.testing.expectEqualSlices(Call, want, self.calls[0..self.len]);
+    }
+
+    /// Whether `dir` is synced after the last rename.
+    fn syncedAfterPublish(self: *const MoveTrace, dir: Stat) bool {
+        var i = self.len;
+        while (i > 0) {
+            i -= 1;
+            switch (self.calls[i]) {
+                .rename => return false,
+                .fsync => |s| if (s.dev == dir.dev and s.ino == dir.ino) return true,
+            }
+        }
+        return false;
+    }
+};
+
+/// Scratch directory under `.zig-cache` for the moveAcross trace tests.
+const MoveScratch = struct {
+    gpa: Allocator,
+    base: []u8,
+    d: fd_t,
+
+    fn init(gpa: Allocator, tag: []const u8) !MoveScratch {
+        var cwd_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &cwd_buf);
+        const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-{s}-{d}", .{ here, tag, linux.getpid() });
+        errdefer gpa.free(base);
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+        return .{ .gpa = gpa, .base = base, .d = try openDir(cwd, base, false) };
+    }
+
+    fn deinit(self: MoveScratch) void {
+        deleteTree(self.gpa, cwd, self.base) catch {};
+        sys.close(self.d);
+        self.gpa.free(self.base);
+    }
+
+    fn mkdir(self: MoveScratch, name: []const u8) !Stat {
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = try sys.call(linux.mkdirat, .{ self.d, (try sys.z(&zb, name)).ptr, @as(linux.mode_t, 0o700) });
+        return statAt(self.d, name, false);
+    }
+
+    fn put(self: MoveScratch, name: []const u8) !void {
+        const fd = try sys.openat(self.d, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+        defer sys.close(fd);
+        try sys.writeAll(fd, "moved\n");
+    }
+
+    fn expectMoved(self: MoveScratch, src: []const u8, dst: []const u8) !void {
+        try std.testing.expectError(error.NotFound, statAt(self.d, src, false));
+        const got = try openRegular(self.d, dst, false);
+        defer sys.close(got.fd);
+        const text = try readAll(self.gpa, got.fd, 64);
+        defer self.gpa.free(text);
+        try std.testing.expectEqualStrings("moved\n", text);
+    }
+};
+
+test "moveAcross traces the rename and the directory syncs that publish it" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-trace");
+    defer s.deinit();
+    const root = try fstat(s.d);
+
+    try s.put("src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "dst", .{}, renamed.faults(false));
+    try s.expectMoved("src", "dst");
+    try renamed.expectCalls(&.{ .rename, MoveTrace.sync(root) });
+
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "dst", s.d, "src", .{}, copied.faults(true));
+    try s.expectMoved("dst", "src");
+    try copied.expectCalls(&.{ .rename, MoveTrace.sync(root), MoveTrace.sync(root) });
+}
+
+test "moveAcross syncs the parent that receives a nested destination" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-nested-dst");
+    defer s.deinit();
+    const sub = try s.mkdir("sub");
+
+    try s.put("src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/renamed", .{}, renamed.faults(false));
+    try s.expectMoved("src", "sub/renamed");
+    try std.testing.expect(renamed.syncedAfterPublish(sub));
+
+    try s.put("src");
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/copied", .{}, copied.faults(true));
+    try s.expectMoved("src", "sub/copied");
+    try std.testing.expect(copied.syncedAfterPublish(sub));
+}
+
+test "moveAcross syncs the source parent beside a nested destination" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-nested-src");
+    defer s.deinit();
+    const root = try fstat(s.d);
+    const sub = try s.mkdir("sub");
+    const a = try s.mkdir("a");
+
+    try s.put("src");
+    var flat = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/flat", .{}, flat.faults(false));
+    try s.expectMoved("src", "sub/flat");
+    try std.testing.expect(flat.syncedAfterPublish(sub));
+    try std.testing.expect(flat.syncedAfterPublish(root));
+
+    try s.put("a/src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/renamed", .{}, renamed.faults(false));
+    try s.expectMoved("a/src", "sub/renamed");
+    try std.testing.expect(renamed.syncedAfterPublish(sub));
+    try std.testing.expect(renamed.syncedAfterPublish(a));
+
+    try s.put("a/src");
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/copied", .{}, copied.faults(true));
+    try s.expectMoved("a/src", "sub/copied");
+    try std.testing.expect(copied.syncedAfterPublish(sub));
+    try std.testing.expect(copied.syncedAfterPublish(a));
+
+    var beside = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "sub/copied", s.d, "sub/beside", .{}, beside.faults(false));
+    try s.expectMoved("sub/copied", "sub/beside");
+    try beside.expectCalls(&.{ .rename, MoveTrace.sync(sub) });
+}
 
 test "moveAcross falls back on EXDEV and removes the source after publish" {
     const gpa = std.testing.allocator;

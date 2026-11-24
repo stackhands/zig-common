@@ -315,10 +315,12 @@ fn childExec(
     // closed) moves above 2 first: a dup2 onto it would clobber it, and a
     // dup2 onto itself keeps its close-on-exec flag.
     var src = [3]sys.fd_t{ in_fd, out_fd, err_fd };
-    for (&src) |*fd| if (fd.* < 3) {
-        const moved = linux.fcntl(fd.*, linux.F.DUPFD, 3);
-        if (linux.errno(moved) != .SUCCESS) linux.exit_group(127);
-        fd.* = @intCast(moved);
+    for (&src, 0..) |*fd, i| if (fd.* < 3) {
+        const old = fd.*;
+        fd.* = sys.keepAboveStdio(old) catch linux.exit_group(127);
+        for (src[i + 1 ..]) |*later| if (later.* == old) {
+            later.* = fd.*;
+        };
     };
     for (src, 0..) |fd, target| {
         if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(127);
@@ -524,15 +526,11 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     defer if (exec_p) |p| sys.close(p.r);
     if (opts.exec_error) {
         var p = try pipe();
-        if (p.w < 3) {
-            const moved = sys.call(linux.fcntl, .{ p.w, linux.F.DUPFD_CLOEXEC, @as(usize, 3) }) catch |e| {
-                sys.close(p.r);
-                sys.close(p.w);
-                return e;
-            };
+        p.w = sys.keepAboveStdio(p.w) catch |e| {
+            sys.close(p.r);
             sys.close(p.w);
-            p.w = @intCast(moved);
-        }
+            return e;
+        };
         exec_p = p;
     }
 

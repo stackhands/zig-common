@@ -133,8 +133,9 @@ fn touch(fd: sys.fd_t) void {
 
 fn write(path: []const u8, data: []const u8, opts: atomic.WriteOptions) atomic.Error!void {
     var why: atomic.Why = .{};
+    defer why.deinit(A);
     atomic.atomicWrite(A, path, data, opts, &why) catch |e| {
-        last_why = why.msg;
+        last_why = A.dupe(u8, why.msg) catch "out of memory";
         return e;
     };
 }
@@ -1716,16 +1717,17 @@ test "atomicWrite frees what it allocates but a refusal's message" {
         const s = scenario(&m);
         defer cleanup(s.dir);
         var why: atomic.Why = .{};
+        defer why.deinit(gpa);
         try atomic.atomicWrite(gpa, s.path, "new", replace, &why);
         try atomic.atomicWrite(gpa, join(s.dir, "copy.lua"), "copy", .{ .metadata_from = s.path }, &why);
         try testing.expectEqualStrings("", why.msg);
         try testing.expectError(error.Refused, atomic.atomicWrite(gpa, s.path, "x", .{ .step = "replace", .faults = .{ .fail_fn = failFsync } }, &why));
-        gpa.free(why.msg);
+        why.deinit(gpa);
         target = s.path;
         hook_errno = .STALE;
         m.hooks.get = hFail;
         try testing.expectError(error.Refused, atomic.atomicWrite(gpa, s.path, "x", replace, &why));
-        gpa.free(why.msg);
+        why.deinit(gpa);
         reset(&m);
         try testing.expectEqualStrings("new", readFile(s.path));
         try expectAttrs(s.expected, m.getPath(s.path));
@@ -1744,6 +1746,164 @@ fn exdevRenameat(_: sys.fd_t, _: [*:0]const u8, _: sys.fd_t, _: [*:0]const u8) u
     return err(.XDEV);
 }
 
+fn eioFsync(_: sys.fd_t) usize {
+    return err(.IO);
+}
+
+fn closedOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
+    const rc = linux.openat(dir, path, flags, mode);
+    if (linux.errno(rc) == .SUCCESS) sys.close(@intCast(rc));
+    return rc;
+}
+
+/// Remove the open file, then fail the write with EIO. Cleanup's later
+/// stat or unlink fails with ENOENT, a different errno.
+fn ioAfterUnlink(fd: sys.fd_t, _: []const u8) usize {
+    var buf: [sys.path_max]u8 = undefined;
+    const path = fsx.realpathFd(fd, &buf) catch unreachable;
+    sys.unlinkat(fsx.cwd, path, 0) catch unreachable;
+    return err(.IO);
+}
+
+/// Open the temporary file, remove it, and close the descriptor. The
+/// following fstat fails with EBADF and the cleanup unlink with ENOENT.
+fn closeAndUnlink(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
+    const rc = linux.openat(dir, path, flags, mode);
+    if (linux.errno(rc) != .SUCCESS) return rc;
+    const fd: sys.fd_t = @intCast(rc);
+    const un = linux.unlinkat(dir, path, 0);
+    sys.close(fd);
+    if (linux.errno(un) != .SUCCESS) return un;
+    return rc;
+}
+
+var stale_path: []const u8 = "";
+var parent_path: []const u8 = "";
+var moved_parent_path: []const u8 = "";
+
+fn replaceStaleWithDirectory() linux.uid_t {
+    sys.unlinkat(fsx.cwd, stale_path, 0) catch unreachable;
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, stale_path) catch unreachable).ptr, 0o700);
+    return linux.geteuid();
+}
+
+fn renameThenUseProcParent(old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize {
+    const rc = linux.renameat(old_dir, old_path, new_dir, new_path);
+    if (linux.errno(rc) != .SUCCESS) return rc;
+    _ = linux.renameat(fsx.cwd, z(parent_path).ptr, fsx.cwd, z(moved_parent_path).ptr);
+    _ = linux.symlinkat("/proc", fsx.cwd, z(parent_path).ptr);
+    return rc;
+}
+
+fn restoreProcParent() void {
+    _ = linux.unlinkat(fsx.cwd, z(parent_path).ptr, 0);
+    _ = linux.renameat(fsx.cwd, z(moved_parent_path).ptr, fsx.cwd, z(parent_path).ptr);
+}
+
+test "OSError messages cover write, fsync, fstat, and stale unlink failures" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    const tmp = join(dir, ".fresh.new");
+
+    atomic.ops.write = enospcWrite;
+    try testing.expectError(error.NoSpace, write(path, "new", replace));
+    try testing.expectEqualStrings("[Errno 28] No space left on device", last_why);
+
+    atomic.ops.* = .{};
+    atomic.ops.fsync = eioFsync;
+    try testing.expectError(error.Unexpected, write(path, "new", replace));
+    try testing.expectEqualStrings("[Errno 5] Input/output error", last_why);
+
+    atomic.ops.* = .{};
+    atomic.ops.openat = closedOpenat;
+    try testing.expectError(error.InvalidArgument, write(path, "new", replace));
+    try testing.expectEqualStrings("[Errno 9] Bad file descriptor", last_why);
+
+    atomic.ops.* = .{};
+    writeFile(tmp, "stale");
+    stale_path = tmp;
+    atomic.ops.geteuid = replaceStaleWithDirectory;
+    try testing.expectError(error.IsDir, write(path, "new", replace));
+    try testing.expectEqualStrings(try A.print("[Errno 21] Is a directory: '{s}'", .{tmp}), last_why);
+}
+
+test "discard keeps the errno when its stat fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    // The write hook removes the temporary file, so discard's stat is ENOENT.
+    atomic.ops.write = ioAfterUnlink;
+    try testing.expectError(error.Unexpected, write(path, "new", replace));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqualStrings("[Errno 5] Input/output error", last_why);
+}
+
+test "fstat cleanup keeps the errno when its unlink fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    // The open hook closes the descriptor and removes the file, so fstat is
+    // EBADF and the cleanup unlink is ENOENT.
+    atomic.ops.openat = closeAndUnlink;
+    try testing.expectError(error.InvalidArgument, write(path, "new", replace));
+    try testing.expectEqual(linux.E.BADF, sys.last_errno);
+    try testing.expectEqualStrings("[Errno 9] Bad file descriptor", last_why);
+}
+
+test "atomicWriteAt cleanup keeps the errno when its unlink fails" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    atomic.ops.write = ioAfterUnlink;
+    const dfd = try fsx.openDir(fsx.cwd, dir, false);
+    defer sys.close(dfd);
+    try testing.expectError(error.Unexpected, atomic.atomicWriteAt(A, dfd, "at", "new", 0o644));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+}
+
+test "a parent fsync failure carries no filename and keeps its errno" {
+    begin();
+    defer end();
+    const dir = tmpdir();
+    defer cleanup(dir);
+    parent_path = dir;
+    moved_parent_path = A.print("{s}.moved", .{dir}) catch unreachable;
+    const path = join(dir, "fresh");
+    atomic.ops.renameat = renameThenUseProcParent;
+    const result = write(path, "new", replace);
+    const kept_errno = sys.last_errno;
+    restoreProcParent();
+    try testing.expectError(error.InvalidArgument, result);
+    try testing.expectEqual(linux.E.INVAL, kept_errno);
+    try testing.expectEqualStrings("[Errno 22] Invalid argument", last_why);
+    try testing.expectEqualStrings("new", readFile(path));
+}
+
+test "a sys-error message can be released with a general-purpose allocator" {
+    begin();
+    defer end();
+    const gpa = testing.allocator;
+    const dir = tmpdir();
+    defer cleanup(dir);
+    const path = join(dir, "fresh");
+    atomic.ops.write = enospcWrite;
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    try testing.expectError(error.NoSpace, atomic.atomicWrite(gpa, path, "new", replace, &why));
+    try testing.expectEqualStrings("[Errno 28] No space left on device", why.msg);
+    why.deinit(gpa);
+    try testing.expectEqualStrings("", why.msg);
+}
+
 test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching the live file" {
     begin();
     defer end();
@@ -1754,6 +1914,7 @@ test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching th
     atomic.ops.write = enospcWrite;
     try testing.expectError(error.NoSpace, write(pt[0], "new", replace));
     try testing.expectEqualStrings("[Errno 28] No space left on device", atomic.describe(error.NoSpace));
+    try testing.expectEqualStrings("[Errno 28] No space left on device", last_why);
     try testing.expect(!exists(pt[1]));
     try testing.expectEqualStrings("old", readFile(pt[0]));
 
@@ -1761,6 +1922,7 @@ test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching th
     atomic.ops.openat = erofsOpenat;
     try testing.expectError(error.ReadOnly, write(pt[0], "new", replace));
     try testing.expectEqualStrings("[Errno 30] Read-only file system", atomic.describe(error.ReadOnly));
+    try testing.expectEqualStrings(try A.print("[Errno 30] Read-only file system: '{s}'", .{pt[1]}), last_why);
     try testing.expect(!exists(pt[1]));
     try testing.expectEqualStrings("old", readFile(pt[0]));
 
@@ -1768,6 +1930,7 @@ test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching th
     atomic.ops.renameat = exdevRenameat;
     try testing.expectError(error.CrossDevice, write(pt[0], "new", replace));
     try testing.expectEqualStrings("[Errno 18] Invalid cross-device link", atomic.describe(error.CrossDevice));
+    try testing.expectEqualStrings(try A.print("[Errno 18] Invalid cross-device link: '{s}' -> '{s}'", .{ pt[1], pt[0] }), last_why);
     try testing.expect(!exists(pt[1]));
     try testing.expectEqualStrings("old", readFile(pt[0]));
 

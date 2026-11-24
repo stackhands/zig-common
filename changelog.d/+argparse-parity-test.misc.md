@@ -1,1 +1,0 @@
-Add a runtime-seeded differential parity test (`tests/test_argparse_parity.py` and `zig build argparse-parity-probe`) comparing `argparse` against Python 3.14 `argparse` and fixing two subtle edge cases uncovered by fuzzing.
