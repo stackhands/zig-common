@@ -412,12 +412,45 @@ const MoveFaults = struct {
     force_cross_device_rename: bool = false,
     reach_fn: ?*const fn (?*anyopaque, []const u8) void = null,
     fail_fn: ?*const fn (?*anyopaque, []const u8) ?Error = null,
+    trace_fn: ?*const fn (?*anyopaque, MoveCall) void = null,
     ctx: ?*anyopaque = null,
+};
+
+/// A rename or directory sync that moveAcross completed; the descriptor of
+/// a sync is open only while the trace runs.
+const MoveCall = union(enum) {
+    rename,
+    fsync: fd_t,
 };
 
 fn moveFaultsStep(faults: MoveFaults, step: []const u8) Error!void {
     if (faults.reach_fn) |f| f(faults.ctx, step);
     if (faults.fail_fn) |f| if (f(faults.ctx, step)) |err| return err;
+}
+
+fn moveRename(faults: MoveFaults, old_dir: fd_t, old_name: []const u8, new_dir: fd_t, new_name: []const u8) Error!void {
+    try sys.renameat(old_dir, old_name, new_dir, new_name);
+    if (faults.trace_fn) |f| f(faults.ctx, .rename);
+}
+
+fn moveFsync(faults: MoveFaults, dir: fd_t) Error!void {
+    try sys.fsync(dir);
+    if (faults.trace_fn) |f| f(faults.ctx, .{ .fsync = dir });
+}
+
+/// `fsyncNameParent` for moveAcross, reported to its trace.
+fn moveFsyncNameParent(faults: MoveFaults, dir: fd_t, name: []const u8) Error!void {
+    const parent_dir = try openDir(dir, std.fs.path.dirname(name) orelse ".", true);
+    defer sys.close(parent_dir);
+    try moveFsync(faults, parent_dir);
+}
+
+/// Whether `a_dir/a_name` and `b_dir/b_name` name entries of the same
+/// directory by the same path. False does not mean the directories differ.
+fn sameNameParent(a_dir: fd_t, a_name: []const u8, b_dir: fd_t, b_name: []const u8) bool {
+    const a = std.fs.path.dirname(a_name) orelse ".";
+    const b = std.fs.path.dirname(b_name) orelse ".";
+    return a_dir == b_dir and std.mem.eql(u8, a, b);
 }
 
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
@@ -543,24 +576,24 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     }
 
     try moveFaultsStep(faults, "move.publish");
-    try sys.renameat(dst_dir, tmp, dst_dir, dst_name);
+    try moveRename(faults, dst_dir, tmp, dst_dir, dst_name);
     published = true;
-    try sys.fsync(dst_dir);
+    try moveFsyncNameParent(faults, dst_dir, dst_name);
     try moveFaultsStep(faults, "move.remove-source");
     if (src.isDir()) {
         try deleteTree(gpa, src_dir, src_name);
     } else {
         try sys.unlinkat(src_dir, src_name, 0);
     }
-    try sys.fsync(src_dir);
+    try moveFsyncNameParent(faults, src_dir, src_name);
 }
 
 fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions, faults: MoveFaults) (Error || Allocator.Error)!void {
     try moveFaultsStep(faults, "move.rename");
     if (!faults.force_cross_device_rename) {
-        if (sys.renameat(src_dir, src_name, dst_dir, dst_name)) |_| {
-            try sys.fsync(dst_dir);
-            if (src_dir != dst_dir) try sys.fsync(src_dir);
+        if (moveRename(faults, src_dir, src_name, dst_dir, dst_name)) |_| {
+            try moveFsyncNameParent(faults, dst_dir, dst_name);
+            if (!sameNameParent(src_dir, src_name, dst_dir, dst_name)) try moveFsyncNameParent(faults, src_dir, src_name);
             return;
         } else |err| switch (err) {
             error.CrossDevice => {},
@@ -1630,6 +1663,169 @@ const MoveProbe = struct {
         self.seen.deinit(std.testing.allocator);
     }
 };
+
+/// The renames and directory syncs one moveAcross call makes, in order. A
+/// sync is kept as the device and inode of the directory it flushed.
+const MoveTrace = struct {
+    calls: [16]Call = undefined,
+    len: usize = 0,
+
+    const Call = union(enum) {
+        rename,
+        fsync: struct { dev: u64, ino: u64 },
+    };
+
+    fn record(ctx: ?*anyopaque, call: MoveCall) void {
+        const self: *MoveTrace = @ptrCast(@alignCast(ctx.?));
+        if (self.len == self.calls.len) return;
+        self.calls[self.len] = switch (call) {
+            .rename => .rename,
+            .fsync => |fd| if (fstat(fd)) |st| .{ .fsync = .{ .dev = st.dev, .ino = st.ino } } else |_| .{ .fsync = .{ .dev = 0, .ino = 0 } },
+        };
+        self.len += 1;
+    }
+
+    fn faults(self: *MoveTrace, cross_device: bool) MoveFaults {
+        return .{ .force_cross_device_rename = cross_device, .trace_fn = record, .ctx = self };
+    }
+
+    fn sync(dir: Stat) Call {
+        return .{ .fsync = .{ .dev = dir.dev, .ino = dir.ino } };
+    }
+
+    fn expectCalls(self: *const MoveTrace, want: []const Call) !void {
+        try std.testing.expectEqualSlices(Call, want, self.calls[0..self.len]);
+    }
+
+    /// Whether `dir` is synced after the last rename.
+    fn syncedAfterPublish(self: *const MoveTrace, dir: Stat) bool {
+        var i = self.len;
+        while (i > 0) {
+            i -= 1;
+            switch (self.calls[i]) {
+                .rename => return false,
+                .fsync => |s| if (s.dev == dir.dev and s.ino == dir.ino) return true,
+            }
+        }
+        return false;
+    }
+};
+
+/// Scratch directory under `.zig-cache` for the moveAcross trace tests.
+const MoveScratch = struct {
+    gpa: Allocator,
+    base: []u8,
+    d: fd_t,
+
+    fn init(gpa: Allocator, tag: []const u8) !MoveScratch {
+        var cwd_buf: [sys.path_max]u8 = undefined;
+        const here = try realpath(cwd, ".", &cwd_buf);
+        const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-{s}-{d}", .{ here, tag, linux.getpid() });
+        errdefer gpa.free(base);
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
+        return .{ .gpa = gpa, .base = base, .d = try openDir(cwd, base, false) };
+    }
+
+    fn deinit(self: MoveScratch) void {
+        deleteTree(self.gpa, cwd, self.base) catch {};
+        sys.close(self.d);
+        self.gpa.free(self.base);
+    }
+
+    fn mkdir(self: MoveScratch, name: []const u8) !Stat {
+        var zb: [sys.path_max:0]u8 = undefined;
+        _ = try sys.call(linux.mkdirat, .{ self.d, (try sys.z(&zb, name)).ptr, @as(linux.mode_t, 0o700) });
+        return statAt(self.d, name, false);
+    }
+
+    fn put(self: MoveScratch, name: []const u8) !void {
+        const fd = try sys.openat(self.d, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+        defer sys.close(fd);
+        try sys.writeAll(fd, "moved\n");
+    }
+
+    fn expectMoved(self: MoveScratch, src: []const u8, dst: []const u8) !void {
+        try std.testing.expectError(error.NotFound, statAt(self.d, src, false));
+        const got = try openRegular(self.d, dst, false);
+        defer sys.close(got.fd);
+        const text = try readAll(self.gpa, got.fd, 64);
+        defer self.gpa.free(text);
+        try std.testing.expectEqualStrings("moved\n", text);
+    }
+};
+
+test "moveAcross traces the rename and the directory syncs that publish it" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-trace");
+    defer s.deinit();
+    const root = try fstat(s.d);
+
+    try s.put("src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "dst", .{}, renamed.faults(false));
+    try s.expectMoved("src", "dst");
+    try renamed.expectCalls(&.{ .rename, MoveTrace.sync(root) });
+
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "dst", s.d, "src", .{}, copied.faults(true));
+    try s.expectMoved("dst", "src");
+    try copied.expectCalls(&.{ .rename, MoveTrace.sync(root), MoveTrace.sync(root) });
+}
+
+test "moveAcross syncs the parent that receives a nested destination" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-nested-dst");
+    defer s.deinit();
+    const sub = try s.mkdir("sub");
+
+    try s.put("src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/renamed", .{}, renamed.faults(false));
+    try s.expectMoved("src", "sub/renamed");
+    try std.testing.expect(renamed.syncedAfterPublish(sub));
+
+    try s.put("src");
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/copied", .{}, copied.faults(true));
+    try s.expectMoved("src", "sub/copied");
+    try std.testing.expect(copied.syncedAfterPublish(sub));
+}
+
+test "moveAcross syncs the source parent beside a nested destination" {
+    const gpa = std.testing.allocator;
+    const s = try MoveScratch.init(gpa, "move-nested-src");
+    defer s.deinit();
+    const root = try fstat(s.d);
+    const sub = try s.mkdir("sub");
+    const a = try s.mkdir("a");
+
+    try s.put("src");
+    var flat = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/flat", .{}, flat.faults(false));
+    try s.expectMoved("src", "sub/flat");
+    try std.testing.expect(flat.syncedAfterPublish(sub));
+    try std.testing.expect(flat.syncedAfterPublish(root));
+
+    try s.put("a/src");
+    var renamed = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/renamed", .{}, renamed.faults(false));
+    try s.expectMoved("a/src", "sub/renamed");
+    try std.testing.expect(renamed.syncedAfterPublish(sub));
+    try std.testing.expect(renamed.syncedAfterPublish(a));
+
+    try s.put("a/src");
+    var copied = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/copied", .{}, copied.faults(true));
+    try s.expectMoved("a/src", "sub/copied");
+    try std.testing.expect(copied.syncedAfterPublish(sub));
+    try std.testing.expect(copied.syncedAfterPublish(a));
+
+    var beside = MoveTrace{};
+    try moveAcrossInternal(gpa, s.d, "sub/copied", s.d, "sub/beside", .{}, beside.faults(false));
+    try s.expectMoved("sub/copied", "sub/beside");
+    try beside.expectCalls(&.{ .rename, MoveTrace.sync(sub) });
+}
 
 test "moveAcross falls back on EXDEV and removes the source after publish" {
     const gpa = std.testing.allocator;

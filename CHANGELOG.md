@@ -2,6 +2,82 @@
 
 <!-- towncrier release notes start -->
 
+## 0.12.0 (2026-11-19)
+
+### Features
+
+- `syslog`: `Identity` names the program and the structured-data identifier of an event; `formatRfc5424For`, `formatJournaldFor` and `emitFor` take one, and `send` delivers an already formatted payload, for a tool with formatting of its own. The functions without an identity keep writing `eb-keep-logs`, as 0.11.0 did, and are removed in 0.13.0.
+
+### Miscellaneous
+
+- Prepare `zig-common` `0.12.0` in `COMPAT.md` for callers adopting `syslog.Identity` and `syslog.send`.
+
+
+## 0.11.0 (2026-11-19)
+
+### Features
+
+- Add `pytext.osError` and `pytext.osErrorErrno` for Python-formatted `OSError` path messages.
+- Add `pytext.reprStr` and `pytext.reprStrAlloc` for Python-compatible surrogateescape string quoting.
+- Add `state.lockExclusiveCancel` supporting atomic cancellation while polling `flock`.
+- Add `sys.strerror` returning `errnoText(e)` or the enum tag name fallback.
+- `json.writeCacheStringTo` writes cache-style JSON strings to a writer without allocation.
+- `proc.resolveExecutable` resolves executable names to absolute executable regular-file paths from slash paths or PATH lookup with a null-PATH default of `/bin:/usr/bin`.
+- `proc.whichShutil` adds an opt-in executable lookup mode that matches POSIX `shutil.which` behavior.
+- `syslog`: the RFC 5424 and systemd-journald event emitter that eb-keep-logs and eessi-arch-guard each carried a copy of: `Target`, `parseTarget`, `parsePen`, `formatRfc5424`, `formatJournald` and `emit`.
+
+### Fixes
+
+- Decode UTF-8 keys, UTF-16 surrogate pairs, and surrogateescape cache bytes in `json.Value.get` so escaped non-ASCII keys match like `json.loads`.
+- Fix `sys.strerror` to avoid panicking on unnamed `linux.E` values by using `std.enums.tagName` with an `"Unknown error N"` fallback.
+- `fsx.appendLine` reports `not a regular file` for an existing non-regular target such as a FIFO.
+- `fsx.moveAcross` reports `error.NotRegularFile` when EXDEV fallback copies a tree entry that none of the earlier copy branches handle.
+- `fsx.moveAcross` reports `not a regular file` for a FIFO source that takes the EXDEV copy fallback.
+- `fsx.openRegular` now reports `error.NotRegularFile` for FIFOs, sockets, and device nodes, and `sys.describe` renders that as `not a regular file` instead of `[Errno 22] Invalid argument`.
+- `fsx.openRegular` now returns `error.IsDir` for directory paths, so `sys.describe` reports `[Errno 21] Is a directory` instead of `[Errno 22] Invalid argument` for that case.
+
+### Documentation
+
+- List every public function and error set including PR #24 shared helpers in `docs/orgmode/reference/api.org`.
+
+### Miscellaneous
+
+- Add `atomic.Ops` fault hooks and unit tests covering `atomicWrite` failures on `ENOSPC`, `EROFS`, and `EXDEV`, as well as `makedirs` and `fsyncDir` error paths.
+- Add unit tests covering `gzipInPlace` error paths (missing file, directory, symlink, hard link, and existing `.gz` archive) in `src/logs.zig`.
+- Add unit tests covering `sys.errnoText` for unknown errno values and error paths for `sys` syscall wrappers.
+- Add unit tests covering error and boundary paths for `which`, `groupAlive`, `killGroup`, `stopGroup`, and `run` in `src/proc.zig`.
+- Add unit tests covering error paths for public file and directory helpers in `src/fsx.zig`.
+- Add unit tests verifying `cli.put` and `cli.print` ignore descriptor write errors and checking `cli.versionLine` formatting.
+- Prepare `zig-common` `0.11.0` in `COMPAT.md` for callers adopting `syslog`. A release is now `cog bump` on a release branch: `cog.toml` sets the version in `build.zig.zon` and refuses a version without a `COMPAT.md` row.
+- Proc resolver tests share one executable fixture helper for scratch script and plain file setup.
+- Route `lockExclusiveCancel` through `state.lock_ops.flock` and add unit tests covering `lockExclusive` with timeout 0, bounded timeout, unsupported `flock`, and private state file error paths.
+- The private `proc.isExecutableFile` helper holds the executable regular-file probe that `proc.which` runs for each PATH candidate.
+- `json.writeWireString` writes each string through one writer and the shared escape code.
+- `proc.resolveExecutable` tests cover relative slash paths for executable and non-executable files.
+- `proc.which` tests cover executable resolution and null returns for non-executable candidates.
+- `proc.which` uses one internal options-driven search loop for executable path matching.
+- `proc` test fixtures clean up scratch directories when setup fails after partial creation.
+
+
+## 0.10.0 (2026-11-18)
+
+### Features
+
+- Add `fsx.mkdtemp` to create a private `0700` directory with a random suffix under a given parent directory and retry on name collisions.
+- Add `fsx.normPath` and `fsx.absPath` to normalize and absolutize POSIX paths without following symbolic links.
+- `fsx.moveAcross` adds a durable cross-filesystem move primitive: it tries `rename` first, falls back on EXDEV to a destination-side temporary copy, publishes with an atomic rename, and removes the source only after publish. The new `fsx.MoveAcrossOptions` policy is opt-in, with `strict` for ACL-preserving copies and `portable` for ACL downgrade when destination filesystems do not represent the source ACL form.
+
+### Documentation
+
+- Every `pub` declaration has a doc comment, whose first sentence is the summary the API pages list.
+- The documentation site is built from Org pages in `docs/orgmode/` with Sphinx, in four parts: the tutorial "Write a small tool on zig-common", how-to guides, explanation and reference. Each module's API page is generated from its doc comments, and the site publishes an `objects.inv` of every `pub` declaration for the tools' sites to link into. `pixi run -e docs docbld` builds it as CI does and fails on a warning, an unresolved name or a dead internal link; `pixi run -e docs linkcheck` checks the external links. The `docs` workflow publishes the site to GitHub Pages; `docs/requirements.txt` and `pages.yml` are gone.
+- The site has how-to guides for replacing a file and keeping its access control lists, keeping private state in `/tmp`, compressing logs that `.licensed-logs` marks, matching a Python tool's output and upgrading zig-common; explanations of process groups and deadlines, system calls without a C library, and Python compatibility; and a reference of the messages, exit statuses and version line that `cli` gives the tools.
+
+### Miscellaneous
+
+- Prepare `zig-common` `0.10.0` in `build.zig.zon` and `COMPAT.md` for callers adopting `fsx.mkdtemp` plus `fsx.normPath` and `fsx.absPath`.
+
+
 ## 0.9.0 (2026-11-16)
 
 ### Features

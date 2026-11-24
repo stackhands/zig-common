@@ -26,24 +26,19 @@ A reader sees the old file or the new one, never a part of either, and never the
 
    The steps that follow use =atomicWrite=.
 
-2. Call it with a [[zig:zig_common.atomic.Why]], which receives the reason for a refusal, and free that with =deinit=:
+2. Call it with a [[zig:zig_common.atomic.Why]], which receives the reason for any failure, and free that with =deinit=:
 
    #+begin_src zig
    var why: common.atomic.Why = .{};
    defer why.deinit(gpa);
-   common.atomic.atomicWrite(gpa, path, bytes, .{}, &why) catch |err| switch (err) {
-       error.Refused => {
-           common.cli.err("tool: {s}\n", .{why.msg});
-           return 1;
-       },
-       else => |e| {
-           common.cli.err("tool: {s}: {s}\n", .{ path, common.atomic.describe(e) });
-           return 1;
-       },
+   common.atomic.atomicWrite(gpa, path, bytes, .{}, &why) catch |err| {
+       const message = if (why.msg.len > 0) why.msg else common.atomic.describe(err);
+       common.cli.err("tool: {s}\n", .{message});
+       return 1;
    };
    #+end_src
 
-   [[zig:zig_common.atomic.describe]] words any other error as Python's =OSError= does, such as =[Errno 28] No space left on device=.
+   =why.msg= includes the filename or filenames of an operating-system error. If a failure happened before it could be filled, [[zig:zig_common.atomic.describe]] supplies text such as =[Errno 12] Cannot allocate memory=.
 
 3. To give the new file the access of another file, such as a file prepared beside the live one it is to replace, name that file in [[zig:zig_common.atomic.WriteOptions]]:
 
