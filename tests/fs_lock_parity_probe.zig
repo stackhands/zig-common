@@ -17,6 +17,12 @@
 //!    short timeout, printing the outcome. The test holds the lock.
 //!  - `hold-lock PATH MS`: takes the lock with no timeout, prints
 //!    `held`, sleeps MS and exits, releasing the lock as it goes.
+//!  - `osfail`: atomicWrite failures. The last field is the full
+//!    `why.msg`, compared with str() of the OSError Python raises for
+//!    the same call.
+//!  - `rootlock`: RootLock.acquire failures. The last two fields are
+//!    osFailure text and path, or NONE when the failure was not an
+//!    operating-system error.
 const std = @import("std");
 const linux = std.os.linux;
 const common = @import("zig_common");
@@ -175,7 +181,13 @@ fn atomicMode() void {
     };
     for (aw_cases) |c| {
         var why: common.atomic.Why = .{};
-        opLine("atomicwrite", c.name, common.atomic.atomicWrite(A, c.name, c.data, c.opts, &why));
+        const result = common.atomic.atomicWrite(A, c.name, c.data, c.opts, &why);
+        if (result) |_| {
+            emit(&.{ "atomicwrite", hexOf(c.name), "OK", hexOf(why.msg) });
+        } else |e| {
+            const status = std.fmt.allocPrint(A, "ERR:{s}", .{errName(e)}) catch unreachable;
+            emit(&.{ "atomicwrite", hexOf(c.name), status, hexOf(why.msg) });
+        }
         why.deinit(A);
     }
     const rc_cases = [_]struct { name: []const u8, data: []const u8 }{
@@ -197,6 +209,142 @@ fn atomicMode() void {
     for (ap_cases) |c| {
         opLine("appendline", c.name, fsx.appendLine(A, dir, c.name, c.line));
     }
+}
+
+/// One atomicWrite, including the full failure text. `why.msg` is copied
+/// into the output before it is freed.
+fn writeFail(name: []const u8, path: []const u8, data: []const u8, opts: common.atomic.WriteOptions) void {
+    var why: common.atomic.Why = .{};
+    const result = common.atomic.atomicWrite(A, path, data, opts, &why);
+    const status = if (result) |_|
+        "OK"
+    else |e|
+        std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable;
+    emit(&.{ "osfail", name, status, hexOf(why.msg) });
+    why.deinit(A);
+}
+
+/// A write that the file-size limit stops. Python's os.write names no
+/// file for that OSError, and neither does atomicWrite. A flush of a
+/// regular file cannot be made to fail from this process, so the write
+/// is the no-filename failure the probe can raise.
+fn writeTooBig() void {
+    var old: linux.rlimit = undefined;
+    if (linux.errno(linux.prlimit(0, .FSIZE, null, &old)) != .SUCCESS) {
+        emit(&.{ "osfail", "write-fsize", "SKIP", "" });
+        return;
+    }
+    const unlimited = std.math.maxInt(u64);
+    const room: u64 = if (old.max == unlimited) 8 else old.max;
+    if (room < 8) {
+        emit(&.{ "osfail", "write-fsize", "SKIP", "" });
+        return;
+    }
+    const ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    var prev: linux.Sigaction = undefined;
+    _ = linux.sigaction(.XFSZ, &ign, &prev);
+    defer _ = linux.sigaction(.XFSZ, &prev, null);
+    const lim: linux.rlimit = .{ .cur = 8, .max = old.max };
+    if (linux.errno(linux.prlimit(0, .FSIZE, &lim, null)) != .SUCCESS) {
+        emit(&.{ "osfail", "write-fsize", "SKIP", "" });
+        return;
+    }
+    defer _ = linux.prlimit(0, .FSIZE, &old, null);
+    var payload: [64]u8 = @splat('x');
+    writeFail("write-fsize", "fsize-out", &payload, .{});
+}
+
+fn chmodAt(path: []const u8, mode: linux.mode_t) void {
+    var zb: [sys.path_max:0]u8 = undefined;
+    const z = sys.z(&zb, path) catch unreachable;
+    if (linux.errno(linux.fchmodat(fsx.cwd, z.ptr, mode)) != .SUCCESS) unreachable;
+}
+
+/// `osfail` mode: real atomicWrite failures whose text is Python's
+/// OSError for the same operation. The fixture is created here, in the
+/// working directory, and any directory made unwritable is restored
+/// before returning so the caller can remove the tree.
+fn osFailMode() void {
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "ro") catch unreachable).ptr, 0o755);
+    if (linux.geteuid() == 0) {
+        emit(&.{ "osfail", "open-ro", "SKIP", "" });
+        emit(&.{ "osfail", "mkdir-ro", "SKIP", "" });
+    } else {
+        chmodAt("ro", 0o555);
+        defer chmodAt("ro", 0o755);
+        // open of the temporary file, which Python names rather than the
+        // destination
+        writeFail("open-ro", "ro/new", "x\n", .{});
+        // mkdir of the first missing ancestor, not the leaf that was asked for
+        writeFail("mkdir-ro", "ro/a/b/file", "x\n", .{});
+    }
+
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "adir") catch unreachable).ptr, 0o755);
+    const meta = sys.openat(fsx.cwd, "meta", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644) catch unreachable;
+    sys.writeAll(meta, "m\n") catch unreachable;
+    sys.close(meta);
+    // metadata comes from a regular file, so the directory at the
+    // destination is reached by rename rather than refused as a source
+    writeFail("rename-dir", "adir", "data\n", .{ .metadata_from = "meta" });
+
+    _ = linux.symlinkat("nowhere", fsx.cwd, (sys.z(&zb, "gone") catch unreachable).ptr);
+    writeFail("missing-ancestor", "gone/a/b/file", "x\n", .{});
+    writeTooBig();
+}
+
+fn lockCase(name: []const u8, root: []const u8) void {
+    if (state.RootLock.acquire(A, root, 0)) |held| {
+        held.release();
+        emit(&.{ "rootlock", name, "OK", "", "" });
+    } else |e| {
+        const status = std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable;
+        if (state.osFailure()) |failure| {
+            emit(&.{ "rootlock", name, status, hexOf(failure.text), hexOf(failure.path) });
+        } else {
+            emit(&.{ "rootlock", name, status, "NONE", "NONE" });
+        }
+    }
+}
+
+/// `rootlock` mode: RootLock.acquire failures. Text and path are the
+/// osFailure snapshot; NONE means the failure was not an OS error and
+/// the snapshot was cleared.
+fn rootLockMode() void {
+    var zb: [sys.path_max:0]u8 = undefined;
+    const file = sys.openat(fsx.cwd, "fileroot", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644) catch unreachable;
+    sys.close(file);
+    lockCase("file-root", "fileroot");
+
+    _ = linux.symlinkat("nowhere", fsx.cwd, (sys.z(&zb, "dangling") catch unreachable).ptr);
+    lockCase("dangling-root", "dangling");
+
+    _ = linux.symlinkat("nowhere", fsx.cwd, (sys.z(&zb, "gone") catch unreachable).ptr);
+    lockCase("ancestor", "gone/a/b");
+
+    if (linux.geteuid() == 0) {
+        emit(&.{ "rootlock", "gate-ro", "SKIP", "", "" });
+        emit(&.{ "rootlock", "sidecar-ro", "SKIP", "", "" });
+    } else {
+        _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "gate") catch unreachable).ptr, 0o755);
+        chmodAt("gate", 0o555);
+        defer chmodAt("gate", 0o755);
+        lockCase("gate-ro", "gate");
+
+        _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "side") catch unreachable).ptr, 0o755);
+        const side = sys.openat(fsx.cwd, "side/.lock", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600) catch unreachable;
+        sys.close(side);
+        chmodAt("side", 0o555);
+        defer chmodAt("side", 0o755);
+        lockCase("sidecar-ro", "side");
+    }
+
+    // a directory planted at the gate is refused without an OSError, and
+    // only after the cases above have recorded one, so a stale snapshot
+    // would show up here
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "gatedir") catch unreachable).ptr, 0o755);
+    _ = linux.mkdirat(fsx.cwd, (sys.z(&zb, "gatedir/.lock") catch unreachable).ptr, 0o755);
+    lockCase("gate-dir", "gatedir");
 }
 
 /// `which` mode: whichShutil over a PATH fixture the test built around
@@ -881,6 +1029,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         effectsMode();
     } else if (std.mem.eql(u8, mode, "atomic")) {
         atomicMode();
+    } else if (std.mem.eql(u8, mode, "osfail")) {
+        osFailMode();
+    } else if (std.mem.eql(u8, mode, "rootlock")) {
+        rootLockMode();
     } else if (std.mem.eql(u8, mode, "which")) {
         whichMode();
     } else if (std.mem.eql(u8, mode, "diag")) {
