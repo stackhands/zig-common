@@ -1,1 +1,0 @@
-Add differential parity fuzz tests covering variadic intermixed positionals (`parse_intermixed_args`) plus `Policy.native_exact` with `SpecialActionMode.prescan` and `CommandSpec.mutually_exclusive` alongside `PositionalSpec.ignore_empty` and `ErrorKind`.

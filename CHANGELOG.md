@@ -2,6 +2,136 @@
 
 <!-- towncrier release notes start -->
 
+## 0.13.0 (2026-11-24)
+
+### Features
+
+- Add `Policy.native_exact` with `NegativeNumberMode.any` and `SpecialActionMode.prescan` plus `Policy.fail_fast` and `CommandSpec.mutually_exclusive` alongside `OptionSpec.allow_empty` / `allow_dash_value` in `zig_common.argparse`.
+- Add `Policy.prolog_lenient` preset with `optional_value` (`nargs="?"`, `const=""`), deferred help/version recording, silent unknown skipping, and non-exiting Slurm TaskProlog semantics.
+- Add `PositionalArity.zero_or_more` and `PositionalArity.one_or_more` alongside `PositionalSpec.ignore_empty` and `UnknownMode.positional` in `zig_common.argparse`.
+- Add `argparse.types` eager validators (`pyFloat`, `nonNegativeFiniteFloat`, `nonNegativeU128`, `boundedU64`, `choice`) and eager option/positional choice checking in `src/argparse.zig`.
+- Add `cli.Stdout` and `cli.writeOut` for checked standard-output writes that report the first write error on standard error and turn a zero exit status into `1`.
+- Add `fsx.TempDir`, a port of `tempfile.gettempdir`. It probes the candidates from the environment first and the system directories after. Each probe is a file write, as in Python. The answer is made absolute and normalized, and it is kept for later calls. A failure gives the text of Python's FileNotFoundError, which lists the candidates. The `TempDir` owns the answer and the message, and `deinit` frees them. `fsx.tempDirCandidates` returns the list alone, and `fsx.freeTempDirCandidates` frees it.
+- Add `fsx.mkstemp` to create a private `0600` file with a random suffix under a given directory. The file is open for reading and writing. As in Python, a relative directory is made absolute, so the path is absolute. A refused open reports its path, so the caller can format the error as Python does.
+- Add `pytext.decimalDigit` and `pytext.decimalToAscii`. They read the decimal digits of every script as Python's `float()` and `int()` do. A generator script under tools builds the table from `unicodedata`, and the table is pinned to Unicode 16.0.0, the data of Python 3.14.
+- Add declarative `argparse` specification, policy, outcome, and `optionLike` types in `src/argparse.zig` and export `zig_common.argparse`.
+- Add structured `ErrorKind` classification on `UsageError` in `zig_common.argparse` so callers can render native diagnostics without parsing `UsageError.message`.
+- Implement pure `argparse.parse` and `argparse.parseOrExit` with Python 3.14 prefix abbreviations, short-option clustering, `--` termination, subcommand dispatch, `REMAINDER`, and argv-ordered unrecognized argument reporting.
+- `Builder.diff`, `Diff.reverse` and `Diff.patch` record an environment
+  change and apply it in either direction.
+- `atomic.atomicWriteAt` writes through an open directory descriptor with
+  the exact mode the caller names, umask aside, for the metrics writers
+  that hold their directory pinned.
+- `fsx.mkdtempReport` is `mkdtemp` with a `Why`. A failed create reports the OSError text that Python gives, with the whole path it tried, random name included, in one repr.
+- `fsx.selfExe` reads this program's own path from /proc/self/exe, answering a
+  failed, empty or truncated read with null so each caller can choose what
+  that means.
+- `json.dumpsCompact` writes the one-line form Python's default json.dumps
+  call gives, with the same separators and ensure_ascii, byte for byte.
+- `logs.gunzip` reads the members of a gzip stream one after another,
+  checking each member's CRC-32 and size, ported from eb-keep-logs.
+- `state.createPrivateAt` creates a private file through an open directory
+  descriptor at an exact mode without ever replacing an existing name, the
+  never-clobber shape the tools' new-file writers need.
+- `state.lockExclusive` and `lockExclusiveCancel` take the timeout as u64
+  milliseconds, wide enough for the 999_999_999 seconds a flock -w style
+  caller passes, where a u32 held only about 49 days.
+- `sys.keepAboveStdio` moves an open descriptor in slots 0, 1 or 2 to 3
+  or above with `FD_CLOEXEC` set and closes the original slot, returning
+  descriptors already at 3 or above unchanged; `proc.run` uses it for its
+  child setup and exec-failure pipe.
+
+### Fixes
+
+- A failed lock acquisition records the OSError text and whether Python names .lock, .lock.posix, the state directory, or no file.
+- A failed replacement names the temporary file when the open fails, names both files when the rename fails, and names no file when the write or the flush fails.
+- An interrupted non-blocking flock is retried instead of reported as a busy lock.
+- Classify a space-containing dash token that matches a registered option as an option token, and drop a double-dash separator only when it is adjacent to a consumed positional.
+- Keep the original operating-system error when allocation fails while formatting its atomic-write diagnostic.
+- Record the state-root path and error text when lock acquisition rejects a non-directory or broken symbolic link.
+- Report the ancestor that actually failed when recursive state-root or atomic-write directory creation stops.
+- Reset stale lock errno state and preserve the parent-directory errno after an atomic replacement has been renamed.
+- `atomic.makedirs` reports EEXIST for a final name that exists as a
+  non-directory, and no longer passes silently when that name is a dangling
+  link, matching os.makedirs with exist_ok.
+- `fsx.copyTo` creates its temporary file in the destination parent directory
+  for nested targets, avoiding cross-device rename failures.
+- `fsx.moveAcross` syncs the destination parent directory for nested targets.
+- `fsx.moveAcross` syncs the parent directory of the source name, also when one descriptor holds both names and the destination is nested.
+- `gzipInPlace` refused to compress a log whose name, well within the
+  reference compressor's own limit, no longer fit a filesystem's 255-byte
+  limit on one path component once its temporary file's pid and random
+  suffix were added on. That suffix alone already makes the temporary
+  name unique, so the original name is left off a temporary name that
+  would otherwise overflow, and a name that reference tool would have
+  compressed compresses here too.
+- `json.toPy` keeps the last value of a duplicate key without decoding the
+  members the document drops, as json.loads does, so an undecodable dropped
+  duplicate no longer fails the document.
+- `json.toPy` refuses a document whose raw non-UTF-8 byte sits in the
+  member a duplicate key drops, as the consumers decode the whole text
+  strictly before json.loads.
+- `logs.gunzip` treats bytes that are all zero after the last member as
+  padding, as gzip -d and Python's gzip do, instead of refusing them as
+  another damaged member.
+- `logs.gzipInPlace` now handles nested relative paths and writes temporary
+  archives beside the destination gzip path.
+- `proc.run` rejects an empty argument vector instead of spawning a child with
+  no `argv[0]`.
+- `state.RootLock.acquire` tightens accepted owner-checked lock descriptors to
+  mode 0600, repairing permissive pre-existing lock files.
+- `state.writePrivate` accepts names with directory components and creates
+  its temporary file in the same subdirectory as the destination.
+- `sys.strerror(.SUCCESS)` reports `Success`, matching libc wording for errno
+  zero.
+- `sys.strerror` returns `Unknown error N` for non-Linux `linux.E` tags such as
+  `NSRNODATA` through `NSRCNAMELOOP`, matching glibc and Python's `os.strerror`.
+
+### Removals
+
+- `syslog`: `formatRfc5424`, `formatJournald` and `emit`, the functions without an `Identity`, are removed, with the identity they wrote; call `formatRfc5424For`, `formatJournaldFor` and `emitFor` with the caller's own `Identity`, `.{ .app = "eb-keep-logs", .sd_name = "ebKeepLogs" }` for the events they sent.
+
+### Miscellaneous
+
+- A differential fuzz compares json.parse, toPy and Value.get against
+  json.loads on strictly decoded text, the way the consumers read it, with
+  the writer's own output read back through the same strict reader.
+- A differential fuzz compares logs.gunzip over a run-time corpus with
+  Python's gzip module: the header flags, multi-member streams, truncated
+  and damaged members, trailing garbage and trailing zero padding.
+- A differential parity test compares atomicWrite, replaceContents and
+  appendLine with the Python tempfile-plus-replace pattern and the append
+  mode of open, covering the umask in the mode bits, symlink targets and
+  read-only parent directories.
+- A differential parity test compares env parsing and building with what a
+  Python child resolves from the same environ block, and the CLI usage exit
+  code with argparse's own error exit.
+- A differential parity test compares sys.describeErrno and sys.errnoText
+  with os.strerror for every errno the kernel names, and the OSError framing
+  with quotes, non-UTF-8 and newlines in the path against Python's repr.
+- A differential parity test compares the library's JSON and pytext output
+  with Python's own json, repr, shlex and text calls, byte for byte, from
+  a probe built in the CI test job.
+- A differential parity test compares the library's path normalization,
+  makedirs errnos, copy and move effects, realpath results and lock
+  outcomes with Python's own os.path, os.makedirs, os.replace,
+  realpath and fcntl.flock calls, from a probe built in the CI test job.
+- A differential parity test compares whichShutil with shutil.which over a
+  PATH fixture, reprStr and osErrorErrno with Python's repr and OSError
+  text, and gzipInPlace with GNU gzip's mode, mtime, header and content.
+- A differential parity test covers copyTo and moveAcross edges against
+  shutil and os: cross-device moves and their copy fallback, a read-only
+  destination, a symlinked destination, a write stopped by the file-size
+  limit and a source removed after its descriptor was opened.
+- Add a runtime-seeded differential parity test (`tests/test_argparse_parity.py` and `zig build argparse-parity-probe`) comparing `argparse` against Python 3.14 `argparse` and fixing two subtle edge cases uncovered by fuzzing.
+- Add a unit test that pins the `fsx.copyTo` error for a FIFO destination.
+- Add differential parity fuzz tests covering variadic intermixed positionals (`parse_intermixed_args`) plus `Policy.native_exact` with `SpecialActionMode.prescan` and `CommandSpec.mutually_exclusive` alongside `PositionalSpec.ignore_empty` and `ErrorKind`.
+- Prepare `zig-common` `0.13.0` in `COMPAT.md` for callers of `syslog` that name their own `Identity`.
+- The CI runs the argparse parity suite under Python 3.14 next to the JSON, filesystem and `tempfile.gettempdir` suites, guarded by a Python 3.14+ version check.
+- The external link check skips `https://www.gnu.org/software/gzip/manual/gzip.html`, which times out from CI.
+- `fsx` unit tests trace the renames and directory syncs that `moveAcross` makes.
+
+
 ## 0.12.0 (2026-11-19)
 
 ### Features

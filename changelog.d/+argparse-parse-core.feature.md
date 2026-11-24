@@ -1,1 +1,0 @@
-Implement pure `argparse.parse` and `argparse.parseOrExit` with Python 3.14 prefix abbreviations, short-option clustering, `--` termination, subcommand dispatch, `REMAINDER`, and argv-ordered unrecognized argument reporting.
