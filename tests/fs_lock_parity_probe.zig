@@ -176,6 +176,7 @@ fn atomicMode() void {
     for (aw_cases) |c| {
         var why: common.atomic.Why = .{};
         opLine("atomicwrite", c.name, common.atomic.atomicWrite(A, c.name, c.data, c.opts, &why));
+        why.deinit(A);
     }
     const rc_cases = [_]struct { name: []const u8, data: []const u8 }{
         .{ .name = "rc-keep", .data = "replaced\n" },
