@@ -4,6 +4,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const atomic = @import("atomic.zig");
+const test_support = @import("test_support.zig");
 const pytext = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1714,23 +1715,16 @@ const MoveTrace = struct {
 /// Scratch directory under `.zig-cache` for the moveAcross trace tests.
 const MoveScratch = struct {
     gpa: Allocator,
-    base: []u8,
+    scratch: test_support.ScratchDir,
     d: fd_t,
 
     fn init(gpa: Allocator, tag: []const u8) !MoveScratch {
-        var cwd_buf: [sys.path_max]u8 = undefined;
-        const here = try realpath(cwd, ".", &cwd_buf);
-        const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-{s}-{d}", .{ here, tag, linux.getpid() });
-        errdefer gpa.free(base);
-        var zb: [sys.path_max:0]u8 = undefined;
-        _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-        return .{ .gpa = gpa, .base = base, .d = try openDir(cwd, base, false) };
+        const scratch = try test_support.ScratchDir.init(gpa, tag);
+        return .{ .gpa = gpa, .scratch = scratch, .d = scratch.fd };
     }
 
     fn deinit(self: MoveScratch) void {
-        deleteTree(self.gpa, cwd, self.base) catch {};
-        sys.close(self.d);
-        self.gpa.free(self.base);
+        self.scratch.deinit();
     }
 
     fn mkdir(self: MoveScratch, name: []const u8) !Stat {
