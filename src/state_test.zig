@@ -286,6 +286,42 @@ test "a release error still closes both layers" {
     try acquireAndRelease(root);
 }
 
+fn einvalFlock(_: fsx.fd_t, _: i32) usize {
+    return err(.INVAL);
+}
+
+fn isOpen(fd: fsx.fd_t) bool {
+    return linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) != .BADF;
+}
+
+test "a failed unlock is returned with both descriptors closed" {
+    const root = begin();
+    defer end(root);
+    const Case = struct { fcntl: bool, flock: bool, want: sys.Error, errno: linux.E, text: []const u8 };
+    // with both unlocks failing, the record lock's error and errno are the
+    // ones returned and kept, not the gate's
+    for ([_]Case{
+        .{ .fcntl = true, .flock = false, .want = error.Unexpected, .errno = .IO, .text = "[Errno 5] Input/output error" },
+        .{ .fcntl = false, .flock = true, .want = error.InvalidArgument, .errno = .INVAL, .text = "[Errno 22] Invalid argument" },
+        .{ .fcntl = true, .flock = true, .want = error.Unexpected, .errno = .IO, .text = "[Errno 5] Input/output error" },
+    }) |c| {
+        const holder = try RootLock.acquire(A, root, 0);
+        const before = try test_support.fdCount(A);
+        if (c.fcntl) state.lock_ops.fcntl = eioFcntl;
+        if (c.flock) state.lock_ops.flock = einvalFlock;
+        sys.last_errno = .SUCCESS;
+        const released = holder.release();
+        state.lock_ops.* = .{};
+        try testing.expectError(c.want, released);
+        try testing.expectEqual(c.errno, sys.last_errno);
+        try testing.expectEqualStrings(c.text, sys.describe(c.want));
+        try testing.expect(!isOpen(holder.posix));
+        try testing.expect(!isOpen(holder.gate));
+        try testing.expectEqual(before - 2, try test_support.fdCount(A));
+        try acquireAndRelease(root);
+    }
+}
+
 test "a hard-linked sidecar is refused" {
     const root = begin();
     defer end(root);
