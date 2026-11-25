@@ -486,21 +486,52 @@ fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossP
     try copyAclsWithPolicy(Xattrs, src_fd, dst_fd, policy);
 }
 
-fn copyRegularInto(src_fd: fd_t, src: Stat, dst_dir: fd_t, name: []const u8, policy: MoveAcrossPolicy) Error!fd_t {
+/// The close of a file about to be published by `replaceContents` or by the
+/// cross-device copy inside `moveAcross`, as a raw system-call result.
+/// Replaceable in the same builds as `atomic.ops`; constant real calls in
+/// any other build. A close that EINTR interrupts is not retried.
+pub const PublishOps = struct {
+    close: *const fn (fd: fd_t) usize = realPublishClose,
+};
+
+var test_publish_ops: PublishOps = .{};
+const real_publish_ops: PublishOps = .{};
+/// The close in use. A replaceable build may assign through it
+/// (`publish_ops.* = ...`); any other build points it at constant real calls.
+pub const publish_ops = if (atomic.replaceable) &test_publish_ops else &real_publish_ops;
+
+fn realPublishClose(fd: fd_t) usize {
+    return linux.close(fd);
+}
+
+/// Close `fd` once before its file is published. EINTR is success and is not
+/// retried, as Linux has freed the descriptor and `sys.result` does not
+/// treat EINTR as an error. Any other errno is returned with `sys.last_errno`
+/// set. The caller does not close `fd` again.
+fn closeBeforePublish(fd: fd_t) Error!void {
+    _ = try sys.result(publish_ops.close(fd));
+}
+
+fn copyRegularInto(src_fd: fd_t, src: Stat, dst_dir: fd_t, name: []const u8, policy: MoveAcrossPolicy) Error!void {
     const fd = try sys.openat(dst_dir, name, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
         .EXCL = true,
         .NOFOLLOW = true,
     }, 0o600);
+    var open = true;
     errdefer {
-        sys.close(fd);
+        if (open) _ = publish_ops.close(fd);
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
         sys.unlinkat(dst_dir, name, 0) catch {};
     }
     try copyFd(src_fd, fd);
     try setModeOwnerAndAcl(src_fd, src, fd, policy);
     try sys.fsync(fd);
-    return fd;
+    open = false;
+    try closeBeforePublish(fd);
 }
 
 fn copyLinkAt(src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8) Error!void {
@@ -520,8 +551,7 @@ fn copyTreeContents(gpa: Allocator, src_fd: fd_t, dst_fd: fd_t, policy: MoveAcro
             DT.REG => {
                 const opened = try openRegular(src_fd, e.name, false);
                 defer sys.close(opened.fd);
-                const out = try copyRegularInto(opened.fd, opened.stat, dst_fd, e.name, policy);
-                sys.close(out);
+                try copyRegularInto(opened.fd, opened.stat, dst_fd, e.name, policy);
             },
             DT.DIR => {
                 var zbuf: [sys.path_max:0]u8 = undefined;
@@ -548,6 +578,9 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     const tmp = try tmpName(dst_name, &tmp_buf);
     var published = false;
     errdefer if (!published) {
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
         if (src.isDir()) {
             deleteTree(gpa, dst_dir, tmp) catch {};
         } else {
@@ -558,8 +591,7 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
     if (src.isReg()) {
         const opened = try openRegular(src_dir, src_name, false);
         defer sys.close(opened.fd);
-        const out = try copyRegularInto(opened.fd, opened.stat, dst_dir, tmp, opts.policy);
-        sys.close(out);
+        try copyRegularInto(opened.fd, opened.stat, dst_dir, tmp, opts.policy);
     } else if (src.isDir()) {
         var zbuf: [sys.path_max:0]u8 = undefined;
         _ = try sys.call(linux.mkdirat, .{ dst_dir, (try sys.z(&zbuf, tmp)).ptr, @as(linux.mode_t, 0o700) });
@@ -606,7 +638,12 @@ fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_d
 
 /// Move `src_dir/src_name` to `dst_dir/dst_name`. On one file system this is
 /// a rename; on `error.CrossDevice` it copies to a destination-side temporary
-/// path, syncs, atomically publishes with rename, then removes the source.
+/// path, syncs and closes each copied regular file, then atomically publishes
+/// with rename and removes the source. A failed close is returned with
+/// `sys.last_errno` set, the destination name is left as it was, and the
+/// temporary path is removed. Each copied descriptor is closed once. A close
+/// that EINTR interrupts is not retried and is not an error, as `sys.result`
+/// treats EINTR. The close is replaceable through `publish_ops`.
 pub fn moveAcross(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions) (Error || Allocator.Error)!void {
     return moveAcrossInternal(gpa, src_dir, src_name, dst_dir, dst_name, opts, .{});
 }
@@ -614,7 +651,14 @@ pub fn moveAcross(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
 /// Replace the contents of the regular file `dir/name` atomically. The new
 /// file keeps the old one's owner (when this process may set it), mode and
 /// access ACL, in the most native of the `acl_attributes` forms the old one
-/// has; it is written beside the old one, synced, then renamed over it.
+/// has. The bytes are written beside the old file, synced and closed, then
+/// renamed over it. A failed write, fchmod, fsync or close is returned with
+/// `sys.last_errno` set to its errno; the name is left as it was and the
+/// temporary file is removed. A write lost on NFS may be reported only by
+/// the close. The temporary descriptor is closed once on every path. A close
+/// that EINTR interrupts is not retried, as Linux has freed the descriptor,
+/// and is not an error, as `sys.result` treats EINTR. The close is
+/// replaceable through `publish_ops`.
 pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     const old = try openRegular(dir, name, false);
     defer sys.close(old.fd);
@@ -626,10 +670,16 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
         .EXCL = true,
         .NOFOLLOW = true,
     }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (open) _ = publish_ops.close(fd);
+        if (!done) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     try sys.writeAll(fd, bytes);
     const st = try fstat(fd);
@@ -642,6 +692,8 @@ pub fn replaceContents(gpa: Allocator, dir: fd_t, name: []const u8, bytes: []con
     try sys.fchmod(fd, @intCast(old.stat.perm()));
     try copyAcls(Xattrs, old.fd, fd);
     try sys.fsync(fd);
+    open = false;
+    try closeBeforePublish(fd);
     try sys.renameat(dir, tmp, dir, name);
     done = true;
 }
@@ -1987,4 +2039,163 @@ test "moveAcross reports not a regular file for a FIFO entry in a moved tree" {
         .force_cross_device_rename = true,
     }));
     try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
+}
+
+// ---- publishing close: checked once, before the rename --------------------
+
+const PublishHook = struct {
+    var closes: usize = 0;
+    var errno: linux.E = .SUCCESS;
+
+    fn arm(e: linux.E) void {
+        closes = 0;
+        errno = e;
+        publish_ops.* = .{ .close = close };
+    }
+
+    /// Linux frees the descriptor whatever close returns, so the hook closes
+    /// it for real and then reports the errno it was given, on the first
+    /// call only: a second close of the descriptor is EBADF.
+    fn close(fd: fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (errno == .SUCCESS or closes > 1) return rc;
+        return @bitCast(-@as(isize, @backingInt(errno)));
+    }
+};
+
+fn expectNoTmp(gpa: Allocator, dir: fd_t) !void {
+    var it = try DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| try std.testing.expect(std.mem.indexOf(u8, e.name, ".tmp") == null);
+}
+
+fn expectText(gpa: Allocator, dir: fd_t, name: []const u8, text: []const u8) !void {
+    const opened = try openRegular(dir, name, false);
+    defer sys.close(opened.fd);
+    const got = try readAll(gpa, opened.fd, 64);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(text, got);
+}
+
+fn putBytes(dir: fd_t, name: []const u8, text: []const u8) !void {
+    const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+    defer sys.close(fd);
+    try sys.writeAll(fd, text);
+}
+
+fn crossMove(gpa: Allocator, dir: fd_t, src: []const u8, dst: []const u8) (Error || Allocator.Error)!void {
+    try moveAcrossInternal(gpa, dir, src, dir, dst, .{ .policy = .strict }, .{
+        .force_cross_device_rename = true,
+    });
+}
+
+test "fsx publish close: replaceContents returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-repl-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "list", "old\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, replaceContents(gpa, scratch.fd, "list", "new\n"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "list", "old\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: replaceContents publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-repl-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "list", "old\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.INTR);
+    try replaceContents(gpa, scratch.fd, "list", "new\n");
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "list", "new\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: moveAcross file returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-move-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "keep\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "src", "new\n");
+    try expectText(gpa, scratch.fd, "dst", "keep\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: moveAcross file publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-move-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "keep\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.INTR);
+    try crossMove(gpa, scratch.fd, "src", "dst");
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
+    try expectText(gpa, scratch.fd, "dst", "new\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: moveAcross tree returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-tree-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = try sys.call(linux.mkdirat, .{ scratch.fd, (try sys.z(&zb, "src")).ptr, @as(linux.mode_t, 0o700) });
+    const sub = try openDir(scratch.fd, "src", false);
+    defer sys.close(sub);
+    try putBytes(sub, "a", "tree\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, sub, "a", "tree\n");
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "dst", false));
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: moveAcross tree publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-tree-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = try sys.call(linux.mkdirat, .{ scratch.fd, (try sys.z(&zb, "src")).ptr, @as(linux.mode_t, 0o700) });
+    const sub = try openDir(scratch.fd, "src", false);
+    try putBytes(sub, "a", "tree\n");
+    sys.close(sub);
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.INTR);
+    try crossMove(gpa, scratch.fd, "src", "dst");
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
+    try expectText(gpa, scratch.fd, "dst/a", "tree\n");
+    try expectNoTmp(gpa, scratch.fd);
 }
