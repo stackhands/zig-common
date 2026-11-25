@@ -84,11 +84,13 @@ Error set: [[zig:zig_common.proc.Error]].
 *** =zig_common.logs=
 
 Error set: [[zig:zig_common.logs.GzipError]].
+Step set: [[zig:zig_common.logs.GzipStep]], which =gzipInPlaceAtStep= sets to the step an error came from.
 
-| Function                               | Error set                           |
-|----------------------------------------+-------------------------------------|
-| [[zig:zig_common.logs.gzipInPlace]]    | [[zig:zig_common.logs.GzipError]]   |
-| [[zig:zig_common.logs.renameInList]]   | =Allocator.Error=                   |
+| Function                                   | Error set                           |
+|--------------------------------------------+-------------------------------------|
+| [[zig:zig_common.logs.gzipInPlace]]        | [[zig:zig_common.logs.GzipError]]   |
+| [[zig:zig_common.logs.gzipInPlaceAtStep]]  | [[zig:zig_common.logs.GzipError]]   |
+| [[zig:zig_common.logs.renameInList]]       | =Allocator.Error=                   |
 
 *** =zig_common.cli=
 

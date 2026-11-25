@@ -4,6 +4,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -37,11 +38,18 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
 /// one set, so the error alone cannot say whether the log was compressed.
 pub const GzipStep = enum {
     /// Up to renaming the archive into place and removing the original.
-    /// The original is where it was, and this call left no `name.gz`.
+    /// When opening `name` fails, the call has changed nothing: a `name`
+    /// that was already absent, as after an earlier run compressed it,
+    /// stays absent, and any `name.gz` already there is left alone. Once
+    /// `name` is open, the original is still there, and `name.gz` is absent
+    /// unless it was there before the call, or removing the original failed
+    /// and so did the removal of the archive that follows; then both are
+    /// present.
     archive,
-    /// Opening the archive's directory and syncing it, after both renames.
-    /// `name.gz` is in place and the original is gone; only whether that
-    /// survives a crash is in doubt.
+    /// Opening the archive's directory and syncing it, after the rename of
+    /// the archive and the removal of the original. `name.gz` is in place
+    /// and the original is gone; only whether that survives a crash is in
+    /// doubt.
     directory_sync,
 };
 
@@ -298,17 +306,10 @@ test "gunzip reads over trailing zero padding" {
 
 test "gzip does not publish a partial archive under the final name" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-gzip-{d}", .{ here, linux.getpid() });
-    defer gpa.free(base);
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "gzip");
+    defer scratch.deinit();
+    const base = scratch.path;
+    const dir = scratch.fd;
     const src = try sys.openat(dir, "a.log", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     const ur = try sys.openat(fsx.cwd, "/dev/urandom", .{}, 0);
     defer sys.close(ur);
@@ -366,17 +367,9 @@ test "renameInList" {
 
 test "gzipInPlace refuses missing files, symlinks, directories, hard links, and existing archives" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-err-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-err");
+    defer scratch.deinit();
+    const dir = scratch.fd;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.testing.expectError(error.NotFound, gzipInPlace(gpa, io, dir, "missing.log"));
@@ -406,17 +399,10 @@ test "gzipInPlace refuses missing files, symlinks, directories, hard links, and 
 
 test "gzipInPlace handles nested paths like gzip -9 sub/file" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-sub-{d}", .{ here, linux.getpid() });
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-sub");
+    defer scratch.deinit();
+    const dir = scratch.fd;
     var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
     _ = linux.mkdirat(dir, (try sys.z(&zb, "sub")).ptr, 0o700);
     const src = try sys.openat(dir, "sub/nested.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     try sys.writeAll(src, "nested\n");
@@ -430,17 +416,9 @@ test "gzipInPlace handles nested paths like gzip -9 sub/file" {
 
 test "gzipInPlace compresses a name its own temporary file alone would overflow" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-long-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-long");
+    defer scratch.deinit();
+    const dir = scratch.fd;
 
     // 240 bytes: short enough that `gzip -9` on the real reference
     // compressor takes it (its own overhead is the 3 bytes of `.gz`), long
@@ -462,16 +440,6 @@ test "gzipInPlace compresses a name its own temporary file alone would overflow"
     try std.testing.expect((fsx.statAt(dir, gz_name, false) catch null) != null);
 }
 
-/// A fresh directory under `.zig-cache` for one test; `buf` holds its path.
-fn testDir(buf: *[sys.path_max]u8, tag: []const u8) ![]const u8 {
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    const base = try std.mem.print(buf, "{s}/.zig-cache/zig-common-logs-{s}-{d}", .{ here, tag, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    return base;
-}
-
 fn writeLog(dir: fsx.fd_t, name: []const u8) !void {
     const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
     defer sys.close(fd);
@@ -480,13 +448,9 @@ fn writeLog(dir: fsx.fd_t, name: []const u8) !void {
 
 test "gzipInPlaceAtStep reports archive when the log is left as it was" {
     const gpa = std.testing.allocator;
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try testDir(&pb, "step-archive");
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-step-archive");
+    defer scratch.deinit();
+    const dir = scratch.fd;
     const io = std.Io.Threaded.global_single_threaded.io();
     try writeLog(dir, "kept.log");
     try writeLog(dir, "kept.log.gz");
@@ -504,13 +468,10 @@ test "gzipInPlaceAtStep reports directory_sync when only the directory sync fail
     const Child = struct {
         fn run() u8 {
             const gpa = std.heap.page_allocator;
-            var pb: [sys.path_max]u8 = undefined;
-            const base = testDir(&pb, "step-sync") catch return 20;
-            const dir = fsx.openDir(fsx.cwd, base, false) catch return 21;
-            defer {
-                fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-                sys.close(dir);
-            }
+            const scratch = test_support.ScratchDir.init(gpa, "logs-step-sync") catch return 20;
+            defer scratch.deinit();
+            const base = scratch.path;
+            const dir = scratch.fd;
             const io = std.Io.Threaded.global_single_threaded.io();
             writeLog(dir, "a.log") catch return 22;
 
@@ -548,6 +509,5 @@ test "gzipInPlaceAtStep reports directory_sync when only the directory sync fail
             return 0;
         }
     };
-    const test_support = @import("test_support.zig");
     try test_support.expectChildPasses(Child.run);
 }
