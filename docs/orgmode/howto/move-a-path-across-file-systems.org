@@ -6,7 +6,7 @@
 
 Use this when a tool moves a file or directory from one mounted file system to another and must not leave a partial destination, such as moving reproduction output from =/tmp= to =/project/results=.
 [[zig:zig_common.fsx.moveAcross]] tries =rename= first.
-When the kernel returns cross-device, it copies to a temporary path in the destination directory, syncs it, renames it over the destination name, and only then removes the source.
+When the kernel returns cross-device, it copies to a temporary path in the destination directory, syncs and closes each copied regular file, renames that path over the destination name only when those closes succeed, and only then removes the source.
 The destination is the old path or the fully copied path, never a partial tree.
 
 ** Before you start
