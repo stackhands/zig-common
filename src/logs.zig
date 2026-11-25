@@ -37,11 +37,18 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
 /// one set, so the error alone cannot say whether the log was compressed.
 pub const GzipStep = enum {
     /// Up to renaming the archive into place and removing the original.
-    /// The original is where it was, and this call left no `name.gz`.
+    /// When opening `name` fails, the call has changed nothing: a `name`
+    /// that was already absent, as after an earlier run compressed it,
+    /// stays absent, and any `name.gz` already there is left alone. Once
+    /// `name` is open, the original is still there, and `name.gz` is absent
+    /// unless it was there before the call, or removing the original failed
+    /// and so did the removal of the archive that follows; then both are
+    /// present.
     archive,
-    /// Opening the archive's directory and syncing it, after both renames.
-    /// `name.gz` is in place and the original is gone; only whether that
-    /// survives a crash is in doubt.
+    /// Opening the archive's directory and syncing it, after the rename of
+    /// the archive and the removal of the original. `name.gz` is in place
+    /// and the original is gone; only whether that survives a crash is in
+    /// doubt.
     directory_sync,
 };
 
