@@ -5,7 +5,9 @@
 * Replace a file and keep its access control lists
 
 Use this when a tool rewrites a file whose owner, group, mode or access control lists (ACLs) decide who may read it, such as a module file under =/project/climate= that the project's members read through an ACL.
-[[zig:zig_common.atomic.atomicWrite]] writes the new bytes to a temporary file beside the old one, gives it the old file's owner, group, mode and ACLs, reads them back, and only then renames it over the old file.
+[[zig:zig_common.atomic.atomicWrite]] writes the new bytes to a temporary file beside the old one, gives it the old file's owner, group, mode and ACLs, reads them back, syncs and closes the temporary file, and renames it over the old file only when that close succeeds.
+A close that =EINTR= interrupts is not an error and is not retried: Linux has already freed the descriptor, and the sync before the close has flushed the bytes.
+[[zig:zig_common.atomic.atomicWriteAt]] closes the same way before its rename.
 A reader sees the old file or the new one, never a part of either, and never the new bytes with other permissions.
 [[file:../explanation/descriptor-checks.org][Checks on the descriptor, not the path]] says why each check is made on an open file.
 
@@ -38,7 +40,7 @@ A reader sees the old file or the new one, never a part of either, and never the
    };
    #+end_src
 
-   =why.msg= includes the filename or filenames of an operating-system error. If a failure happened before it could be filled, [[zig:zig_common.atomic.describe]] supplies text such as =[Errno 12] Cannot allocate memory=.
+   =why.msg= carries the text of an operating-system error. When the failing call names a path, the text includes that filename, or both filenames of a rename. A failed write, sync or close of the open temporary file names no path. If a failure happened before the text could be filled, [[zig:zig_common.atomic.describe]] supplies text such as =[Errno 12] Cannot allocate memory=.
 
 3. To give the new file the access of another file, such as a file prepared beside the live one it is to replace, name that file in [[zig:zig_common.atomic.WriteOptions]]:
 

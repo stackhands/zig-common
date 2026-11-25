@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const atomic = @import("atomic.zig");
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const test_support = @import("test_support.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -1936,4 +1937,147 @@ test "atomicWrite returns NoSpace, ReadOnly, and CrossDevice without touching th
 
     try testing.expectError(error.NotDir, atomic.makedirs(join(pt[0], "child")));
     try testing.expectError(error.NotFound, atomic.fsyncDir(join(dir, "absent")));
+}
+
+// ---- close of the temporary file, before the rename -------------------------
+
+const CloseHook = struct {
+    var closes: usize = 0;
+    var close_errno: linux.E = .SUCCESS;
+
+    fn set(e: linux.E) void {
+        closes = 0;
+        close_errno = e;
+        atomic.ops.close = close;
+    }
+
+    /// Linux frees the descriptor whatever close returns, so the hook
+    /// closes it for real and then reports the errno it was given, on the
+    /// first call only: a second close of the descriptor is EBADF.
+    fn close(fd: sys.fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (close_errno == .SUCCESS or closes > 1) return rc;
+        return err(close_errno);
+    }
+};
+
+fn closeError(e: linux.E) sys.Error {
+    return switch (e) {
+        .IO => error.Unexpected,
+        .NOSPC, .DQUOT => error.NoSpace,
+        else => unreachable,
+    };
+}
+
+fn expectNoPublishTemp(gpa: Allocator, dir: fsx.fd_t) !void {
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |entry| {
+        try testing.expect(std.mem.indexOf(u8, entry.name, ".tmp") == null);
+        try testing.expect(!std.mem.endsWith(u8, entry.name, ".new"));
+    }
+}
+
+fn seed(path: []const u8, present: bool) void {
+    if (present) {
+        writeFile(path, "old\n");
+    } else {
+        sys.unlinkat(fsx.cwd, path, 0) catch {};
+    }
+}
+
+fn armPublish(close_errno: linux.E, fsync_fails: bool) void {
+    atomic.ops.* = .{};
+    CloseHook.set(close_errno);
+    if (fsync_fails) atomic.ops.fsync = eioFsync;
+}
+
+/// One publish through `atomicWrite` and one through `atomicWriteAt`, each
+/// for an existing name and a name that is absent. `fails` means `failure`
+/// is returned, `sys.last_errno` is `errno_out`, the previous bytes stay,
+/// and an absent name stays absent. Otherwise the new bytes are published.
+/// Either way the temporary file is gone, the descriptor was closed once,
+/// and the process's descriptor count is unchanged. The hook is installed
+/// again before every publish: each publish resets `atomic.ops`.
+fn expectPublishClose(dir_path: []const u8, dfd: fsx.fd_t, close_errno: linux.E, fsync_fails: bool, errno_out: linux.E, failure: sys.Error, fails: bool) !void {
+    const gpa = testing.allocator;
+    const cases = [_]struct { name: []const u8, present: bool, at: bool }{
+        .{ .name = "kept", .present = true, .at = false },
+        .{ .name = "fresh", .present = false, .at = false },
+        .{ .name = "metrics", .present = true, .at = true },
+        .{ .name = "fresh-at", .present = false, .at = true },
+    };
+    for (cases) |c| {
+        const path = join(dir_path, c.name);
+        seed(path, c.present);
+        armPublish(close_errno, fsync_fails);
+        const before = try test_support.fdCount(gpa);
+        const ncloses = if (c.at) blk: {
+            const wrote = atomic.atomicWriteAt(gpa, dfd, c.name, "new\n", 0o644);
+            const n = CloseHook.closes;
+            if (fails) {
+                try testing.expectError(failure, wrote);
+                try testing.expectEqual(errno_out, sys.last_errno);
+                try testing.expectEqualStrings(sys.describeErrno(errno_out), sys.describe(failure));
+            } else try wrote;
+            break :blk n;
+        } else blk: {
+            var why: atomic.Why = .{};
+            defer why.deinit(gpa);
+            const wrote = atomic.atomicWrite(gpa, path, "new\n", .{}, &why);
+            const n = CloseHook.closes;
+            if (fails) {
+                try testing.expectError(failure, wrote);
+                try testing.expectEqual(errno_out, sys.last_errno);
+                const text = sys.describeErrno(errno_out);
+                try testing.expectEqualStrings(text, why.msg);
+                try testing.expectEqualStrings(text, sys.describe(failure));
+            } else {
+                try wrote;
+                try testing.expectEqualStrings("", why.msg);
+            }
+            break :blk n;
+        };
+        if (fails) {
+            if (c.present) {
+                try testing.expectEqualStrings("old\n", readFile(path));
+            } else try testing.expect(!exists(path));
+        } else try testing.expectEqualStrings("new\n", readFile(path));
+        try testing.expectEqual(@as(usize, 1), ncloses);
+        try testing.expectEqual(before, try test_support.fdCount(gpa));
+        try expectNoPublishTemp(gpa, dfd);
+    }
+}
+
+test "a failed close of an atomic write is returned and the destination is unchanged" {
+    begin();
+    defer end();
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    const dfd = try fsx.openDir(fsx.cwd, dir_path, false);
+    defer sys.close(dfd);
+    for ([_]linux.E{ .IO, .NOSPC, .DQUOT }) |e| {
+        try expectPublishClose(dir_path, dfd, e, false, e, closeError(e), true);
+    }
+}
+
+test "a close that EINTR interrupts is not retried and the file is published" {
+    begin();
+    defer end();
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    const dfd = try fsx.openDir(fsx.cwd, dir_path, false);
+    defer sys.close(dfd);
+    try expectPublishClose(dir_path, dfd, .INTR, false, .SUCCESS, error.Unexpected, false);
+}
+
+test "a failed fsync of an atomic write closes the temporary file once" {
+    begin();
+    defer end();
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    const dfd = try fsx.openDir(fsx.cwd, dir_path, false);
+    defer sys.close(dfd);
+    try expectPublishClose(dir_path, dfd, .SUCCESS, true, .IO, error.Unexpected, true);
 }
