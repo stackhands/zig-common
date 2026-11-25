@@ -199,7 +199,14 @@ pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode:
 }
 
 /// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
-/// mode 0600, then renamed over the name.
+/// mode 0600, flushed with fsync and closed, then renamed over the name.
+/// A failed write, fchmod, fsync or close is returned with `sys.last_errno`
+/// set to its errno; the name is left as it was and the temporary file is
+/// removed. A write lost on NFS may be reported only by the close. The
+/// descriptor is closed once on every path. A close that EINTR
+/// interrupts is not retried, as Linux has freed the descriptor, and is
+/// not an error, as `sys.result` treats EINTR; the fsync before it has
+/// already flushed the bytes.
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
@@ -208,15 +215,45 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
     const tmp = try gpa.print("{s}/.{s}.{d}.{x}.tmp", .{ parent, base, linux.getpid(), rnd });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (open) _ = write_ops.close(fd);
+        if (!done) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     try sys.writeAll(fd, bytes);
     try sys.fchmod(fd, 0o600);
+    _ = try lockCall(write_ops.fsync, .{fd});
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
     try sys.renameat(dir, tmp, dir, name);
     done = true;
+}
+
+/// The calls `writePrivate` makes on the temporary file, as raw
+/// system-call results. Replaceable in the same builds as `lock_ops`;
+/// constant real calls in any other build.
+pub const WriteOps = struct {
+    fsync: *const fn (fd: fsx.fd_t) usize = realFsync,
+    close: *const fn (fd: fsx.fd_t) usize = realClose,
+};
+
+var test_write_ops: WriteOps = .{};
+const real_write_ops: WriteOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`write_ops.* = ...`); any other build points it at constant real calls.
+pub const write_ops = if (@import("atomic.zig").replaceable) &test_write_ops else &real_write_ops;
+
+fn realFsync(fd: fsx.fd_t) usize {
+    return linux.fsync(fd);
+}
+fn realClose(fd: fsx.fd_t) usize {
+    return linux.close(fd);
 }
 
 test "createPrivateAt creates without clobbering" {
@@ -655,7 +692,7 @@ fn realOpenLock(dir: fsx.fd_t, name: [*:0]const u8) usize {
     return linux.openat(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
 }
 
-/// One of `lock_ops`, retrying on EINTR.
+/// One of `lock_ops` or `write_ops`, retrying on EINTR.
 fn lockCall(f: anytype, args: anytype) Error!usize {
     while (true) {
         if (try sys.result(@call(.auto, f, args))) |rc| return rc;

@@ -1,0 +1,1 @@
+Add tests that `state.writePrivate` returns a failed `fsync` or `close` injected through `state.write_ops`, closes the descriptor once, leaves the name and no temporary file, retries an `fsync` that `EINTR` interrupts, and treats a `close` that `EINTR` interrupts as success without a retry.

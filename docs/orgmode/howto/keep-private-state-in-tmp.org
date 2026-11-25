@@ -65,7 +65,7 @@ Use this when a tool keeps a small file between runs in a directory every user m
    #+end_src
 
    [[zig:zig_common.state.readPrivate]] returns null for a file that is absent, larger than the limit or not private, so the tool starts over instead of trusting it.
-   [[zig:zig_common.state.writePrivate]] writes =.NAME.PID.RANDOM.tmp= with mode 0600 and renames it over the name.
+   [[zig:zig_common.state.writePrivate]] writes =.NAME.PID.RANDOM.tmp= with mode 0600, syncs and closes it, and renames it over the name only when the sync and the close both succeed.
 
 ** Check that it worked
 
