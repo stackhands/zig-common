@@ -51,7 +51,7 @@ the entry and its hash.
 | `state` | private files in a shared directory: trusted only when the open file is a regular file of this user with one link and no group or other bits, a lock trusted the same way, atomic 0600 writes; `RootLock`, a flock gate plus a POSIX record lock on a sidecar, with a deadline read from the clock. The gate and the sidecar must each be a regular file of this user with one link |
 | `json` | a JSON reader with Python's two string encodings (surrogateescape text, one byte per code point), Python values, and `json.dumps(indent=N, sort_keys=True)` byte for byte, float repr included |
 | `pytext` | byte strings as Python text: the surrogateescape character, the 'replace' decoder, str.isspace, strip and split, shlex.quote |
-| `atomic` | `atomic_write`: replace a file only after its bytes, owner, mode and every ACL form (GPFS NFSv4, NFSv4, POSIX access) are durable and read back; fault points before write, fsync and rename |
+| `atomic` | `atomic_write`: replace a file only after its bytes, owner, mode and every ACL form (GPFS NFSv4, NFSv4, POSIX access) are durable and read back, and the temporary file has been closed; fault points before write, fsync and rename |
 | `syslog` | events to a collector: a `unix:`, `journal:`, `udp:` or `tcp:` target, RFC 5424 and native journald framing for the `Identity` the caller names, and `send`, the transport alone, with a timeout; nothing here fails the caller |
 | `cli` | messages to stdout and stderr that ignore a closed stream, exit code 2 for a refused invocation, the version line |
 

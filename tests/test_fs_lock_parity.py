@@ -220,7 +220,13 @@ def make_atomic_fixture(root):
 def py_atomic_write(root, name, data, mode=None):
     """The documented atomicWrite behavior: a temp file beside the target,
     the existing mode kept, 0644 less the umask for a new one, a symlink
-    refused, then os.replace and a parent fsync."""
+    refused, the temp file closed before os.replace, then a parent fsync.
+
+    A close error other than InterruptedError leaves the destination
+    unchanged and removes the temp file. InterruptedError is not an
+    error and is not retried: Linux has already closed the descriptor,
+    which is how atomicWrite treats EINTR from close (sys.result).
+    """
     path = os.path.join(root, name)
     if os.path.islink(path):
         return "ERR:Refused"
@@ -239,7 +245,10 @@ def py_atomic_write(root, name, data, mode=None):
             os.fsync(fd)
             os.fchmod(fd, want)
         finally:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except InterruptedError:
+                pass
         os.replace(tmp, path)
         fsync_dir(parent)
         return "OK"
