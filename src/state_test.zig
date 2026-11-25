@@ -548,3 +548,144 @@ test "acquire tightens existing owned lock files to mode 0600" {
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
 }
+
+// ---- writePrivate: the sync and the close come before the rename ----------
+
+const WriteHooks = struct {
+    var closes: usize = 0;
+    var close_errno: linux.E = .SUCCESS;
+    var fsync_errno: linux.E = .SUCCESS;
+
+    fn set(fsync_e: linux.E, close_e: linux.E) void {
+        closes = 0;
+        fsync_errno = fsync_e;
+        close_errno = close_e;
+        state.write_ops.* = .{ .fsync = fsync, .close = close };
+    }
+    fn fsync(fd: fsx.fd_t) usize {
+        if (fsync_errno != .SUCCESS) return err(fsync_errno);
+        return linux.fsync(fd);
+    }
+    /// Linux frees the descriptor whatever close returns, so the hook
+    /// closes it for real and then reports the errno it was given, on the
+    /// first call only: a second close of the descriptor is EBADF.
+    fn close(fd: fsx.fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (close_errno == .SUCCESS or closes > 1) return rc;
+        return err(close_errno);
+    }
+};
+
+fn expectNoTemporary(gpa: std.mem.Allocator, dir: fsx.fd_t) !void {
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| try testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+}
+
+const WriteCase = struct { fsync: linux.E = .SUCCESS, close: linux.E = .SUCCESS, want: sys.Error };
+
+fn expectWriteRefused(gpa: std.mem.Allocator, cases: []const WriteCase) !void {
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try state.writePrivate(gpa, dir, "c.json", "old\n");
+    for (cases) |c| {
+        const code = if (c.close != .SUCCESS) c.close else c.fsync;
+        for ([_][]const u8{ "c.json", "fresh.json" }) |name| {
+            const before = try test_support.fdCount(gpa);
+            WriteHooks.set(c.fsync, c.close);
+            sys.last_errno = .SUCCESS;
+            const wrote = state.writePrivate(gpa, dir, name, "new\n");
+            state.write_ops.* = .{};
+            try testing.expectError(c.want, wrote);
+            try testing.expectEqual(code, sys.last_errno);
+            try testing.expectEqualStrings(sys.describeErrno(code), sys.describe(c.want));
+            try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+            try testing.expectEqual(before, try test_support.fdCount(gpa));
+            try expectNoTemporary(gpa, dir);
+        }
+        try expectContents(gpa, dir, "c.json", "old\n");
+        try testing.expectError(error.NotFound, fsx.statAt(dir, "fresh.json", false));
+    }
+}
+
+test "a failed close of the written file is returned and the name is not replaced" {
+    try expectWriteRefused(testing.allocator, &.{
+        .{ .close = .IO, .want = error.Unexpected },
+        .{ .close = .NOSPC, .want = error.NoSpace },
+        .{ .close = .DQUOT, .want = error.NoSpace },
+    });
+}
+
+test "a failed fsync of the written file is returned and the file is closed once" {
+    try expectWriteRefused(testing.allocator, &.{
+        .{ .fsync = .IO, .want = error.Unexpected },
+        .{ .fsync = .NOSPC, .want = error.NoSpace },
+    });
+}
+
+test "a close that EINTR interrupts is not retried and is not an error" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try state.writePrivate(gpa, dir, "c.json", "old\n");
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .INTR);
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
+
+test "a sync that EINTR interrupts is retried" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const Intr = struct {
+        var syncs: usize = 0;
+        fn fsync(fd: fsx.fd_t) usize {
+            syncs += 1;
+            if (syncs == 1) return err(.INTR);
+            return linux.fsync(fd);
+        }
+    };
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .SUCCESS);
+    Intr.syncs = 0;
+    state.write_ops.fsync = Intr.fsync;
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 2), Intr.syncs);
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
+
+test "writePrivate closes the written file once when it succeeds" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .SUCCESS);
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
