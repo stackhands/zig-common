@@ -35,6 +35,11 @@ jobs:
   # zig build --fork puts this checkout in place of the zig-common the tool
   # pins and leaves its build.zig.zon alone: eb-local's SBOM tests read it.
   tools:
+    # A matrix boolean is rendered as true. develop named this job from
+    # repo and ref, and the ruleset still requires
+    # tools (stackhands/eb-keep-logs, zig). label is that second
+    # component. A row that sets args keeps that text instead.
+    name: tools (${{ matrix.repo }}${{ matrix.label && format(', {0}', matrix.label) || matrix.args && format(', {0}', matrix.args) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -42,6 +47,7 @@ jobs:
       matrix:
         include:
           - repo: stackhands/eb-keep-logs
+            label: zig
             # tests/test_metrics.sh checks the metrics file with promtool, and
             # the schema tests need jsonschema, as in the tool's own CI.
             promtool: true
