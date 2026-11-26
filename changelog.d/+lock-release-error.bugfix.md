@@ -1,1 +1,0 @@
-`state.RootLock.release` reports a failed release of the state-root lock. It closes both lock files and returns the first error as `sys.Error`. It used to drop that error, so callers that discarded the result have to handle it.

@@ -1,1 +1,0 @@
-Move the scratch directory the `logs` tests and the `fsx` `moveAcross` fixture make into `test_support.ScratchDir`, which removes a directory left by an earlier run of the same pid before it creates its own.
