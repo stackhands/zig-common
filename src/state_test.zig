@@ -689,3 +689,40 @@ test "writePrivate closes the written file once when it succeeds" {
     try expectContents(gpa, dir, "c.json", "new\n");
     try expectNoTemporary(gpa, dir);
 }
+
+test "a failed close of the file createPrivateAt creates is returned" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .IO);
+    sys.last_errno = .SUCCESS;
+    const created = state.createPrivateAt(dir, "new", "bytes\n", 0o640);
+    state.write_ops.* = .{};
+    try testing.expectError(error.Unexpected, created);
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "new", "bytes\n");
+    try testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(dir, "new", false)).perm());
+}
+
+test "a close that EINTR interrupts is success for the file createPrivateAt creates" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .INTR);
+    try state.createPrivateAt(dir, "new", "bytes\n", 0o640);
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "new", "bytes\n");
+    try testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(dir, "new", false)).perm());
+}

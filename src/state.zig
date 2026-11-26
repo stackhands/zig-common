@@ -190,12 +190,30 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
 /// umask cannot bite it. The name is created and closed in one step;
 /// nothing is renamed, so another name's file is never touched. A
 /// symbolic link at the name is refused without being followed, as
-/// `openPrivate` refuses one.
+/// `openPrivate` refuses one. The descriptor is closed once on every
+/// path. A failed close is returned with
+/// `sys.last_errno` set to its errno. The created name is left in place
+/// on a failed close, and on a failed fchmod or write: nothing unlinks
+/// it. A write lost on NFS may be reported only by the close. A close
+/// that EINTR interrupts is not retried, as Linux has freed the
+/// descriptor, and is not an error, as `sys.result` treats EINTR. A
+/// close that only releases the descriptor after an earlier error
+/// ignores its result, so `sys.last_errno` stays that error's errno.
 pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode: u32) Error!void {
     const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, 0o600);
-    defer sys.close(fd);
+    var open = true;
+    defer {
+        if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = write_ops.close(fd);
+        }
+    }
     try sys.fchmod(fd, mode);
     try sys.writeAll(fd, bytes);
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
 }
 
 /// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
@@ -235,8 +253,9 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
     done = true;
 }
 
-/// The calls `writePrivate` makes on the temporary file, as raw
-/// system-call results. Replaceable in the same builds as `lock_ops`;
+/// Raw results of the calls `writePrivate` makes on its temporary file
+/// (`fsync` and `close`) and of the close `createPrivateAt` checks on
+/// the file it creates. Replaceable in the same builds as `lock_ops`;
 /// constant real calls in any other build.
 pub const WriteOps = struct {
     fsync: *const fn (fd: fsx.fd_t) usize = realFsync,
