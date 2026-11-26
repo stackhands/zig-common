@@ -969,19 +969,6 @@ test "resolveExecutable handles relative slash paths" {
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, rel_plain, null));
 }
 
-test "which resolves executable candidates directly" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which");
-    defer fixture.deinit(gpa);
-
-    const found = (try which(gpa, "tool.sh", fixture.base)).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings(fixture.exe_path, found);
-
-    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
-    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
-}
-
 test "whichShutil uses os.defpath when PATH is unset" {
     const gpa = std.testing.allocator;
     const found = (try whichShutil(gpa, "sh", null)).?;

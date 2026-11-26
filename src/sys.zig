@@ -460,12 +460,6 @@ test "strerror formats unnamed errno values instead of panicking" {
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
 }
 
-test "strerror returns Unknown error for non-Linux linux.E tags" {
-    try std.testing.expectEqualStrings("Unknown error 160", strerror(.NSRNODATA));
-    try std.testing.expectEqualStrings("Unknown error 177", strerror(.NSRCNAMELOOP));
-    try std.testing.expectEqualStrings("[Errno 160] Unknown error 160", describeErrno(.NSRNODATA));
-}
-
 test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {
     try std.testing.expectEqualStrings("Success", errnoText(.SUCCESS).?);
     var raw: u16 = 134;

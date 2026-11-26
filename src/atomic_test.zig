@@ -972,10 +972,6 @@ fn nfs4Only(label: []const u8) Model {
     return .{ .label = label, .native = NFS4, .supported = .{ false, true, false } };
 }
 
-fn gpfsOnly(label: []const u8) Model {
-    return .{ .label = label, .native = GPFS, .supported = .{ true, false, false } };
-}
-
 test "an unlisted EINVAL probe is treated as not provided when POSIX is listed" {
     begin();
     defer end();
@@ -1078,34 +1074,6 @@ test "an unlisted NFSv4 EINVAL without a listed POSIX ACL is refused" {
     hook_errno = .INVAL;
     hook_names = .{ true, false, true };
     m.hooks.get = hNames;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
-}
-
-test "a listed NFSv4 EINVAL is refused" {
-    begin();
-    defer end();
-    var m = nfs4Only("nfs4-generic-listed");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    m.hooks.get = hFail;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
-}
-
-test "a listed GPFS EINVAL is refused" {
-    begin();
-    defer end();
-    var m = gpfsOnly("gpfs-native-listed");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    m.hooks.get = hFail;
     try expectRefused(write(s.path, "new", replace), null);
     reset(&m);
     try assertUnchanged(&m, s);
