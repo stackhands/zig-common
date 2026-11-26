@@ -171,11 +171,13 @@ pub fn normPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
 
 /// Return a normalized absolute path like Python's `os.path.abspath`,
 /// joining relative paths to the current working directory without
-/// following symbolic links. The caller owns the returned slice.
-pub fn absPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
+/// following symbolic links. The caller owns the returned slice. A
+/// relative path is `error.NotFound` when that directory has been
+/// removed, as `os.getcwd` reports.
+pub fn absPath(gpa: Allocator, path: []const u8) (Error || Allocator.Error)![]u8 {
     if (std.mem.startsWith(u8, path, "/")) return normPath(gpa, path);
     var buf: [sys.path_max]u8 = undefined;
-    const cwd_path = realpath(cwd, ".", &buf) catch return normPath(gpa, path);
+    const cwd_path = try getcwd(&buf);
     const joined = try std.mem.concat(gpa, u8, &.{ cwd_path, "/", path });
     defer gpa.free(joined);
     return normPath(gpa, joined);
@@ -210,6 +212,31 @@ test "normPath and absPath match posixpath.normpath and os.path.abspath" {
     const expected = try std.mem.concat(gpa, u8, &.{ here, "/sub/file" });
     defer gpa.free(expected);
     try std.testing.expectEqualStrings(expected, abs_rel);
+}
+
+test "absPath reports a removed working directory" {
+    const gpa = std.testing.allocator;
+    var here_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &here_buf);
+    var hz: [sys.path_max:0]u8 = undefined;
+    const here_z = try sys.z(&hz, here);
+    var gb: [sys.path_max]u8 = undefined;
+    const gone = try std.fmt.bufPrint(&gb, "{s}/.zig-cache/zig-common-abspath-gone-{d}", .{ here, linux.getpid() });
+    var gz: [sys.path_max:0]u8 = undefined;
+    const gone_z = try sys.z(&gz, gone);
+    try std.testing.expectEqual(@as(usize, 0), linux.mkdirat(cwd, gone_z.ptr, 0o700));
+    try std.testing.expectEqual(@as(usize, 0), linux.chdir(gone_z.ptr));
+    defer _ = linux.chdir(here_z.ptr);
+    try sys.unlinkat(cwd, gone, linux.AT.REMOVEDIR);
+
+    // os.path.abspath raises ENOENT from getcwd. A relative path with a
+    // "." segment still needs that directory.
+    try std.testing.expectError(error.NotFound, absPath(gpa, "sub/./file"));
+    try std.testing.expectEqual(linux.E.NOENT, sys.last_errno);
+
+    const abs = try absPath(gpa, "/tmp/./x/../y");
+    defer gpa.free(abs);
+    try std.testing.expectEqualStrings("/tmp/y", abs);
 }
 
 /// Open an existing regular file for reading. `follow` decides whether a

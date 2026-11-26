@@ -283,7 +283,11 @@ pub fn resolveExecutable(gpa: Allocator, name: []const u8, path_env: ?[]const u8
     const abs = if (std.fs.path.isAbsolute(name))
         try gpa.dupe(u8, name)
     else
-        try fsx.absPath(gpa, name);
+        fsx.absPath(gpa, name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // No absolute path exists when the working directory is gone.
+            else => return null,
+        };
     if (!isExecutableFile(abs)) {
         gpa.free(abs);
         return null;
