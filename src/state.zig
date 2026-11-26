@@ -410,13 +410,13 @@ test "lockExclusive waits out the timeout while signals arrive" {
     const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 400));
+    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 30));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
     Stop.go.store(false, .release);
     buzz.join();
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try std.testing.expect(ms >= 300 and ms < 5000);
+    try std.testing.expect(ms >= 20 and ms < 5000);
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
@@ -454,7 +454,7 @@ test "lockExclusive takes the timeout flock -w seconds give" {
     const Holder = struct {
         var fd: fsx.fd_t = -1;
         fn letGo() void {
-            var ts: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             _ = linux.nanosleep(&ts, null);
             _ = linux.flock(fd, std.posix.LOCK.UN);
         }

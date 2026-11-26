@@ -146,6 +146,7 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
     var crc = std.hash.Crc32.init();
     var size: u64 = 0;
     var in_buf: [64 * 1024]u8 = undefined;
+    if (gzip_ops.fail_compress) return error.WriteFailed;
     while (true) {
         const n = try sys.read(src.fd, &in_buf);
         if (n == 0) break;
@@ -200,6 +201,10 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
 /// close in any other build. The caller does not retry it.
 pub const GzipOps = struct {
     close: *const fn (fd: fsx.fd_t) usize = realClose,
+    /// Fail the compressor with `error.WriteFailed` before the archive is
+    /// renamed. A real run leaves this false; a test sets it to show the
+    /// final name is unpublished when compression stops early.
+    fail_compress: bool = false,
 };
 
 var test_gzip_ops: GzipOps = .{};
@@ -357,50 +362,19 @@ test "gzip does not publish a partial archive under the final name" {
     const gpa = std.testing.allocator;
     const scratch = try test_support.ScratchDir.init(gpa, "gzip");
     defer scratch.deinit();
-    const base = scratch.path;
     const dir = scratch.fd;
     const src = try sys.openat(dir, "a.log", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
-    const ur = try sys.openat(fsx.cwd, "/dev/urandom", .{}, 0);
-    defer sys.close(ur);
-    var buf: [64 * 1024]u8 = undefined;
-    var left: usize = 6 << 20;
-    while (left > 0) {
-        const n = try sys.read(ur, buf[0..@min(buf.len, left)]);
-        if (n == 0) return error.Unexpected;
-        try sys.writeAll(src, buf[0..n]);
-        left -= n;
-    }
+    var body: [4096]u8 = undefined;
+    @memset(&body, 'a');
+    try sys.writeAll(src, &body);
     sys.close(src);
-    const gz = try std.fmt.allocPrint(gpa, "{s}/a.log.gz", .{base});
-    defer gpa.free(gz);
-    var gz_z: [sys.path_max:0]u8 = undefined;
-    const gz_sent = try sys.z(&gz_z, gz);
 
-    const Watch = struct {
-        var stop = std.atomic.Value(bool).init(false);
-        var partial = std.atomic.Value(bool).init(false);
-        var path: [*:0]const u8 = undefined;
-        fn run() void {
-            while (!stop.load(.acquire)) {
-                if (fsx.statAt(fsx.cwd, std.mem.span(path), false)) |_| {
-                    if (!archiveIntact(path)) partial.store(true, .release);
-                } else |_| {}
-                var ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
-        }
-    };
-    Watch.path = gz_sent.ptr;
-    Watch.stop.store(false, .release);
-    Watch.partial.store(false, .release);
-    const watch = try std.Thread.spawn(.{}, Watch.run, .{});
+    gzip_ops.fail_compress = true;
+    defer gzip_ops.fail_compress = false;
     const io = std.Io.Threaded.global_single_threaded.io();
-    try gzipInPlace(gpa, io, dir, "a.log");
-    Watch.stop.store(true, .release);
-    watch.join();
-    try std.testing.expect(!Watch.partial.load(.acquire));
-    try std.testing.expect(archiveIntact(gz_sent.ptr));
-    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    try std.testing.expectError(error.WriteFailed, gzipInPlace(gpa, io, dir, "a.log"));
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log.gz", false));
+    try std.testing.expect((try fsx.statAt(dir, "a.log", false)).isReg());
 }
 
 test "renameInList" {

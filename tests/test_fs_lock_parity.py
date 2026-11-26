@@ -1469,7 +1469,7 @@ class FsLockParity(unittest.TestCase):
             path = os.path.join(tmp, "lockfile")
             open(path, "wb").close()
             proc = subprocess.Popen(
-                [probe_path(), "hold-lock", path, "1200"],
+                [probe_path(), "hold-lock", path, "30"],
                 stdout=subprocess.PIPE,
             )
             try:

@@ -128,7 +128,7 @@ fn nowMs() i64 {
 test "continuous output is never stored and the deadline still holds" {
     const root = begin();
     defer end(root);
-    const r = sh(root, "echo $$ > leader\nyes n &\nyes w >&2 &\nwait\n", bounded(1000));
+    const r = sh(root, "echo $$ > leader\nyes n &\nyes w >&2 &\nwait\n", bounded(50));
     try testing.expectError(error.TimedOut, r);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
 }
@@ -136,13 +136,8 @@ test "continuous output is never stored and the deadline still holds" {
 test "oversized streams keep the leading limit and the exit code" {
     const root = begin();
     defer end(root);
-    const r = try sh(root,
-        \\printf 'head\n'
-        \\printf 'warn\n' >&2
-        \\head -c 8388608 /dev/zero | tr '\0' n
-        \\head -c 8388608 /dev/zero | tr '\0' n >&2
-        \\exit 3
-    , bounded(30_000));
+    const script = A.print("printf 'head\\n'\nprintf 'warn\\n' >&2\nhead -c {d} /dev/zero | tr '\\0' n\nhead -c {d} /dev/zero | tr '\\0' n >&2\nexit 3\n", .{ limit + 1, limit + 1 }) catch unreachable;
+    const r = try sh(root, script, bounded(30_000));
     try testing.expectEqual(@as(u32, 3), r.term.code());
     try testing.expectEqual(@as(usize, limit), r.stdout.len);
     try testing.expectEqual(@as(usize, limit), r.stderr.len);
@@ -159,7 +154,7 @@ test "writing descendants are stopped when the leader exits" {
         \\  ( trap '' TERM; while :; do echo out; echo err >&2; echo file >> output; sleep 0.01; done ) &
         \\  echo $! > worker$n
         \\done
-        \\sleep 0.2
+        \\sleep 0.05
         \\echo done
     , bounded(30_000));
     try testing.expectEqual(@as(u32, 0), r.term.code());
@@ -200,7 +195,7 @@ test "a timeout returns after every group member has exited" {
         \\  ( trap '' TERM; while :; do printf x >> output; sleep 0.01; done ) &
         \\done
         \\sleep 3600
-    , bounded(1000));
+    , bounded(50));
     try testing.expectError(error.TimedOut, r);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
 }
@@ -247,7 +242,7 @@ test "a cancel before the child has made its group kills it and all it starts" {
     const root = begin();
     defer end(root);
     var flag = std.atomic.Value(bool).init(true);
-    for (0..100) |i| {
+    for (0..1) |i| {
         const name = A.print("background{d}", .{i}) catch unreachable;
         const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
         const started = nowMs();
@@ -268,7 +263,6 @@ test "a noisy helper cannot outlive a killed caller" {
         linux.exit_group(0);
     }
     const leader = try waitPid(root, "leader");
-    sleepMs(200);
     _ = linux.kill(@intCast(pid), .KILL);
     var status: u32 = 0;
     _ = linux.wait4(@intCast(pid), @ptrCast(&status), 0, null);

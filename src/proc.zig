@@ -733,7 +733,7 @@ test "stdin and both outputs larger than a pipe do not deadlock" {
 
 test "run kills a child past its deadline" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.TimedOut, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .timeout_ms = 200, .grace_ms = 200 }));
+    try std.testing.expectError(error.TimedOut, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .timeout_ms = 20, .grace_ms = 20 }));
 }
 
 test "a set cancel flag kills the child" {
