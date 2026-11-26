@@ -1105,10 +1105,36 @@ fn getcwd(buf: *[sys.path_max]u8) Error![]const u8 {
     return buf[0..n -| 1];
 }
 
+fn realTempProbeClose(fd: fd_t) usize {
+    return linux.close(fd);
+}
+
+/// The close of the probe file `tempDirUsable` writes before a directory
+/// can be chosen. Replaceable in the same builds as `publish_ops`; a
+/// constant real close in any other build. A close that EINTR interrupts
+/// is not retried.
+const TempProbeOps = struct {
+    close: *const fn (fd: fd_t) usize = realTempProbeClose,
+};
+
+var test_temp_probe_ops: TempProbeOps = .{};
+const real_temp_probe_ops: TempProbeOps = .{};
+/// The close in use. A replaceable build may assign through it
+/// (`temp_probe_ops.* = ...`); any other build points it at a constant
+/// real close.
+pub const temp_probe_ops = if (atomic.replaceable) &test_temp_probe_ops else &real_temp_probe_ops;
+
 /// `tempfile._get_default_tempdir`'s probe of one directory: a new file with
 /// a random name, `blat` written to it, closed and removed. Python tries
 /// 100 names, goes on only after a name that exists, and gives up on the
 /// directory at any other error. A short write is not an error there.
+/// The probe is closed once. A failed close gives up on the directory, the
+/// same way Python's `os.close` does: a write lost on NFS may be reported
+/// only by the close, and that directory is not chosen. The probe file is
+/// still removed. A close that EINTR interrupts is not retried and is not
+/// an error, as `sys.result` treats EINTR. The close goes through
+/// `temp_probe_ops`. A cleanup close after an earlier error ignores its
+/// result so that error keeps its errno.
 fn tempDirUsable(gpa: Allocator, dir: []const u8) bool {
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
@@ -1119,10 +1145,34 @@ fn tempDirUsable(gpa: Allocator, dir: []const u8) bool {
             error.Exists => continue,
             else => return false,
         };
+        var open = true;
+        defer if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = temp_probe_ops.close(fd);
+        };
         const wrote = if (sys.call(linux.write, .{ fd, "blat", 4 })) |_| true else |_| false;
-        sys.close(fd);
+        if (!wrote) {
+            open = false;
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = temp_probe_ops.close(fd);
+            sys.unlinkat(cwd, path, 0) catch return false;
+            return false;
+        }
+        // Once. A later failure must not close again.
+        open = false;
+        if (sys.result(temp_probe_ops.close(fd))) |_| {} else |_| {
+            // The close error keeps its errno across the removal.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(cwd, path, 0) catch {};
+            return false;
+        }
         sys.unlinkat(cwd, path, 0) catch return false;
-        return wrote;
+        return true;
     }
     return false;
 }
@@ -1142,10 +1192,11 @@ fn tempDirPath(gpa: Allocator, candidate: []const u8) (Error || Allocator.Error)
 }
 
 /// `tempfile.gettempdir`: the first of `tempDirCandidates` that takes the
-/// probe file, made absolute and normalized like `os.path.abspath`. Python
-/// keeps the answer for the life of the process, and so does `path` here:
-/// a later call returns it without looking at the environment or the
-/// directory again. A failure is not kept; each call tries again.
+/// probe file, made absolute and normalized like `os.path.abspath`. A
+/// directory whose probe close fails did not take it. Python keeps the
+/// answer for the life of the process, and so does `path` here: a later
+/// call returns it without looking at the environment or the directory
+/// again. A failure is not kept; each call tries again.
 ///
 /// `path` and `message` are allocated from the `gpa` given to `get` and
 /// owned by the `TempDir`; `deinit` frees them. Nothing else a call
@@ -2604,4 +2655,83 @@ test "dir close: moveAcross parent sync publishes on EINTR" {
     try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
     try std.testing.expect((try statAt(scratch.fd, "dst", false)).isDir());
     try expectNoTmp(gpa, scratch.fd);
+}
+
+const TempProbeHook = struct {
+    var closes: usize = 0;
+    var errno: linux.E = .SUCCESS;
+
+    fn arm(e: linux.E) void {
+        closes = 0;
+        errno = e;
+        temp_probe_ops.* = .{ .close = close };
+    }
+
+    /// Linux frees the descriptor whatever close returns, so the hook closes
+    /// it for real and then reports the errno it was given.
+    fn close(fd: fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (errno == .SUCCESS) return rc;
+        return @bitCast(-@as(isize, @backingInt(errno)));
+    }
+};
+
+fn expectEmptyDir(gpa: Allocator, dir: fd_t) !void {
+    var it = try DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    try std.testing.expect(try it.next() == null);
+}
+
+test "temp dir probe close: EIO leaves the directory unchosen" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-temp-probe-eio");
+    defer scratch.deinit();
+    defer temp_probe_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    TempProbeHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expect(!tempDirUsable(gpa, scratch.path));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), TempProbeHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectEmptyDir(gpa, scratch.fd);
+
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMPDIR", scratch.path);
+    try env.put(gpa, "TEMP", "/nonexistent-zig-common-temp-probe");
+    try env.put(gpa, "TMP", "/nonexistent-zig-common-temp-probe-2");
+    TempProbeHook.arm(.IO);
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+    try std.testing.expectError(error.NoTempDir, td.get(gpa, env));
+    try std.testing.expect(td.path == null);
+    try expectEmptyDir(gpa, scratch.fd);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+}
+
+test "temp dir probe close: EINTR counts the directory usable" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-temp-probe-eintr");
+    defer scratch.deinit();
+    defer temp_probe_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    TempProbeHook.arm(.INTR);
+    try std.testing.expect(tempDirUsable(gpa, scratch.path));
+    try std.testing.expectEqual(@as(usize, 1), TempProbeHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectEmptyDir(gpa, scratch.fd);
+
+    TempProbeHook.arm(.INTR);
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMPDIR", scratch.path);
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+    try std.testing.expectEqualStrings(scratch.path, try td.get(gpa, env));
+    try std.testing.expect(td.path != null);
+    try std.testing.expectEqual(@as(usize, 1), TempProbeHook.closes);
+    try expectEmptyDir(gpa, scratch.fd);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
 }

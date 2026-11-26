@@ -1,0 +1,1 @@
+`fsx.TempDir.get` does not keep a directory whose probe file close fails, so a write that a network file system (NFS) reported lost at the close is not committed as the temporary directory. The probe file is removed. A close that `EINTR` interrupts counts as success and is not retried. The close goes through `fsx.temp_probe_ops`.
