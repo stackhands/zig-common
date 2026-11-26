@@ -22,8 +22,9 @@ const posix_access = "system.posix_acl_access";
 /// filesystem's ACL model or a failing call, in a `replaceable` build only
 /// (this library's tests, a tool's -Dtest-ops artifact). `created` runs on
 /// the temporary file right after its O_EXCL creation, where a filesystem
-/// applies an inherited ACL. `close` is that temporary file's close, before
-/// the rename; the caller does not retry it.
+/// applies an inherited ACL. `close` is the temporary file's close before
+/// the rename, and the parent directory's close after its sync; the caller
+/// does not retry either.
 pub const Ops = struct {
     flistxattr: *const fn (fd: sys.fd_t, buf: []u8) usize = realList,
     fgetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize = realGet,
@@ -453,12 +454,19 @@ pub fn fileMode(path: []const u8) u32 {
     return 0o644 & ~currentUmask();
 }
 
-/// Open `path` read-only and fsync it. For a directory, that makes a
-/// rename or a new name in it durable.
+/// Open `path` read-only, fsync it and close it. For a directory, that
+/// makes a rename or a new name in it durable. A failed close is returned
+/// with `sys.last_errno` set. A close that EINTR interrupts is not retried
+/// and is not an error, as `sys.result` treats EINTR. The close goes
+/// through `ops.close`. On an earlier error the cleanup close is ignored
+/// and that errno is kept.
 pub fn fsyncDir(path: []const u8) sys.Error!void {
     const fd = try sys.openat(fsx.cwd, path, .{}, 0);
-    defer sys.close(fd);
+    var open = true;
+    errdefer if (open) closeDiscarded(fd);
     try sys.fsync(fd);
+    open = false;
+    try closeTemp(fd);
 }
 
 /// os.makedirs(path, exist_ok=True): a name that exists as something
@@ -595,9 +603,11 @@ pub const WriteOptions = struct {
 /// points STEP.write, STEP.fsync and STEP.rename precede those
 /// operations, and in a replaceable build can fail them (Faults.fails);
 /// the destination is never unlinked first. The close goes through
-/// `ops.close`. Everything it allocates from `a` is freed before it
-/// returns, except the failure message in `why`. Call `why.deinit(a)`
-/// after any error.
+/// `ops.close`. After the rename the parent directory is synced and closed
+/// through that same call. A failed close of the directory is reported
+/// with no path, and the destination keeps the bytes the rename published.
+/// Everything it allocates from `a` is freed before it returns, except the
+/// failure message in `why`. Call `why.deinit(a)` after any error.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
@@ -681,8 +691,11 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     renamed = true;
     // Opening the directory names it. Flushing the descriptor names no file.
     const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
-    defer sys.close(directory);
+    var dir_open = true;
+    defer if (dir_open) closeDiscarded(directory);
     sys.fsync(directory) catch |err| return failOs(a, why, err, null, null);
+    dir_open = false;
+    closeTemp(directory) catch |err| return failOs(a, why, err, null, null);
 }
 
 /// atomic_write pinned to an open directory: replace `dir/name` with
