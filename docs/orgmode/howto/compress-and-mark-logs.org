@@ -36,7 +36,7 @@ Such a log is marked by a line in its directory's =.licensed-logs= list, which n
    #+end_src
 
    Each archive keeps the log's mode and its access and modification times, and its header carries the log's name.
-   The archive is written under a temporary name and renamed into place, and only then is the log removed.
+   The archive is written under a temporary name, flushed, synced and closed, then renamed into place, and only then is the log removed. A failed close leaves the log as it was and removes the temporary file.
 
 3. Rewrite the list when it names any of them:
 
