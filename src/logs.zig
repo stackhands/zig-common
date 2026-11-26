@@ -29,6 +29,14 @@ pub const GzipError = sys.Error || Allocator.Error || error{WriteFailed};
 /// bits and access and modification times, and the original is removed.
 /// A file with other hard links, a symbolic link, a non-regular file and an
 /// existing `name.gz` are refused, as gzip refuses them.
+/// The compressed bytes go to a temporary file, which is flushed, synced
+/// and closed before it is renamed over `name.gz`. A failed close is
+/// returned with `sys.last_errno` set to its errno; the temporary file is
+/// removed and both `name` and `name.gz` are left as they were. A write
+/// lost on NFS may be reported only by the close. That descriptor is
+/// closed once on every path. A close that EINTR interrupts is not
+/// retried, as Linux has freed the descriptor, and is not an error, as
+/// `sys.result` treats EINTR.
 pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) GzipError!void {
     var failed_at: GzipStep = undefined;
     return gzipInPlaceAtStep(gpa, io, dir, name, &failed_at);
@@ -56,7 +64,8 @@ pub const GzipStep = enum {
 /// `gzipInPlace`, which also sets `failed_at` to the step an error came
 /// from. It reads `.archive` until the archive is in place and the original
 /// removed, and `.directory_sync` from right before the final sync of the
-/// archive's directory.
+/// archive's directory. A failed close of the temporary archive is
+/// `.archive`: the rename has not run.
 pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8, failed_at: *GzipStep) GzipError!void {
     failed_at.* = .archive;
     const src = try fsx.openRegular(dir, name, false);
@@ -98,10 +107,21 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
         .EXCL = true,
         .NOFOLLOW = true,
     }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(dst);
-        if (!done) sys.unlinkat(dir, tmp_name, 0) catch {};
+        if (open) {
+            // Linux frees the descriptor whatever close reports. Keep the
+            // errno of the failure being returned.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = gzip_ops.close(dst);
+        }
+        if (!done) {
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp_name, 0) catch {};
+        }
     }
 
     const file: Io.File = .{ .handle = dst, .flags = .{ .nonblocking = false } };
@@ -148,6 +168,9 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
     const times = [2]linux.timespec{ src.stat.atime, src.stat.mtime };
     _ = try sys.call(linux.futimens, .{ dst, &times });
     try sys.fsync(dst);
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    _ = try sys.result(gzip_ops.close(dst));
     try sys.renameat(dir, tmp_name, dir, gz_name);
     sys.unlinkat(dir, name, 0) catch |err| {
         // The archive is complete, but the original is still there. Drop
@@ -161,6 +184,23 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
     const parent_fd = try fsx.openDir(dir, gz_parent, true);
     defer sys.close(parent_fd);
     try sys.fsync(parent_fd);
+}
+
+/// The close of the temporary archive `gzipInPlaceAtStep` publishes, as a
+/// raw system-call result. Replaceable in the same builds as `atomic.ops`;
+/// a constant real close in any other build. The caller does not retry it.
+pub const GzipOps = struct {
+    close: *const fn (fd: fsx.fd_t) usize = realClose,
+};
+
+var test_gzip_ops: GzipOps = .{};
+const real_gzip_ops: GzipOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`gzip_ops.* = ...`); any other build points it at a constant real close.
+pub const gzip_ops = if (@import("atomic.zig").replaceable) &test_gzip_ops else &real_gzip_ops;
+
+fn realClose(fd: fsx.fd_t) usize {
+    return linux.close(fd);
 }
 
 /// The lines of a `.licensed-logs` list with every line found in `renames`
@@ -475,26 +515,33 @@ test "gzipInPlaceAtStep reports directory_sync when only the directory sync fail
             const io = std.Io.Threaded.global_single_threaded.io();
             writeLog(dir, "a.log") catch return 22;
 
-            // The source and the temporary archive take the two lowest free
-            // descriptors. With the limit right above them, every step up to
-            // removing the original has the descriptors it needs, while the
-            // open for the final directory sync is the first call refused.
-            const first = sys.openat(fsx.cwd, "/dev/null", .{}, 0) catch return 23;
-            const second = sys.openat(fsx.cwd, "/dev/null", .{}, 0) catch {
-                sys.close(first);
-                return 24;
+            // The temporary archive is closed before the directory is
+            // opened, so a limit set in advance would hand that descriptor
+            // to the directory open. Close the archive for real, then leave
+            // no free descriptor. Rename and unlink need none, and the
+            // directory open is the call that is refused.
+            const Limit = struct {
+                var saved: linux.rlimit = .{ .cur = 0, .max = 0 };
+                var lowered = false;
+                fn close(fd: fsx.fd_t) usize {
+                    const rc = linux.close(fd);
+                    if (linux.errno(rc) != .SUCCESS) return rc;
+                    if (linux.errno(linux.prlimit(0, .NOFILE, null, &saved)) != .SUCCESS)
+                        return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+                    const none: linux.rlimit = .{ .cur = 0, .max = saved.max };
+                    if (linux.errno(linux.prlimit(0, .NOFILE, &none, null)) != .SUCCESS)
+                        return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+                    lowered = true;
+                    return rc;
+                }
             };
-            sys.close(first);
-            sys.close(second);
-            var saved: linux.rlimit = undefined;
-            if (linux.errno(linux.prlimit(0, .NOFILE, null, &saved)) != .SUCCESS) return 25;
-            const tight: linux.rlimit = .{ .cur = @intCast(second + 1), .max = saved.max };
-            if (linux.errno(linux.prlimit(0, .NOFILE, &tight, null)) != .SUCCESS) return 26;
+            gzip_ops.* = .{ .close = Limit.close };
+            defer gzip_ops.* = .{};
 
             var failed_at: GzipStep = .archive;
             const got = gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
             const got_errno = sys.last_errno;
-            if (linux.errno(linux.prlimit(0, .NOFILE, &saved, null)) != .SUCCESS) return 27;
+            if (Limit.lowered and linux.errno(linux.prlimit(0, .NOFILE, &Limit.saved, null)) != .SUCCESS) return 27;
             if (got) |_| return 28 else |err| if (err != error.Unexpected) return 29;
             if (got_errno != .MFILE) return 30;
             if (failed_at != .directory_sync) return 31;
@@ -510,4 +557,85 @@ test "gzipInPlaceAtStep reports directory_sync when only the directory sync fail
         }
     };
     try test_support.expectChildPasses(Child.run);
+}
+
+const GzipClose = struct {
+    var closes: usize = 0;
+    var close_errno: linux.E = .SUCCESS;
+
+    fn set(close_e: linux.E) void {
+        closes = 0;
+        close_errno = close_e;
+        gzip_ops.* = .{ .close = close };
+    }
+
+    /// Linux frees the descriptor whatever close returns, so the hook
+    /// closes it for real and then reports the errno it was given, on the
+    /// first call only: a second close of the descriptor is EBADF.
+    fn close(fd: fsx.fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (close_errno == .SUCCESS or closes > 1) return rc;
+        return @bitCast(-@as(isize, @backingInt(close_errno)));
+    }
+};
+
+fn expectNoGzTemp(gpa: Allocator, dir: fsx.fd_t) !void {
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| try std.testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+}
+
+test "gzip close EIO leaves the log and publishes nothing" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-close-eio");
+    defer scratch.deinit();
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    defer gzip_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    GzipClose.set(.IO);
+    sys.last_errno = .SUCCESS;
+    var failed_at: GzipStep = .directory_sync;
+    const got = gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    gzip_ops.* = .{};
+    try std.testing.expectError(error.Unexpected, got);
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+    try std.testing.expectEqual(@as(usize, 1), GzipClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectNoGzTemp(gpa, dir);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log.gz", false));
+    const f = try fsx.openRegular(dir, "a.log", false);
+    defer sys.close(f.fd);
+    const body = try fsx.readAll(gpa, f.fd, 64);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("a log\n", body);
+}
+
+test "gzip close EINTR publishes the archive and closes once" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-close-eintr");
+    defer scratch.deinit();
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    defer gzip_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    GzipClose.set(.INTR);
+    var failed_at: GzipStep = .archive;
+    try gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    gzip_ops.* = .{};
+    try std.testing.expectEqual(@as(usize, 1), GzipClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectNoGzTemp(gpa, dir);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    const f = try fsx.openRegular(dir, "a.log.gz", false);
+    defer sys.close(f.fd);
+    const raw = try fsx.readAll(gpa, f.fd, 1 << 20);
+    defer gpa.free(raw);
+    const plain = try gunzip(gpa, raw, 64);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("a log\n", plain);
 }
