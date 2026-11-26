@@ -251,19 +251,28 @@ fn copyFd(src: fd_t, dst: fd_t) Error!void {
 
 /// Copy an open regular file to `dir/name`: all of it, whatever the
 /// descriptor's offset, which is left where it was. The bytes are written
-/// to a temporary file in `dir`, synced, and renamed over `name`, so a
-/// short write (a full disk, a file-size limit) leaves an existing
-/// destination as it was and does not publish a partial file under `name`.
-/// An existing regular file keeps its owner, when this process may set it,
-/// and its mode; a new file gets the source's permission bits less the
-/// umask. A destination that is a symbolic link or not a regular file is
-/// refused. A destination with other hard links keeps those links on the
-/// previous inode; `name` is the new inode. The directory that receives
-/// `name` is synced and closed after the rename. A failed close is returned
-/// with `sys.last_errno` set and `name` is left as the rename made it. A
-/// close that EINTR interrupts is not retried and is not an error, as
-/// `sys.result` treats EINTR. That close is replaceable through
-/// `publish_ops`. Returns the open destination, which the caller closes.
+/// to a temporary file in `dir`, synced and closed, then renamed over
+/// `name`, so a short write (a full disk, a file-size limit) leaves an
+/// existing destination as it was and does not publish a partial file
+/// under `name`. An existing regular file keeps its owner, when this
+/// process may set it, and its mode; a new file gets the source's
+/// permission bits less the umask. A destination that is a symbolic link
+/// or not a regular file is refused. A destination with other hard links
+/// keeps those links on the previous inode; `name` is the new inode.
+/// A failed close before that rename is returned with `sys.last_errno`
+/// set, the destination is left as it was, and the temporary file is
+/// removed. A write lost on a network file system may be reported only
+/// by the close. The temporary descriptor is closed once on every path.
+/// A close that EINTR interrupts is not retried, as Linux has freed the
+/// descriptor, and is not an error, as `sys.result` treats EINTR. The
+/// directory that receives `name` is synced and closed after the rename.
+/// A failed close there is returned with `sys.last_errno` set and `name`
+/// is left as the rename made it. Both closes are replaceable through
+/// `publish_ops`. The temporary descriptor is duplicated before that
+/// close, and the duplicate is returned. It shares the open file
+/// description, so the close of one still reports a lost network write
+/// and the duplicate stays at the end the write left. It still refers
+/// to the inode that was written if `name` is replaced after the rename.
 pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t {
     const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
         error.NotFound => null,
@@ -278,10 +287,21 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
         .EXCL = true,
         .NOFOLLOW = true,
     }, if (existing != null) 0o600 else @intCast(src_stat.mode & 0o777));
+    var open = true;
     var done = false;
     errdefer {
-        sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = publish_ops.close(fd);
+        }
+        if (!done) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     try copyFd(src, fd);
     if (existing) |st| {
@@ -294,10 +314,27 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
         try sys.fchmod(fd, @intCast(st.perm()));
     }
     try sys.fsync(fd);
+    // Same open file description as fd, so the offset stays where the
+    // write left it, and CLOEXEC matches openat. Reopening tmp by name
+    // would let another actor swap that name after the close.
+    const published: fd_t = @intCast(try sys.call(linux.fcntl, .{
+        fd,
+        linux.F.DUPFD_CLOEXEC,
+        @as(usize, 0),
+    }));
+    errdefer {
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
+        sys.close(published);
+    }
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    try closeBeforePublish(fd);
     try sys.renameat(dir, tmp, dir, name);
     done = true;
     try fsyncNameParent(dir, name);
-    return fd;
+    return published;
 }
 
 /// Append `line` and a newline to `dir/name` in one write, creating the file
@@ -2298,6 +2335,94 @@ test "fsx publish close: appendLine keeps the line on EINTR" {
     try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
     try std.testing.expectEqual(before, try test_support.fdCount(gpa));
     try expectText(gpa, scratch.fd, "list", "old\nnew\n");
+}
+
+test "fsx publish close: copyTo returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-copyto-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "old\n");
+    const opened = try openRegular(scratch.fd, "src", false);
+    defer sys.close(opened.fd);
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, copyTo(opened.fd, opened.stat, scratch.fd, "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "dst", "old\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: copyTo publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-copyto-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "old\n");
+    const opened = try openRegular(scratch.fd, "src", false);
+    defer sys.close(opened.fd);
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.INTR);
+    const fd = try copyTo(opened.fd, opened.stat, scratch.fd, "dst");
+    // The same offset the write left, so a later write appends.
+    try std.testing.expectEqual(@as(u64, 4), linux.lseek(fd, 0, linux.SEEK.CUR));
+    sys.close(fd);
+    // The file close, then the parent directory close. EINTR is not retried.
+    try std.testing.expectEqual(@as(usize, 2), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "dst", "new\n");
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+const CopyToReplaceHook = struct {
+    var dir: fd_t = -1;
+    var directory_closes: usize = 0;
+
+    fn arm(d: fd_t) void {
+        dir = d;
+        directory_closes = 0;
+        publish_ops.* = .{ .close = close };
+    }
+
+    fn close(fd: fd_t) usize {
+        const is_dir = if (fstat(fd)) |st| st.isDir() else |_| false;
+        const rc = linux.close(fd);
+        if (is_dir) {
+            directory_closes += 1;
+            if (directory_closes == 1) {
+                sys.renameat(dir, "dst", dir, "published") catch unreachable;
+                sys.renameat(dir, "other", dir, "dst") catch unreachable;
+            }
+        }
+        return rc;
+    }
+};
+
+test "copyTo returns the inode it published if the name is replaced" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-copyto-replaced");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "old\n");
+    try putBytes(scratch.fd, "other", "other\n");
+    const opened = try openRegular(scratch.fd, "src", false);
+    defer sys.close(opened.fd);
+    CopyToReplaceHook.arm(scratch.fd);
+    const fd = try copyTo(opened.fd, opened.stat, scratch.fd, "dst");
+    defer sys.close(fd);
+    const returned = try fstat(fd);
+    const published = try statAt(scratch.fd, "published", false);
+    const replacement = try statAt(scratch.fd, "dst", false);
+    try std.testing.expectEqual(published.ino, returned.ino);
+    try std.testing.expect(returned.ino != replacement.ino);
+    try expectText(gpa, scratch.fd, "published", "new\n");
+    try expectText(gpa, scratch.fd, "dst", "other\n");
 }
 
 const DirCloseHook = struct {
