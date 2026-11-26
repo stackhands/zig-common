@@ -258,8 +258,12 @@ fn copyFd(src: fd_t, dst: fd_t) Error!void {
 /// and its mode; a new file gets the source's permission bits less the
 /// umask. A destination that is a symbolic link or not a regular file is
 /// refused. A destination with other hard links keeps those links on the
-/// previous inode; `name` is the new inode. Returns the open destination,
-/// which the caller closes.
+/// previous inode; `name` is the new inode. The directory that receives
+/// `name` is synced and closed after the rename. A failed close is returned
+/// with `sys.last_errno` set and `name` is left as the rename made it. A
+/// close that EINTR interrupts is not retried and is not an error, as
+/// `sys.result` treats EINTR. That close is replaceable through
+/// `publish_ops`. Returns the open destination, which the caller closes.
 pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t {
     const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
         error.NotFound => null,
@@ -463,8 +467,16 @@ fn moveFsync(faults: MoveFaults, dir: fd_t) Error!void {
 /// `fsyncNameParent` for moveAcross, reported to its trace.
 fn moveFsyncNameParent(faults: MoveFaults, dir: fd_t, name: []const u8) Error!void {
     const parent_dir = try openDir(dir, std.fs.path.dirname(name) orelse ".", true);
-    defer sys.close(parent_dir);
+    var open = true;
+    errdefer if (open) {
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
+        _ = publish_ops.close(parent_dir);
+    };
     try moveFsync(faults, parent_dir);
+    open = false;
+    try closeBeforePublish(parent_dir);
 }
 
 /// Whether `a_dir/a_name` and `b_dir/b_name` name entries of the same
@@ -492,8 +504,16 @@ fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
 fn fsyncNameParent(dir: fd_t, name: []const u8) Error!void {
     const parent = std.fs.path.dirname(name) orelse ".";
     const parent_dir = try openDir(dir, parent, true);
-    defer sys.close(parent_dir);
+    var open = true;
+    errdefer if (open) {
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
+        _ = publish_ops.close(parent_dir);
+    };
     try sys.fsync(parent_dir);
+    open = false;
+    try closeBeforePublish(parent_dir);
 }
 
 fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossPolicy) Error!void {
@@ -508,10 +528,11 @@ fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossP
 }
 
 /// The close of a file about to be published by `replaceContents` or by the
-/// cross-device copy inside `moveAcross`, and the close after `appendLine`
-/// writes, as a raw system-call result. Replaceable in the same builds as
-/// `atomic.ops`; constant real calls in any other build. A close that EINTR
-/// interrupts is not retried.
+/// cross-device copy inside `moveAcross`, the close after `appendLine`
+/// writes, and the close of a directory after the sync that makes that
+/// directory durable, as a raw system-call result. Replaceable in the same
+/// builds as `atomic.ops`; constant real calls in any other build. A close
+/// that EINTR interrupts is not retried.
 pub const PublishOps = struct {
     close: *const fn (fd: fd_t) usize = realPublishClose,
 };
@@ -528,10 +549,11 @@ fn realPublishClose(fd: fd_t) usize {
 
 /// Close `fd` once. `replaceContents` and the cross-device copy inside
 /// `moveAcross` do this before the file is published; `appendLine` does this
-/// after the write. EINTR is success and is not retried, as Linux has freed
-/// the descriptor and `sys.result` does not treat EINTR as an error. Any
-/// other errno is returned with `sys.last_errno` set. The caller does not
-/// close `fd` again.
+/// after the write; a directory is closed after the sync that makes it
+/// durable. EINTR is success and is not retried, as Linux has freed the
+/// descriptor and `sys.result` does not treat EINTR as an error. Any other
+/// errno is returned with `sys.last_errno` set. The caller does not close
+/// `fd` again.
 fn closeBeforePublish(fd: fd_t) Error!void {
     _ = try sys.result(publish_ops.close(fd));
 }
@@ -583,11 +605,19 @@ fn copyTreeContents(gpa: Allocator, src_fd: fd_t, dst_fd: fd_t, policy: MoveAcro
                 const sdir = try openDir(src_fd, e.name, false);
                 defer sys.close(sdir);
                 const ddir = try openDir(dst_fd, e.name, false);
-                defer sys.close(ddir);
+                var dopen = true;
+                errdefer if (dopen) {
+                    // The error being returned keeps its errno.
+                    const saved = sys.last_errno;
+                    defer sys.last_errno = saved;
+                    _ = publish_ops.close(ddir);
+                };
                 try copyTreeContents(gpa, sdir, ddir, policy);
                 const st = try fstat(sdir);
                 try setModeOwnerAndAcl(sdir, st, ddir, policy);
                 try sys.fsync(ddir);
+                dopen = false;
+                try closeBeforePublish(ddir);
             },
             DT.LNK => try copyLinkAt(src_fd, e.name, dst_fd, e.name),
             else => return error.NotRegularFile,
@@ -622,10 +652,18 @@ fn moveAcrossCopy(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: 
         const sdir = try openDir(src_dir, src_name, false);
         defer sys.close(sdir);
         const ddir = try openDir(dst_dir, tmp, false);
-        defer sys.close(ddir);
+        var dopen = true;
+        errdefer if (dopen) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = publish_ops.close(ddir);
+        };
         try copyTreeContents(gpa, sdir, ddir, opts.policy);
         try setModeOwnerAndAcl(sdir, src, ddir, opts.policy);
         try sys.fsync(ddir);
+        dopen = false;
+        try closeBeforePublish(ddir);
     } else if (src.isLink()) {
         try copyLinkAt(src_dir, src_name, dst_dir, tmp);
     } else {
@@ -662,11 +700,14 @@ fn moveAcrossInternal(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_d
 
 /// Move `src_dir/src_name` to `dst_dir/dst_name`. On one file system this is
 /// a rename; on `error.CrossDevice` it copies to a destination-side temporary
-/// path, syncs and closes each copied regular file, then atomically publishes
-/// with rename and removes the source. A failed close is returned with
-/// `sys.last_errno` set, the destination name is left as it was, and the
-/// temporary path is removed. Each copied descriptor is closed once. A close
-/// that EINTR interrupts is not retried and is not an error, as `sys.result`
+/// path, syncs and closes each copied regular file and each copied
+/// directory, then atomically publishes with rename and removes the source.
+/// A failed close before that rename is returned with `sys.last_errno` set,
+/// the destination name is left as it was, and the temporary path is
+/// removed. The parent directory is synced and closed after the rename. A
+/// failed close there is returned and the published name is left as the
+/// rename made it. Each of these descriptors is closed once. A close that
+/// EINTR interrupts is not retried and is not an error, as `sys.result`
 /// treats EINTR. The close is replaceable through `publish_ops`.
 pub fn moveAcross(gpa: Allocator, src_dir: fd_t, src_name: []const u8, dst_dir: fd_t, dst_name: []const u8, opts: MoveAcrossOptions) (Error || Allocator.Error)!void {
     return moveAcrossInternal(gpa, src_dir, src_name, dst_dir, dst_name, opts, .{});
@@ -2175,7 +2216,8 @@ test "fsx publish close: moveAcross file publishes on EINTR" {
     const before = try test_support.fdCount(gpa);
     PublishHook.arm(.INTR);
     try crossMove(gpa, scratch.fd, "src", "dst");
-    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    // The file, then the destination parent and the source parent.
+    try std.testing.expectEqual(@as(usize, 3), PublishHook.closes);
     try std.testing.expectEqual(before, try test_support.fdCount(gpa));
     try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
     try expectText(gpa, scratch.fd, "dst", "new\n");
@@ -2197,7 +2239,8 @@ test "fsx publish close: moveAcross tree returns EIO and leaves the destination"
     sys.last_errno = .SUCCESS;
     try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
     try std.testing.expectEqual(linux.E.IO, sys.last_errno);
-    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    // The file close fails, then the temporary directory is closed on the way out.
+    try std.testing.expectEqual(@as(usize, 2), PublishHook.closes);
     try std.testing.expectEqual(before, try test_support.fdCount(gpa));
     try expectText(gpa, sub, "a", "tree\n");
     try std.testing.expectError(error.NotFound, statAt(scratch.fd, "dst", false));
@@ -2217,7 +2260,8 @@ test "fsx publish close: moveAcross tree publishes on EINTR" {
     const before = try test_support.fdCount(gpa);
     PublishHook.arm(.INTR);
     try crossMove(gpa, scratch.fd, "src", "dst");
-    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    // The file, the temporary directory, then both parent directories.
+    try std.testing.expectEqual(@as(usize, 4), PublishHook.closes);
     try std.testing.expectEqual(before, try test_support.fdCount(gpa));
     try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
     try expectText(gpa, scratch.fd, "dst/a", "tree\n");
@@ -2254,4 +2298,185 @@ test "fsx publish close: appendLine keeps the line on EINTR" {
     try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
     try std.testing.expectEqual(before, try test_support.fdCount(gpa));
     try expectText(gpa, scratch.fd, "list", "old\nnew\n");
+}
+
+const DirCloseHook = struct {
+    var closes: usize = 0;
+    var errno: linux.E = .SUCCESS;
+    /// 1-based index of the directory close that reports `errno`.
+    var fail_at: usize = 1;
+
+    fn arm(e: linux.E, at: usize) void {
+        closes = 0;
+        errno = e;
+        fail_at = at;
+        publish_ops.* = .{ .close = close };
+    }
+
+    /// Closes `fd` for real. A file is returned unchanged. `errno` is
+    /// reported for one directory close, and later directory closes are the
+    /// real result, so that call is not retried.
+    fn close(fd: fd_t) usize {
+        const is_dir = if (fstat(fd)) |st| st.isDir() else |_| false;
+        const rc = linux.close(fd);
+        if (!is_dir) return rc;
+        closes += 1;
+        if (errno == .SUCCESS or closes != fail_at) return rc;
+        return @bitCast(-@as(isize, @backingInt(errno)));
+    }
+};
+
+fn mkdirAt(dir: fd_t, name: []const u8) !void {
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = try sys.call(linux.mkdirat, .{ dir, (try sys.z(&zb, name)).ptr, @as(linux.mode_t, 0o700) });
+}
+
+test "dir close: moveAcross empty directory returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-empty-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.IO, 1);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expect((try statAt(scratch.fd, "src", false)).isDir());
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "dst", false));
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "dir close: moveAcross empty directory publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-empty-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.INTR, 1);
+    try crossMove(gpa, scratch.fd, "src", "dst");
+    // Temporary directory, then the destination parent and the source parent.
+    try std.testing.expectEqual(@as(usize, 3), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
+    try std.testing.expect((try statAt(scratch.fd, "dst", false)).isDir());
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "dir close: copied subdirectory returns EIO and leaves the destination" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-sub-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const sub = try openDir(scratch.fd, "src", false);
+    defer sys.close(sub);
+    try mkdirAt(sub, "child");
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.IO, 1);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    // The child close fails, then the temporary directory is closed on the way out.
+    try std.testing.expectEqual(@as(usize, 2), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expect((try statAt(sub, "child", false)).isDir());
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "dst", false));
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "dir close: copied subdirectory publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-sub-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const sub = try openDir(scratch.fd, "src", false);
+    try mkdirAt(sub, "child");
+    sys.close(sub);
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.INTR, 1);
+    try crossMove(gpa, scratch.fd, "src", "dst");
+    // Child directory, temporary root, then both parents.
+    try std.testing.expectEqual(@as(usize, 4), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
+    try std.testing.expect((try statAt(scratch.fd, "dst/child", false)).isDir());
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "dir close: copyTo parent returns EIO and leaves the published file" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-copy-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "old\n");
+    const opened = try openRegular(scratch.fd, "src", false);
+    defer sys.close(opened.fd);
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.IO, 1);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, copyTo(opened.fd, opened.stat, scratch.fd, "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "dst", "new\n");
+}
+
+test "dir close: copyTo parent publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-copy-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "src", "new\n");
+    try putBytes(scratch.fd, "dst", "old\n");
+    const opened = try openRegular(scratch.fd, "src", false);
+    defer sys.close(opened.fd);
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.INTR, 1);
+    const fd = try copyTo(opened.fd, opened.stat, scratch.fd, "dst");
+    sys.close(fd);
+    try std.testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "dst", "new\n");
+}
+
+test "dir close: moveAcross parent sync returns EIO and leaves the published tree" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-parent-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const before = try test_support.fdCount(gpa);
+    // The second directory close is the destination parent, after the rename.
+    DirCloseHook.arm(.IO, 2);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, crossMove(gpa, scratch.fd, "src", "dst"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 2), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expect((try statAt(scratch.fd, "src", false)).isDir());
+    try std.testing.expect((try statAt(scratch.fd, "dst", false)).isDir());
+    try expectNoTmp(gpa, scratch.fd);
+}
+
+test "dir close: moveAcross parent sync publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-dir-close-parent-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try mkdirAt(scratch.fd, "src");
+    const before = try test_support.fdCount(gpa);
+    DirCloseHook.arm(.INTR, 2);
+    try crossMove(gpa, scratch.fd, "src", "dst");
+    // Temporary directory, destination parent, then the source parent.
+    try std.testing.expectEqual(@as(usize, 3), DirCloseHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
+    try std.testing.expect((try statAt(scratch.fd, "dst", false)).isDir());
+    try expectNoTmp(gpa, scratch.fd);
 }

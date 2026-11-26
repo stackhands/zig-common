@@ -2044,7 +2044,9 @@ fn expectPublishClose(dir_path: []const u8, dfd: fsx.fd_t, close_errno: linux.E,
                 try testing.expectEqualStrings("old\n", readFile(path));
             } else try testing.expect(!exists(path));
         } else try testing.expectEqualStrings("new\n", readFile(path));
-        try testing.expectEqual(@as(usize, 1), ncloses);
+        // atomicWrite also closes the parent directory after the rename.
+        const want_closes: usize = if (!fails and !c.at) 2 else 1;
+        try testing.expectEqual(want_closes, ncloses);
         try testing.expectEqual(before, try test_support.fdCount(gpa));
         try expectNoPublishTemp(gpa, dfd);
     }
@@ -2080,4 +2082,95 @@ test "a failed fsync of an atomic write closes the temporary file once" {
     const dfd = try fsx.openDir(fsx.cwd, dir_path, false);
     defer sys.close(dfd);
     try expectPublishClose(dir_path, dfd, .SUCCESS, true, .IO, error.Unexpected, true);
+}
+
+const DirCloseHook = struct {
+    var closes: usize = 0;
+    var errno: linux.E = .SUCCESS;
+    /// When set, only a directory descriptor is injected. A file close stays
+    /// the real call, so the parent close can fail on its own.
+    var dirs_only: bool = false;
+
+    fn arm(e: linux.E, directories_only: bool) void {
+        closes = 0;
+        errno = e;
+        dirs_only = directories_only;
+        atomic.ops.close = close;
+    }
+
+    fn close(fd: sys.fd_t) usize {
+        const is_dir = if (fsx.fstat(fd)) |st| st.isDir() else |_| false;
+        const rc = linux.close(fd);
+        if (dirs_only and !is_dir) return rc;
+        closes += 1;
+        if (errno == .SUCCESS or closes > 1) return rc;
+        return err(errno);
+    }
+};
+
+test "dir close: fsyncDir returns EIO and leaves the directory" {
+    begin();
+    defer end();
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    DirCloseHook.arm(.IO, false);
+    sys.last_errno = .SUCCESS;
+    try testing.expectError(error.Unexpected, atomic.fsyncDir(dir_path));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try testing.expect(exists(dir_path));
+}
+
+test "dir close: fsyncDir publishes on EINTR" {
+    begin();
+    defer end();
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    DirCloseHook.arm(.INTR, false);
+    try atomic.fsyncDir(dir_path);
+    try testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try testing.expect(exists(dir_path));
+}
+
+test "dir close: atomicWrite parent returns EIO and keeps the published bytes" {
+    begin();
+    defer end();
+    const gpa = testing.allocator;
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    const path = join(dir_path, "kept");
+    seed(path, true);
+    DirCloseHook.arm(.IO, true);
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    sys.last_errno = .SUCCESS;
+    const before = try test_support.fdCount(gpa);
+    try testing.expectError(error.Unexpected, atomic.atomicWrite(gpa, path, "new\n", .{}, &why));
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqualStrings(sys.describeErrno(.IO), why.msg);
+    try testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try testing.expectEqualStrings("new\n", readFile(path));
+    const dfd = try fsx.openDir(fsx.cwd, dir_path, false);
+    defer sys.close(dfd);
+    try expectNoPublishTemp(gpa, dfd);
+}
+
+test "dir close: atomicWrite parent publishes on EINTR" {
+    begin();
+    defer end();
+    const gpa = testing.allocator;
+    const dir_path = tmpdir();
+    defer cleanup(dir_path);
+    const path = join(dir_path, "kept");
+    seed(path, true);
+    DirCloseHook.arm(.INTR, true);
+    var why: atomic.Why = .{};
+    defer why.deinit(gpa);
+    const before = try test_support.fdCount(gpa);
+    try atomic.atomicWrite(gpa, path, "new\n", .{}, &why);
+    try testing.expectEqualStrings("", why.msg);
+    try testing.expectEqual(@as(usize, 1), DirCloseHook.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try testing.expectEqualStrings("new\n", readFile(path));
 }
