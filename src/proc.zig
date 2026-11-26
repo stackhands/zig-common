@@ -886,33 +886,33 @@ test "makeExecFixture removes scratch directories after setup failures" {
     try std.testing.expect(saw_failure_after_dir);
 }
 
-test "a closed stdout at start does not send the child's stderr to its stdout" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(1);
-            return shPrints("echo out; echo err >&2", null, "out\n");
-        }
-    }.body);
+const ClosedStdio = struct {
+    fd: i32,
+    script: []const u8,
+    stdin: ?[]const u8,
+    want: []const u8,
+};
+
+const closed_stdio_rows = [_]ClosedStdio{
+    .{ .fd = 1, .script = "echo out; echo err >&2", .stdin = null, .want = "out\n" },
+    .{ .fd = 0, .script = "readlink /proc/self/fd/0 || echo closed", .stdin = null, .want = "/dev/null\n" },
+    .{ .fd = 0, .script = "cat; readlink /proc/self/fd/2", .stdin = "in\n", .want = "in\n/dev/null\n" },
+    .{ .fd = 2, .script = "readlink /proc/self/fd/2 || echo closed", .stdin = null, .want = "/dev/null\n" },
+};
+
+var closed_stdio_row: usize = 0;
+
+fn closedStdioChild() u8 {
+    const row = closed_stdio_rows[closed_stdio_row];
+    sys.close(row.fd);
+    return shPrints(row.script, row.stdin, row.want);
 }
 
-test "a closed stdin at start leaves the child's stdin and stderr on their files" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(0);
-            const r = shPrints("readlink /proc/self/fd/0 || echo closed", null, "/dev/null\n");
-            if (r != 0) return r;
-            return shPrints("cat; readlink /proc/self/fd/2", "in\n", "in\n/dev/null\n");
-        }
-    }.body);
-}
-
-test "a closed stderr at start leaves the child's stderr on /dev/null" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(2);
-            return shPrints("readlink /proc/self/fd/2 || echo closed", null, "/dev/null\n");
-        }
-    }.body);
+test "a closed standard stream at start stays on its own file" {
+    for (0..closed_stdio_rows.len) |i| {
+        closed_stdio_row = i;
+        try test_support.expectChildPasses(closedStdioChild);
+    }
 }
 
 test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
@@ -977,21 +977,11 @@ test "whichShutil uses os.defpath when PATH is unset" {
     try std.testing.expectEqualStrings("sh", std.fs.path.basename(found));
 }
 
-test "whichShutil returns null for an empty PATH" {
+test "whichShutil covers an empty PATH, an empty entry, and slash paths" {
     const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-empty");
+    const fixture = try makeExecFixture(gpa, "which-shutil");
     defer fixture.deinit(gpa);
-    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", ""));
-}
-
-test "whichShutil empty entry search uses provided cwd handle" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-cwd-handle");
-    defer fixture.deinit(gpa);
-    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
-    defer sys.close(dir);
-
-    const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", .{
+    const shutil_opts: WhichOptions = .{
         .unset_path = .use_default,
         .default_path = "/bin:/usr/bin",
         .empty_path = .search_cwd,
@@ -999,40 +989,48 @@ test "whichShutil empty entry search uses provided cwd handle" {
         .executable_check = .not_directory,
         .slash_name = .check_direct,
         .slash_split_join = true,
-    })).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings("tool.sh", found);
-}
+    };
 
-test "whichShutil slash normalization keeps //x and collapses a//x" {
-    const gpa = std.testing.allocator;
-    const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
-    defer gpa.free(collapsed);
-    try std.testing.expectEqualStrings("a/x", collapsed);
-
-    const double = try shutilSplitJoinPosix(gpa, "//x");
-    defer gpa.free(double);
-    try std.testing.expectEqualStrings("//x", double);
-
-    const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
-    defer gpa.free(dotted);
-    try std.testing.expectEqualStrings(".//a/x", dotted);
-}
-
-test "whichShutil slash paths ending in slash do not match regular files" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-slash-tail");
-    defer fixture.deinit(gpa);
-
-    const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
-    defer gpa.free(slash);
-    const found = (try whichShutil(gpa, slash, "")).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings(fixture.exe_path, found);
-
-    const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
-    defer gpa.free(trailing);
-    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
+    const Row = enum { empty_path, empty_entry, slash_collapse, slash_keep, slash_dot, slash_hit, slash_miss };
+    for ([_]Row{ .empty_path, .empty_entry, .slash_collapse, .slash_keep, .slash_dot, .slash_hit, .slash_miss }) |row| {
+        switch (row) {
+            .empty_path => try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", "")),
+            .empty_entry => {
+                const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+                defer sys.close(dir);
+                const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", shutil_opts)).?;
+                defer gpa.free(found);
+                try std.testing.expectEqualStrings("tool.sh", found);
+            },
+            .slash_collapse => {
+                const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
+                defer gpa.free(collapsed);
+                try std.testing.expectEqualStrings("a/x", collapsed);
+            },
+            .slash_keep => {
+                const double = try shutilSplitJoinPosix(gpa, "//x");
+                defer gpa.free(double);
+                try std.testing.expectEqualStrings("//x", double);
+            },
+            .slash_dot => {
+                const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
+                defer gpa.free(dotted);
+                try std.testing.expectEqualStrings(".//a/x", dotted);
+            },
+            .slash_hit => {
+                const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
+                defer gpa.free(slash);
+                const found = (try whichShutil(gpa, slash, "")).?;
+                defer gpa.free(found);
+                try std.testing.expectEqualStrings(fixture.exe_path, found);
+            },
+            .slash_miss => {
+                const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
+                defer gpa.free(trailing);
+                try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
+            },
+        }
+    }
 }
 
 test "which, groupAlive, and run cover error and boundary paths" {

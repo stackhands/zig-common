@@ -1655,22 +1655,38 @@ test "appendLine does not leave a partial line when the write cannot finish" {
     try std.testing.expectEqualStrings("hi\n", text);
 }
 
-test "appendLine reports not a regular file for a FIFO target" {
+test "a FIFO is not a regular file" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try realpath(cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-append-fifo-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const d = try openDir(cwd, base, false);
-    defer {
-        deleteTree(gpa, cwd, base) catch {};
-        sys.close(d);
+    const scratch = try test_support.ScratchDir.init(gpa, "fifo");
+    defer scratch.deinit();
+    const d = scratch.fd;
+    _ = linux.mkdirat(d, "tree", 0o700);
+    const tree = try openDir(d, "tree", false);
+    defer sys.close(tree);
+    _ = try sys.call(linux.mknodat, .{ tree, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
+    const srcfd = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    try sys.writeAll(srcfd, "text\n");
+    sys.close(srcfd);
+
+    const Op = enum { open, append, copy_dest, move_source, move_tree };
+    for ([_]Op{ .open, .append, .copy_dest, .move_source, .move_tree }) |op| {
+        switch (op) {
+            .open => try std.testing.expectError(error.NotRegularFile, openRegular(tree, "pipe", false)),
+            .append => try std.testing.expectError(error.NotRegularFile, appendLine(gpa, tree, "pipe", "x")),
+            .copy_dest => {
+                const src = try openRegular(d, "src", false);
+                defer sys.close(src.fd);
+                try std.testing.expectError(error.NotRegularFile, copyTo(src.fd, src.stat, tree, "pipe"));
+            },
+            .move_source => try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, tree, "pipe", tree, "dst", .{ .policy = .strict }, .{
+                .force_cross_device_rename = true,
+            })),
+            .move_tree => try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "tree", d, "moved", .{ .policy = .strict }, .{
+                .force_cross_device_rename = true,
+            })),
+        }
+        try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
     }
-    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
-    try std.testing.expectError(error.NotRegularFile, appendLine(gpa, d, "pipe", "x"));
-    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
 test "copyTo copies the whole source and leaves its offset" {
@@ -1718,47 +1734,6 @@ test "openRegular reports IsDir for a directory" {
     _ = linux.mkdirat(d, "subdir", 0o700);
     try std.testing.expectError(error.IsDir, openRegular(d, "subdir", false));
     try std.testing.expectEqualStrings("[Errno 21] Is a directory", sys.describe(error.IsDir));
-}
-
-test "openRegular reports not a regular file for a FIFO" {
-    const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try realpath(cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-open-regular-fifo-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const d = try openDir(cwd, base, false);
-    defer {
-        deleteTree(gpa, cwd, base) catch {};
-        sys.close(d);
-    }
-    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
-    try std.testing.expectError(error.NotRegularFile, openRegular(d, "pipe", false));
-    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
-}
-
-test "copyTo reports not a regular file for a FIFO destination" {
-    const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try realpath(cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-copy-fifo-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const d = try openDir(cwd, base, false);
-    defer {
-        deleteTree(gpa, cwd, base) catch {};
-        sys.close(d);
-    }
-    const srcfd = try sys.openat(d, "src", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
-    try sys.writeAll(srcfd, "text\n");
-    sys.close(srcfd);
-    const src = try openRegular(d, "src", false);
-    defer sys.close(src.fd);
-    _ = try sys.call(linux.mknodat, .{ d, "dst", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
-    try std.testing.expectError(error.NotRegularFile, copyTo(src.fd, src.stat, d, "dst"));
-    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
 /// A filesystem's answer to each ACL form, GPFS native, generic NFSv4 and
@@ -1954,76 +1929,60 @@ const MoveScratch = struct {
     }
 };
 
-test "moveAcross traces the rename and the directory syncs that publish it" {
+test "moveAcross syncs the directories that publish a rename" {
     const gpa = std.testing.allocator;
-    const s = try MoveScratch.init(gpa, "move-trace");
-    defer s.deinit();
-    const root = try fstat(s.d);
-
-    try s.put("src");
-    var renamed = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "src", s.d, "dst", .{}, renamed.faults(false));
-    try s.expectMoved("src", "dst");
-    try renamed.expectCalls(&.{ .rename, MoveTrace.sync(root) });
-
-    var copied = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "dst", s.d, "src", .{}, copied.faults(true));
-    try s.expectMoved("dst", "src");
-    try copied.expectCalls(&.{ .rename, MoveTrace.sync(root), MoveTrace.sync(root) });
-}
-
-test "moveAcross syncs the parent that receives a nested destination" {
-    const gpa = std.testing.allocator;
-    const s = try MoveScratch.init(gpa, "move-nested-dst");
-    defer s.deinit();
-    const sub = try s.mkdir("sub");
-
-    try s.put("src");
-    var renamed = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/renamed", .{}, renamed.faults(false));
-    try s.expectMoved("src", "sub/renamed");
-    try std.testing.expect(renamed.syncedAfterPublish(sub));
-
-    try s.put("src");
-    var copied = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/copied", .{}, copied.faults(true));
-    try s.expectMoved("src", "sub/copied");
-    try std.testing.expect(copied.syncedAfterPublish(sub));
-}
-
-test "moveAcross syncs the source parent beside a nested destination" {
-    const gpa = std.testing.allocator;
-    const s = try MoveScratch.init(gpa, "move-nested-src");
+    const s = try MoveScratch.init(gpa, "move-sync");
     defer s.deinit();
     const root = try fstat(s.d);
     const sub = try s.mkdir("sub");
     const a = try s.mkdir("a");
 
-    try s.put("src");
-    var flat = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "src", s.d, "sub/flat", .{}, flat.faults(false));
-    try s.expectMoved("src", "sub/flat");
-    try std.testing.expect(flat.syncedAfterPublish(sub));
-    try std.testing.expect(flat.syncedAfterPublish(root));
+    const DirId = enum { root, sub, a };
+    const Row = struct {
+        src: []const u8,
+        dst: []const u8,
+        exdev: bool,
+        /// Directories synced after the rename, in order. `exact` requires
+        /// that list and nothing else; otherwise each must be synced.
+        synced: []const DirId,
+        exact: bool,
+        /// File to create before the move. Null moves the previous destination.
+        put: ?[]const u8,
+    };
+    const rows = [_]Row{
+        .{ .src = "src", .dst = "dst", .exdev = false, .synced = &.{.root}, .exact = true, .put = "src" },
+        .{ .src = "dst", .dst = "src", .exdev = true, .synced = &.{ .root, .root }, .exact = true, .put = null },
+        .{ .src = "src", .dst = "sub/renamed", .exdev = false, .synced = &.{.sub}, .exact = false, .put = null },
+        .{ .src = "src", .dst = "sub/copied", .exdev = true, .synced = &.{.sub}, .exact = false, .put = "src" },
+        .{ .src = "src", .dst = "sub/flat", .exdev = false, .synced = &.{ .sub, .root }, .exact = false, .put = "src" },
+        .{ .src = "a/src", .dst = "sub/from-a", .exdev = false, .synced = &.{ .sub, .a }, .exact = false, .put = "a/src" },
+        .{ .src = "a/src", .dst = "sub/from-a-copy", .exdev = true, .synced = &.{ .sub, .a }, .exact = false, .put = "a/src" },
+        .{ .src = "sub/from-a-copy", .dst = "sub/beside", .exdev = false, .synced = &.{.sub}, .exact = true, .put = null },
+    };
 
-    try s.put("a/src");
-    var renamed = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/renamed", .{}, renamed.faults(false));
-    try s.expectMoved("a/src", "sub/renamed");
-    try std.testing.expect(renamed.syncedAfterPublish(sub));
-    try std.testing.expect(renamed.syncedAfterPublish(a));
-
-    try s.put("a/src");
-    var copied = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "a/src", s.d, "sub/copied", .{}, copied.faults(true));
-    try s.expectMoved("a/src", "sub/copied");
-    try std.testing.expect(copied.syncedAfterPublish(sub));
-    try std.testing.expect(copied.syncedAfterPublish(a));
-
-    var beside = MoveTrace{};
-    try moveAcrossInternal(gpa, s.d, "sub/copied", s.d, "sub/beside", .{}, beside.faults(false));
-    try s.expectMoved("sub/copied", "sub/beside");
-    try beside.expectCalls(&.{ .rename, MoveTrace.sync(sub) });
+    for (rows) |row| {
+        if (row.put) |name| try s.put(name);
+        var trace = MoveTrace{};
+        try moveAcrossInternal(gpa, s.d, row.src, s.d, row.dst, .{}, trace.faults(row.exdev));
+        try s.expectMoved(row.src, row.dst);
+        const dirOf = struct {
+            fn get(id: DirId, root_st: Stat, sub_st: Stat, a_st: Stat) Stat {
+                return switch (id) {
+                    .root => root_st,
+                    .sub => sub_st,
+                    .a => a_st,
+                };
+            }
+        }.get;
+        if (row.exact) {
+            var want: [8]MoveTrace.Call = undefined;
+            want[0] = .rename;
+            for (row.synced, 0..) |id, i| want[i + 1] = MoveTrace.sync(dirOf(id, root, sub, a));
+            try trace.expectCalls(want[0 .. row.synced.len + 1]);
+        } else {
+            for (row.synced) |id| try std.testing.expect(trace.syncedAfterPublish(dirOf(id, root, sub, a)));
+        }
+    }
 }
 
 test "moveAcross falls back on EXDEV and removes the source after publish" {
@@ -2148,50 +2107,6 @@ test "fsx public helpers return expected errors on bad paths and descriptors" {
     defer bad_it.deinit(gpa);
     try std.testing.expectError(error.InvalidArgument, bad_it.next());
     try std.testing.expectError(error.NotFound, deleteTree(gpa, d, "missing"));
-}
-
-test "moveAcross reports not a regular file for a FIFO source on EXDEV fallback" {
-    const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try realpath(cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-fifo-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const d = try openDir(cwd, base, false);
-    defer {
-        deleteTree(gpa, cwd, base) catch {};
-        sys.close(d);
-    }
-    _ = try sys.call(linux.mknodat, .{ d, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
-    try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "pipe", d, "dst", .{ .policy = .strict }, .{
-        .force_cross_device_rename = true,
-    }));
-    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
-}
-
-test "moveAcross reports not a regular file for a FIFO entry in a moved tree" {
-    const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try realpath(cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-move-tree-fifo-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const d = try openDir(cwd, base, false);
-    defer {
-        deleteTree(gpa, cwd, base) catch {};
-        sys.close(d);
-    }
-    _ = linux.mkdirat(d, "tree", 0o700);
-    const tree = try openDir(d, "tree", false);
-    defer sys.close(tree);
-    _ = try sys.call(linux.mknodat, .{ tree, "pipe", @as(linux.mode_t, linux.S.IFIFO | 0o600), @as(linux.dev_t, 0) });
-
-    try std.testing.expectError(error.NotRegularFile, moveAcrossInternal(gpa, d, "tree", d, "dst", .{ .policy = .strict }, .{
-        .force_cross_device_rename = true,
-    }));
-    try std.testing.expectEqualStrings("not a regular file", sys.describe(error.NotRegularFile));
 }
 
 // ---- publishing close: checked once, before the rename --------------------
