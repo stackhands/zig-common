@@ -2,7 +2,7 @@
 
 | zig-common | Zig | tools built on it |
 |---|---|---|
-| 0.13.0 | 0.17.1 | eb-keep-logs and eessi-arch-guard on their next releases (`syslog` without the functions that take no `Identity`; `emitFor` and `send` are unchanged); eb-keep-logs builds against it in CI |
+| 0.13.0 | 0.17.1 | eb-keep-logs, eessi-arch-guard and eb-local on their next releases (`syslog` without the functions that take no `Identity`; `emitFor` and `send` are unchanged); eb-keep-logs builds against it in CI |
 | 0.12.0 | 0.17.1 | eb-keep-logs (`syslog.emitFor` with its own `Identity`) and eessi-arch-guard (`syslog.send`, the transport under its own formatting) on their next releases; eb-keep-logs builds against it in CI |
 | 0.11.0 | 0.17.1 | eb-keep-logs and eessi-arch-guard on their next releases (`syslog`: the RFC 5424 and journald emitter each carried a copy of); eb-keep-logs builds against it in CI |
 | 0.10.0 | 0.17.1 | eessi-arch-guard and eb-staged-rebuild (`fsx.mkdtemp`, `fsx.normPath`, `fsx.absPath`); eb-keep-logs builds against it in CI |

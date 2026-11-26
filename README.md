@@ -54,6 +54,7 @@ the entry and its hash.
 | `atomic` | `atomic_write`: replace a file only after its bytes, owner, mode and every ACL form (GPFS NFSv4, NFSv4, POSIX access) are durable and read back, and the temporary file has been closed; fault points before write, fsync and rename |
 | `syslog` | events to a collector: a `unix:`, `journal:`, `udp:` or `tcp:` target, RFC 5424 and native journald framing for the `Identity` the caller names, and `send`, the transport alone, with a timeout; nothing here fails the caller |
 | `cli` | messages to stdout and stderr that ignore a closed stream, exit code 2 for a refused invocation, the version line |
+| `argparse` | a declarative argument parser compatible with Python 3.14 argparse, with a lenient policy preset for Slurm TaskProlog tools |
 
 ## Test
 
