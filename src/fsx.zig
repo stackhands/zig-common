@@ -298,7 +298,16 @@ pub fn copyTo(src: fd_t, src_stat: Stat, dir: fd_t, name: []const u8) Error!fd_t
 
 /// Append `line` and a newline to `dir/name` in one write, creating the file
 /// with mode 0666 less the umask. A symbolic link or non-regular file at the
-/// name is refused.
+/// name is refused. The descriptor is closed once on every path. A failed
+/// close after the write is returned with `sys.last_errno` set to its errno.
+/// A close that EINTR interrupts is not retried, as Linux has freed the
+/// descriptor, and is not an error, as `sys.result` treats EINTR. A write
+/// lost on NFS may be reported only by the close. The line may or may not
+/// be present when that close fails, because the descriptor is already gone
+/// and the file cannot be shortened back to its old size. A short write is
+/// still rolled back to the size before it. The cleanup close on that path
+/// and on any earlier error ignores its result so the earlier error keeps
+/// its errno. The close is replaceable through `publish_ops`.
 pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8) (Error || Allocator.Error)!void {
     const existing: ?Stat = statAt(dir, name, false) catch |err| switch (err) {
         error.NotFound => null,
@@ -312,7 +321,15 @@ pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8)
         .NOFOLLOW = true,
         .NONBLOCK = true,
     }, 0o666);
-    defer sys.close(fd);
+    var open = true;
+    defer {
+        if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = publish_ops.close(fd);
+        }
+    }
     const st = try fstat(fd);
     if (regularTypeError(st)) |err| return err;
     const bytes = try std.mem.concat(gpa, u8, &.{ line, "\n" });
@@ -329,6 +346,10 @@ pub fn appendLine(gpa: Allocator, dir: fd_t, name: []const u8, line: []const u8)
         } else |_| {}
         return err;
     };
+    // The descriptor is gone after this close, failed or not, so the file
+    // cannot be shortened back to `st.size`. The line may or may not remain.
+    open = false;
+    try closeBeforePublish(fd);
 }
 
 /// Read a whole regular file opened by the caller; more than `limit` bytes
@@ -487,9 +508,10 @@ fn setModeOwnerAndAcl(src_fd: fd_t, src: Stat, dst_fd: fd_t, policy: MoveAcrossP
 }
 
 /// The close of a file about to be published by `replaceContents` or by the
-/// cross-device copy inside `moveAcross`, as a raw system-call result.
-/// Replaceable in the same builds as `atomic.ops`; constant real calls in
-/// any other build. A close that EINTR interrupts is not retried.
+/// cross-device copy inside `moveAcross`, and the close after `appendLine`
+/// writes, as a raw system-call result. Replaceable in the same builds as
+/// `atomic.ops`; constant real calls in any other build. A close that EINTR
+/// interrupts is not retried.
 pub const PublishOps = struct {
     close: *const fn (fd: fd_t) usize = realPublishClose,
 };
@@ -504,10 +526,12 @@ fn realPublishClose(fd: fd_t) usize {
     return linux.close(fd);
 }
 
-/// Close `fd` once before its file is published. EINTR is success and is not
-/// retried, as Linux has freed the descriptor and `sys.result` does not
-/// treat EINTR as an error. Any other errno is returned with `sys.last_errno`
-/// set. The caller does not close `fd` again.
+/// Close `fd` once. `replaceContents` and the cross-device copy inside
+/// `moveAcross` do this before the file is published; `appendLine` does this
+/// after the write. EINTR is success and is not retried, as Linux has freed
+/// the descriptor and `sys.result` does not treat EINTR as an error. Any
+/// other errno is returned with `sys.last_errno` set. The caller does not
+/// close `fd` again.
 fn closeBeforePublish(fd: fd_t) Error!void {
     _ = try sys.result(publish_ops.close(fd));
 }
@@ -2198,4 +2222,36 @@ test "fsx publish close: moveAcross tree publishes on EINTR" {
     try std.testing.expectError(error.NotFound, statAt(scratch.fd, "src", false));
     try expectText(gpa, scratch.fd, "dst/a", "tree\n");
     try expectNoTmp(gpa, scratch.fd);
+}
+
+test "fsx publish close: appendLine returns EIO" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-append-eio");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "list", "old\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.IO);
+    sys.last_errno = .SUCCESS;
+    try std.testing.expectError(error.Unexpected, appendLine(gpa, scratch.fd, "list", "new"));
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    // The write finished before close failed, and the descriptor is already
+    // gone, so the new line is not shortened away.
+    try expectText(gpa, scratch.fd, "list", "old\nnew\n");
+}
+
+test "fsx publish close: appendLine keeps the line on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "fsx-close-append-eintr");
+    defer scratch.deinit();
+    defer publish_ops.* = .{};
+    try putBytes(scratch.fd, "list", "old\n");
+    const before = try test_support.fdCount(gpa);
+    PublishHook.arm(.INTR);
+    try appendLine(gpa, scratch.fd, "list", "new");
+    try std.testing.expectEqual(@as(usize, 1), PublishHook.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectText(gpa, scratch.fd, "list", "old\nnew\n");
 }
