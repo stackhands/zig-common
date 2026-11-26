@@ -971,10 +971,25 @@ test "resolveExecutable handles relative slash paths" {
 
 test "whichShutil uses os.defpath when PATH is unset" {
     const gpa = std.testing.allocator;
-    const found = (try whichShutil(gpa, "sh", null)).?;
+    const fixture = try makeExecFixture(gpa, "which-shutil-defpath");
+    defer fixture.deinit(gpa);
+    const sh_path = try std.fs.path.join(gpa, &.{ fixture.base, "sh" });
+    defer gpa.free(sh_path);
+    const sh_fd = try sys.openat(fsx.cwd, sh_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+    defer sys.close(sh_fd);
+    try sys.writeAll(sh_fd, "#!/bin/sh\nexit 0\n");
+
+    const found = (try whichWithOptions(gpa, std.Io.Dir.cwd().handle, "sh", null, .{
+        .unset_path = .use_default,
+        .default_path = fixture.base,
+        .empty_path = .return_none,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    })).?;
     defer gpa.free(found);
-    try std.testing.expect(found.len > 0 and found[0] == '/');
-    try std.testing.expectEqualStrings("sh", std.fs.path.basename(found));
+    try std.testing.expectEqualStrings(sh_path, found);
 }
 
 test "whichShutil covers an empty PATH, an empty entry, and slash paths" {
