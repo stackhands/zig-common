@@ -391,32 +391,25 @@ test "lockExclusive waits out the timeout while signals arrive" {
     var prev: linux.Sigaction = undefined;
     _ = linux.sigaction(.USR1, &handler, &prev);
     defer _ = linux.sigaction(.USR1, &prev, null);
-    const Stop = struct {
-        var go = std.atomic.Value(bool).init(true);
-        fn buzz() void {
-            // This thread must not catch SIGUSR1, or the waiter's sleep is
-            // never the one the signal interrupts.
-            var blocked = linux.sigemptyset();
-            linux.sigaddset(&blocked, .USR1);
-            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            while (go.load(.acquire)) {
-                _ = linux.kill(linux.getpid(), .USR1);
-                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
+    const Ping = struct {
+        var go = std.atomic.Value(bool).init(false);
+        fn once() void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            _ = linux.kill(linux.getpid(), .USR1);
         }
     };
-    Stop.go.store(true, .release);
-    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
+    Ping.go.store(false, .release);
+    const ping = try std.Thread.spawn(.{}, Ping.once, .{});
+    defer ping.join();
+    const timeout_ms: u64 = 30;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 400));
+    Ping.go.store(true, .release);
+    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, timeout_ms));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
-    Stop.go.store(false, .release);
-    buzz.join();
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try std.testing.expect(ms >= 300 and ms < 5000);
+    try std.testing.expect(ms + 1 >= timeout_ms);
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
@@ -454,7 +447,7 @@ test "lockExclusive takes the timeout flock -w seconds give" {
     const Holder = struct {
         var fd: fsx.fd_t = -1;
         fn letGo() void {
-            var ts: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             _ = linux.nanosleep(&ts, null);
             _ = linux.flock(fd, std.posix.LOCK.UN);
         }

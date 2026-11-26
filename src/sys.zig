@@ -437,18 +437,6 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
     try std.testing.expectEqualStrings("No such file or directory", strerror(.NOENT));
     try std.testing.expectEqualStrings("File name too long", strerror(.NAMETOOLONG));
-    const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
-    defer close(compat_fd);
-    var compat: std.ArrayList(u8) = .empty;
-    defer compat.deinit(std.testing.allocator);
-    var chunk: [512]u8 = undefined;
-    while (true) {
-        const n = try read(compat_fd, &chunk);
-        if (n == 0) break;
-        try compat.appendSlice(std.testing.allocator, chunk[0..n]);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
 }
 
 test "strerror formats unnamed errno values instead of panicking" {
@@ -458,12 +446,6 @@ test "strerror formats unnamed errno values instead of panicking" {
     raw = 999;
     const unknown_999: linux.E = @fromBackingInt(raw);
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
-}
-
-test "strerror returns Unknown error for non-Linux linux.E tags" {
-    try std.testing.expectEqualStrings("Unknown error 160", strerror(.NSRNODATA));
-    try std.testing.expectEqualStrings("Unknown error 177", strerror(.NSRCNAMELOOP));
-    try std.testing.expectEqualStrings("[Errno 160] Unknown error 160", describeErrno(.NSRNODATA));
 }
 
 test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {

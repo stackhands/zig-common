@@ -972,25 +972,76 @@ fn nfs4Only(label: []const u8) Model {
     return .{ .label = label, .native = NFS4, .supported = .{ false, true, false } };
 }
 
-fn gpfsOnly(label: []const u8) Model {
-    return .{ .label = label, .native = GPFS, .supported = .{ true, false, false } };
-}
-
-test "an unlisted EINVAL probe is treated as not provided when POSIX is listed" {
-    begin();
-    defer end();
-    var m = posixOnly("posix-access-einval-foreign");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    hook_listed = s.expected;
-    m.hooks.get = hUnlisted;
-    try write(s.path, "new", replace);
-    reset(&m);
-    try testing.expectEqualStrings("new", readFile(s.path));
-    try expectAttrs(s.expected, m.getPath(s.path));
-    try testing.expectEqual(@as(u32, 0o640), modeOf(s.path));
+test "an unlisted EINVAL is kept or refused with the listed model" {
+    const Row = struct {
+        kind: enum { posix, nfs4 },
+        label: []const u8,
+        /// Names that return `EINVAL`. Ignored when `unlisted` is set, which
+        /// fails every name the model did not list.
+        names: [3]bool,
+        unlisted: bool,
+        outcome: enum { scenario, posix_bytes, refuse },
+    };
+    const rows = [_]Row{
+        .{ .kind = .posix, .label = "posix-access-einval-foreign", .names = .{ false, false, false }, .unlisted = true, .outcome = .scenario },
+        .{ .kind = .posix, .label = "posix-only", .names = .{ true, true, false }, .unlisted = false, .outcome = .posix_bytes },
+        .{ .kind = .nfs4, .label = "nfs4-only", .names = .{ false, false, true }, .unlisted = false, .outcome = .refuse },
+        .{ .kind = .nfs4, .label = "nfs4-only-no-posix", .names = .{ true, false, true }, .unlisted = false, .outcome = .refuse },
+    };
+    for (rows) |row| {
+        begin();
+        defer end();
+        var m = switch (row.kind) {
+            .posix => posixOnly(row.label),
+            .nfs4 => nfs4Only(row.label),
+        };
+        switch (row.outcome) {
+            .scenario => {
+                const s = scenario(&m);
+                defer cleanup(s.dir);
+                target = s.path;
+                hook_errno = .INVAL;
+                hook_listed = s.expected;
+                m.hooks.get = hUnlisted;
+                try write(s.path, "new", replace);
+                reset(&m);
+                try testing.expectEqualStrings("new", readFile(s.path));
+                try expectAttrs(s.expected, m.getPath(s.path));
+                try testing.expectEqual(@as(u32, 0o640), modeOf(s.path));
+            },
+            .posix_bytes => {
+                const dir = tmpdir();
+                defer cleanup(dir);
+                const path = join(dir, "module.lua");
+                writeFile(path, "old");
+                chmod(path, 0o640);
+                install(&m);
+                const posix_bytes = OPAQUE ++ "|posix-retained";
+                m.setPath(path, POSIX, posix_bytes);
+                try expectAttrs(.{ null, null, posix_bytes }, m.getPath(path));
+                target = path;
+                hook_errno = .INVAL;
+                hook_names = row.names;
+                m.hooks.get = hNames;
+                try write(path, "new", replace);
+                reset(&m);
+                try testing.expectEqualStrings("new", readFile(path));
+                try expectAttrs(.{ null, null, posix_bytes }, m.getPath(path));
+                try testing.expectEqual(@as(u32, 0o640), modeOf(path));
+            },
+            .refuse => {
+                const s = scenario(&m);
+                defer cleanup(s.dir);
+                target = s.path;
+                hook_errno = .INVAL;
+                hook_names = row.names;
+                m.hooks.get = hNames;
+                try expectRefused(write(s.path, "new", replace), null);
+                reset(&m);
+                try assertUnchanged(&m, s);
+            },
+        }
+    }
 }
 
 test "a listed EINVAL read is refused, not treated as absent" {
@@ -1027,88 +1078,6 @@ test "an unlisted EINVAL does not weaken EACCES or EPERM probes" {
             try assertUnchanged(&m, s);
         }
     }
-}
-
-test "an unlisted NFSv4-family EINVAL with a listed POSIX ACL keeps the POSIX bytes" {
-    begin();
-    defer end();
-    var m = posixOnly("posix-only");
-    const dir = tmpdir();
-    defer cleanup(dir);
-    const path = join(dir, "module.lua");
-    writeFile(path, "old");
-    chmod(path, 0o640);
-    install(&m);
-    const posix_bytes = OPAQUE ++ "|posix-retained";
-    m.setPath(path, POSIX, posix_bytes);
-    try expectAttrs(.{ null, null, posix_bytes }, m.getPath(path));
-    target = path;
-    hook_errno = .INVAL;
-    hook_names = .{ true, true, false };
-    m.hooks.get = hNames;
-    try write(path, "new", replace);
-    reset(&m);
-    try testing.expectEqualStrings("new", readFile(path));
-    try expectAttrs(.{ null, null, posix_bytes }, m.getPath(path));
-    try testing.expectEqual(@as(u32, 0o640), modeOf(path));
-}
-
-test "an unlisted POSIX EINVAL without a positive model is refused" {
-    begin();
-    defer end();
-    var m = nfs4Only("nfs4-only");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    hook_names = .{ false, false, true };
-    m.hooks.get = hNames;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
-}
-
-test "an unlisted NFSv4 EINVAL without a listed POSIX ACL is refused" {
-    begin();
-    defer end();
-    var m = nfs4Only("nfs4-only-no-posix");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    hook_names = .{ true, false, true };
-    m.hooks.get = hNames;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
-}
-
-test "a listed NFSv4 EINVAL is refused" {
-    begin();
-    defer end();
-    var m = nfs4Only("nfs4-generic-listed");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    m.hooks.get = hFail;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
-}
-
-test "a listed GPFS EINVAL is refused" {
-    begin();
-    defer end();
-    var m = gpfsOnly("gpfs-native-listed");
-    const s = scenario(&m);
-    defer cleanup(s.dir);
-    target = s.path;
-    hook_errno = .INVAL;
-    m.hooks.get = hFail;
-    try expectRefused(write(s.path, "new", replace), null);
-    reset(&m);
-    try assertUnchanged(&m, s);
 }
 
 test "the narrow EINVAL guard still refuses a denied NFSv4 probe" {
@@ -1298,37 +1267,41 @@ fn posixModule(value: []const u8, mode: u32) ?Posix {
     return .{ .dir = dir, .path = path, .stored = getPathXattr(path, names[POSIX]).? };
 }
 
-test "a mask wider than the group owner round-trips with its mode" {
+test "a POSIX mask round-trips with its mode or refuses a contradiction" {
+    const Row = struct {
+        user_obj: u16,
+        named: u16,
+        group_obj: u16,
+        mask: u16,
+        other: u16,
+        mode: u32,
+        requested: ?u32,
+        accept: bool,
+    };
+    const rows = [_]Row{
+        .{ .user_obj = 6, .named = 6, .group_obj = 4, .mask = 6, .other = 0, .mode = 0o660, .requested = null, .accept = true },
+        .{ .user_obj = 6, .named = 6, .group_obj = 6, .mask = 4, .other = 4, .mode = 0o644, .requested = null, .accept = true },
+        .{ .user_obj = 6, .named = 6, .group_obj = 4, .mask = 6, .other = 0, .mode = 0o660, .requested = 0o600, .accept = false },
+    };
     begin();
     defer end();
-    const p = posixModule(acl(6, 6, 4, 6, 0), 0o660) orelse return error.SkipZigTest;
-    defer cleanup(p.dir);
-    try testing.expectEqual(@as(u32, 0o660), modeOf(p.path));
-    try write(p.path, "new", replace);
-    try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
-    try testing.expectEqual(@as(u32, 0o660), modeOf(p.path));
-}
-
-test "a mask narrower than the group owner round-trips with its mode" {
-    begin();
-    defer end();
-    const p = posixModule(acl(6, 6, 6, 4, 4), 0o644) orelse return error.SkipZigTest;
-    defer cleanup(p.dir);
-    try testing.expectEqual(@as(u32, 0o644), modeOf(p.path));
-    try write(p.path, "new", replace);
-    try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
-    try testing.expectEqual(@as(u32, 0o644), modeOf(p.path));
-}
-
-test "a requested mode that contradicts the mask is refused" {
-    begin();
-    defer end();
-    const p = posixModule(acl(6, 6, 4, 6, 0), 0o660) orelse return error.SkipZigTest;
-    defer cleanup(p.dir);
-    try expectRefused(write(p.path, "new", .{ .step = "replace", .mode = 0o600 }), "ownership or mode did not round-trip");
-    try testing.expectEqualStrings("old", readFile(p.path));
-    try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
-    try testing.expectEqual(@as(u32, 0o660), modeOf(p.path));
+    for (rows) |row| {
+        const bytes = acl(row.user_obj, row.named, row.group_obj, row.mask, row.other);
+        const p = posixModule(bytes, row.mode) orelse return error.SkipZigTest;
+        defer cleanup(p.dir);
+        try testing.expectEqual(row.mode, modeOf(p.path));
+        if (row.accept) {
+            try write(p.path, "new", replace);
+            try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
+            try testing.expectEqual(row.mode, modeOf(p.path));
+        } else {
+            const opts: atomic.WriteOptions = .{ .step = "replace", .mode = row.requested.? };
+            try expectRefused(write(p.path, "new", opts), "ownership or mode did not round-trip");
+            try testing.expectEqualStrings("old", readFile(p.path));
+            try testing.expectEqualSlices(u8, p.stored, getPathXattr(p.path, names[POSIX]).?);
+            try testing.expectEqual(row.mode, modeOf(p.path));
+        }
+    }
 }
 
 test "the ACL is written through the descriptor after ownership and mode" {

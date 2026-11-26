@@ -275,7 +275,7 @@ fn sendUnixOnce(path: []const u8, sock_type: u32, payload: []const u8) bool {
     defer sys.close(fd);
     setSockTimeout(fd);
     while (true) {
-        const c_rc = linux.connect(fd, @ptrCast(&addr), addr_len);
+        const c_rc = unixConnect(fd, &addr, addr_len);
         switch (linux.errno(c_rc)) {
             .SUCCESS => break,
             .INTR => continue,
@@ -283,6 +283,16 @@ fn sendUnixOnce(path: []const u8, sock_type: u32, payload: []const u8) bool {
         }
     }
     return sendAllFd(fd, payload);
+}
+
+/// Replacement for the unix `connect` above. Null calls the kernel. Tests
+/// point it at a function that returns an errno, so `send` does not wait on
+/// a socket nobody listens on.
+var test_unix_connect: ?*const fn (fd: linux.fd_t, addr: *const anyopaque, len: linux.socklen_t) usize = null;
+
+fn unixConnect(fd: linux.fd_t, addr: *const linux.sockaddr.un, len: linux.socklen_t) usize {
+    if (test_unix_connect) |hook| return hook(fd, @ptrCast(addr), len);
+    return linux.connect(fd, @ptrCast(addr), len);
 }
 
 fn sendUnix(arena: Allocator, path: []const u8, payload: []const u8, stream_nl: bool) bool {
@@ -489,7 +499,16 @@ test "the formatters write the identity they are given" {
     try std.testing.expect(std.mem.find(u8, datagram, "SYSLOG_IDENTIFIER=some-tool\n") != null);
 }
 
+fn refuseConnect(fd: linux.fd_t, addr: *const anyopaque, len: linux.socklen_t) usize {
+    _ = fd;
+    _ = addr;
+    _ = len;
+    return @bitCast(-@as(isize, @backingInt(linux.E.CONNREFUSED)));
+}
+
 test "send reports false for a target nobody listens on" {
+    test_unix_connect = refuseConnect;
+    defer test_unix_connect = null;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();

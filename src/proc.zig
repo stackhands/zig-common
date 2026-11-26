@@ -78,6 +78,10 @@ pub const Options = struct {
     /// A failed exec is returned as its errno's error, as Python's Popen
     /// raises OSError, instead of a child that exits 127.
     exec_error: bool = false,
+    /// Read end the child blocks on, for one byte, after the fork and
+    /// before `setsid`. -1 does not block. A test holds the write end,
+    /// stops the child, then releases the pipe.
+    hold_before_setsid: sys.fd_t = -1,
 };
 
 /// What `run` returns once the child has ended: how, and what it wrote.
@@ -302,7 +306,18 @@ fn childExec(
     out_fd: sys.fd_t,
     err_fd: sys.fd_t,
     exec_err_fd: sys.fd_t,
+    hold_fd: sys.fd_t,
 ) noreturn {
+    if (hold_fd >= 0) {
+        var held: [1]u8 = undefined;
+        while (true) {
+            const rc = linux.read(hold_fd, &held, 1);
+            switch (linux.errno(rc)) {
+                .INTR => continue,
+                else => break,
+            }
+        }
+    }
     if (new_session) _ = linux.setsid();
     const empty = linux.sigemptyset();
     var act: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = empty, .flags = 0 };
@@ -372,12 +387,22 @@ fn reap(pid: linux.pid_t) sys.Error!Term {
 /// True while a live (not zombie) process is in process group `pgid`. A
 /// /proc read that fails mid-scan answers false, so a wait on this is best
 /// effort.
+/// Test double for `getdents64` inside `groupAlive`. Null calls the kernel.
+/// A test returns `EINTR` once and then the real scan, so the retry is not
+/// a signal delivered to this process.
+var test_getdents: ?*const fn (fd: linux.fd_t, buf: [*]u8, len: usize) usize = null;
+
+fn scanGetdents(fd: linux.fd_t, buf: [*]u8, len: usize) usize {
+    if (test_getdents) |hook| return hook(fd, buf, len);
+    return linux.getdents64(fd, buf, @intCast(len));
+}
+
 pub fn groupAlive(pgid: linux.pid_t) bool {
     const dir = sys.openat(linux.AT.FDCWD, "/proc", .{ .DIRECTORY = true }, 0) catch return false;
     defer sys.close(dir);
     var dents: [16 * 1024]u8 align(8) = undefined;
     while (true) {
-        const n = linux.getdents64(dir, &dents, dents.len);
+        const n = scanGetdents(dir, &dents, dents.len);
         // EINTR is not a failed scan. Treating it as "nobody is alive"
         // would let waitGroupGone return while the group is still running.
         if (linux.errno(n) == .INTR) continue;
@@ -539,7 +564,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         if (exec_p) |p| sys.close(p.w);
         return e;
     };
-    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err, if (exec_p) |p| p.w else -1);
+    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err, if (exec_p) |p| p.w else -1, opts.hold_before_setsid);
     const pid: linux.pid_t = @intCast(fork_rc);
     if (opts.new_session) {
         if (opts.pgid_out) |p| p.store(pid, .seq_cst);
@@ -733,7 +758,7 @@ test "stdin and both outputs larger than a pipe do not deadlock" {
 
 test "run kills a child past its deadline" {
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.TimedOut, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .timeout_ms = 200, .grace_ms = 200 }));
+    try std.testing.expectError(error.TimedOut, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .timeout_ms = 20, .grace_ms = 20 }));
 }
 
 test "a set cancel flag kills the child" {
@@ -742,53 +767,23 @@ test "a set cancel flag kills the child" {
     try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
 }
 
-var usr1_caught = std.atomic.Value(u32).init(0);
+const GroupScan = struct {
+    var calls: usize = 0;
 
-fn onUsr1Proc(_: linux.SIG) callconv(.c) void {
-    _ = usr1_caught.fetchAdd(1, .monotonic);
-}
+    fn getdents(fd: linux.fd_t, buf: [*]u8, len: usize) usize {
+        calls += 1;
+        if (calls == 1) return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+        return linux.getdents64(fd, buf, @intCast(len));
+    }
+};
 
 test "groupAlive stays true for a live group while signals arrive" {
-    const handler: linux.Sigaction = .{ .handler = .{ .handler = &onUsr1Proc }, .mask = linux.sigemptyset(), .flags = 0 };
-    var prev: linux.Sigaction = undefined;
-    _ = linux.sigaction(.USR1, &handler, &prev);
-    defer _ = linux.sigaction(.USR1, &prev, null);
-    const Stop = struct {
-        var go = std.atomic.Value(bool).init(true);
-        fn buzz() void {
-            // This thread must not catch SIGUSR1, or the signal may interrupt
-            // it instead of the scan.
-            var blocked = linux.sigemptyset();
-            linux.sigaddset(&blocked, .USR1);
-            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            // Without the pause a signal is always pending, the scan takes
-            // one after every system call, and the checks below take a
-            // minute on more than one CPU.
-            while (go.load(.acquire)) {
-                _ = linux.kill(linux.getpid(), .USR1);
-                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
-        }
-    };
-    Stop.go.store(true, .release);
-    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
-    defer {
-        Stop.go.store(false, .release);
-        buzz.join();
-    }
+    GroupScan.calls = 0;
+    test_getdents = GroupScan.getdents;
+    defer test_getdents = null;
     const pgid: linux.pid_t = @intCast(linux.getpgid(0));
-    // At least 50 checks, and on until 10 have caught a signal mid-scan, so
-    // the test fails rather than passes when no signal lands.
-    const until = nowMs() + 10_000;
-    var checks: usize = 0;
-    var interrupted: usize = 0;
-    while (checks < 50 or (interrupted < 10 and nowMs() < until)) : (checks += 1) {
-        const caught = usr1_caught.load(.monotonic);
-        try std.testing.expect(groupAlive(pgid));
-        if (usr1_caught.load(.monotonic) != caught) interrupted += 1;
-    }
-    try std.testing.expect(interrupted >= 10);
+    try std.testing.expect(groupAlive(pgid));
+    try std.testing.expect(GroupScan.calls >= 2);
 }
 
 test "run refuses a relative program" {
@@ -886,33 +881,33 @@ test "makeExecFixture removes scratch directories after setup failures" {
     try std.testing.expect(saw_failure_after_dir);
 }
 
-test "a closed stdout at start does not send the child's stderr to its stdout" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(1);
-            return shPrints("echo out; echo err >&2", null, "out\n");
-        }
-    }.body);
+const ClosedStdio = struct {
+    fd: i32,
+    script: []const u8,
+    stdin: ?[]const u8,
+    want: []const u8,
+};
+
+const closed_stdio_rows = [_]ClosedStdio{
+    .{ .fd = 1, .script = "echo out; echo err >&2", .stdin = null, .want = "out\n" },
+    .{ .fd = 0, .script = "readlink /proc/self/fd/0 || echo closed", .stdin = null, .want = "/dev/null\n" },
+    .{ .fd = 0, .script = "cat; readlink /proc/self/fd/2", .stdin = "in\n", .want = "in\n/dev/null\n" },
+    .{ .fd = 2, .script = "readlink /proc/self/fd/2 || echo closed", .stdin = null, .want = "/dev/null\n" },
+};
+
+var closed_stdio_row: usize = 0;
+
+fn closedStdioChild() u8 {
+    const row = closed_stdio_rows[closed_stdio_row];
+    sys.close(row.fd);
+    return shPrints(row.script, row.stdin, row.want);
 }
 
-test "a closed stdin at start leaves the child's stdin and stderr on their files" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(0);
-            const r = shPrints("readlink /proc/self/fd/0 || echo closed", null, "/dev/null\n");
-            if (r != 0) return r;
-            return shPrints("cat; readlink /proc/self/fd/2", "in\n", "in\n/dev/null\n");
-        }
-    }.body);
-}
-
-test "a closed stderr at start leaves the child's stderr on /dev/null" {
-    try test_support.expectChildPasses(struct {
-        fn body() u8 {
-            sys.close(2);
-            return shPrints("readlink /proc/self/fd/2 || echo closed", null, "/dev/null\n");
-        }
-    }.body);
+test "a closed standard stream at start stays on its own file" {
+    for (0..closed_stdio_rows.len) |i| {
+        closed_stdio_row = i;
+        try test_support.expectChildPasses(closedStdioChild);
+    }
 }
 
 test "a status lost to an ignored SIGCHLD is an error, not a kill by signal 9" {
@@ -969,42 +964,34 @@ test "resolveExecutable handles relative slash paths" {
     try std.testing.expectEqual(@as(?[]u8, null), try resolveExecutable(gpa, rel_plain, null));
 }
 
-test "which resolves executable candidates directly" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which");
-    defer fixture.deinit(gpa);
-
-    const found = (try which(gpa, "tool.sh", fixture.base)).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings(fixture.exe_path, found);
-
-    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "plain.txt", fixture.base));
-    try std.testing.expectEqual(@as(?[]u8, null), try which(gpa, "not-present-tool", fixture.base));
-}
-
 test "whichShutil uses os.defpath when PATH is unset" {
     const gpa = std.testing.allocator;
-    const found = (try whichShutil(gpa, "sh", null)).?;
+    const fixture = try makeExecFixture(gpa, "which-shutil-defpath");
+    defer fixture.deinit(gpa);
+    const sh_path = try std.fs.path.join(gpa, &.{ fixture.base, "sh" });
+    defer gpa.free(sh_path);
+    const sh_fd = try sys.openat(fsx.cwd, sh_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+    defer sys.close(sh_fd);
+    try sys.writeAll(sh_fd, "#!/bin/sh\nexit 0\n");
+
+    const found = (try whichWithOptions(gpa, std.Io.Dir.cwd().handle, "sh", null, .{
+        .unset_path = .use_default,
+        .default_path = fixture.base,
+        .empty_path = .return_none,
+        .result_path = .candidate,
+        .executable_check = .not_directory,
+        .slash_name = .check_direct,
+        .slash_split_join = true,
+    })).?;
     defer gpa.free(found);
-    try std.testing.expect(found.len > 0 and found[0] == '/');
-    try std.testing.expectEqualStrings("sh", std.fs.path.basename(found));
+    try std.testing.expectEqualStrings(sh_path, found);
 }
 
-test "whichShutil returns null for an empty PATH" {
+test "whichShutil covers an empty PATH, an empty entry, and slash paths" {
     const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-empty");
+    const fixture = try makeExecFixture(gpa, "which-shutil");
     defer fixture.deinit(gpa);
-    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", ""));
-}
-
-test "whichShutil empty entry search uses provided cwd handle" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-cwd-handle");
-    defer fixture.deinit(gpa);
-    const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
-    defer sys.close(dir);
-
-    const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", .{
+    const shutil_opts: WhichOptions = .{
         .unset_path = .use_default,
         .default_path = "/bin:/usr/bin",
         .empty_path = .search_cwd,
@@ -1012,40 +999,48 @@ test "whichShutil empty entry search uses provided cwd handle" {
         .executable_check = .not_directory,
         .slash_name = .check_direct,
         .slash_split_join = true,
-    })).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings("tool.sh", found);
-}
+    };
 
-test "whichShutil slash normalization keeps //x and collapses a//x" {
-    const gpa = std.testing.allocator;
-    const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
-    defer gpa.free(collapsed);
-    try std.testing.expectEqualStrings("a/x", collapsed);
-
-    const double = try shutilSplitJoinPosix(gpa, "//x");
-    defer gpa.free(double);
-    try std.testing.expectEqualStrings("//x", double);
-
-    const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
-    defer gpa.free(dotted);
-    try std.testing.expectEqualStrings(".//a/x", dotted);
-}
-
-test "whichShutil slash paths ending in slash do not match regular files" {
-    const gpa = std.testing.allocator;
-    const fixture = try makeExecFixture(gpa, "which-shutil-slash-tail");
-    defer fixture.deinit(gpa);
-
-    const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
-    defer gpa.free(slash);
-    const found = (try whichShutil(gpa, slash, "")).?;
-    defer gpa.free(found);
-    try std.testing.expectEqualStrings(fixture.exe_path, found);
-
-    const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
-    defer gpa.free(trailing);
-    try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
+    const Row = enum { empty_path, empty_entry, slash_collapse, slash_keep, slash_dot, slash_hit, slash_miss };
+    for ([_]Row{ .empty_path, .empty_entry, .slash_collapse, .slash_keep, .slash_dot, .slash_hit, .slash_miss }) |row| {
+        switch (row) {
+            .empty_path => try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, "tool.sh", "")),
+            .empty_entry => {
+                const dir = try fsx.openDir(fsx.cwd, fixture.base, false);
+                defer sys.close(dir);
+                const found = (try whichWithOptions(gpa, dir, "tool.sh", ":", shutil_opts)).?;
+                defer gpa.free(found);
+                try std.testing.expectEqualStrings("tool.sh", found);
+            },
+            .slash_collapse => {
+                const collapsed = try shutilSplitJoinPosix(gpa, "a//x");
+                defer gpa.free(collapsed);
+                try std.testing.expectEqualStrings("a/x", collapsed);
+            },
+            .slash_keep => {
+                const double = try shutilSplitJoinPosix(gpa, "//x");
+                defer gpa.free(double);
+                try std.testing.expectEqualStrings("//x", double);
+            },
+            .slash_dot => {
+                const dotted = try shutilSplitJoinPosix(gpa, ".//a/x");
+                defer gpa.free(dotted);
+                try std.testing.expectEqualStrings(".//a/x", dotted);
+            },
+            .slash_hit => {
+                const slash = try std.fmt.allocPrint(gpa, "{s}//tool.sh", .{fixture.base});
+                defer gpa.free(slash);
+                const found = (try whichShutil(gpa, slash, "")).?;
+                defer gpa.free(found);
+                try std.testing.expectEqualStrings(fixture.exe_path, found);
+            },
+            .slash_miss => {
+                const trailing = try std.fmt.allocPrint(gpa, "{s}/tool.sh/", .{fixture.base});
+                defer gpa.free(trailing);
+                try std.testing.expectEqual(@as(?[]u8, null), try whichShutil(gpa, trailing, ""));
+            },
+        }
+    }
 }
 
 test "which, groupAlive, and run cover error and boundary paths" {

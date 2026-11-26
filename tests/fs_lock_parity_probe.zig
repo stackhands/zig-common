@@ -1000,7 +1000,7 @@ fn openLockFile(path: []const u8) sys.fd_t {
 fn tryLockMode(path: []const u8) void {
     const fd = openLockFile(path);
     defer sys.close(fd);
-    const result = state.lockExclusive(fd, 400);
+    const result = state.lockExclusive(fd, 30);
     if (result) |_| {
         put("lockExclusive\tOK\n");
     } else |e| {
