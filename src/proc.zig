@@ -285,7 +285,8 @@ pub fn resolveExecutable(gpa: Allocator, name: []const u8, path_env: ?[]const u8
     else
         fsx.absPath(gpa, name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            // No absolute path exists when the working directory is gone.
+            // `else => null` also swallows `ERANGE` and any other `getcwd`
+            // failure, not only a removed working directory.
             else => return null,
         };
     if (!isExecutableFile(abs)) {

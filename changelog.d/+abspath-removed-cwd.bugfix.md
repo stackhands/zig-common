@@ -1,0 +1,1 @@
+`fsx.absPath` returns `Error` as well as `Allocator.Error` in its error set, which is a source-breaking change for callers that switch exhaustively on its errors. It handles a removed working directory, reporting `error.NotFound`.
