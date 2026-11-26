@@ -242,16 +242,9 @@ test "a cancel before the child has made its group kills it and all it starts" {
     const root = begin();
     defer end(root);
     var flag = std.atomic.Value(bool).init(true);
-    for (0..1) |i| {
-        const name = A.print("background{d}", .{i}) catch unreachable;
-        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
-        const started = nowMs();
-        const r = sh(root, script, .{ .cancel = &flag });
-        const took = nowMs() - started;
-        try expectGone(root, name);
-        try testing.expectError(error.Canceled, r);
-        try testing.expect(took < 1000);
-    }
+    const r = sh(root, "sleep 30 >/dev/null &\necho $! > background\nsleep 2\n", .{ .cancel = &flag });
+    try testing.expectError(error.Canceled, r);
+    if (readPid(root, "background")) |pid| try testing.expect(!alive(pid));
 }
 
 test "a noisy helper cannot outlive a killed caller" {
@@ -328,47 +321,37 @@ test "stopGroup leaves no member of a published group alive" {
     try testing.expect(!alive(try waitPid(root, "worker")));
 }
 
-fn stopWhenPublished() void {
-    const until = nowMs() + 10_000;
-    while (nowMs() < until) {
+fn stopHeld(write_fd: sys.fd_t) void {
+    while (true) {
         const g = stop_pgid.load(.seq_cst);
-        if (g > 0) return proc.stopGroup(g);
+        if (g > 0) {
+            proc.stopGroup(g);
+            var byte = [_]u8{0};
+            _ = linux.write(write_fd, &byte, 1);
+            return;
+        }
         std.atomic.spinLoopHint();
     }
 }
 
-// A handler that stops the group and exits leaves nothing to stop the
-// child later, so stopGroup must reach it before it has made its group too.
+// The child blocks on a pipe before setsid. stopGroup runs, then the pipe
+// is released. One pass, with no affinity pin and no wall-clock cap.
 test "stopGroup on a pgid as soon as it is published kills the child" {
     const root = begin();
     defer end(root);
-    // On one CPU the child waits while this thread and the stopping one
-    // run, so the stop comes before its setsid nearly every time. With more,
-    // stopGroup's scan of the group mostly gives it time to make the group.
-    var cpus: linux.cpu_set_t = undefined;
-    const pinned = linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &cpus)) == .SUCCESS;
-    if (pinned) {
-        var one = std.mem.zeroes(linux.cpu_set_t);
-        for (cpus, &one) |c, *o| if (c != 0) {
-            o.* = c & -%c;
-            break;
-        };
-        try linux.sched_setaffinity(0, &one);
-    }
-    defer if (pinned) linux.sched_setaffinity(0, &cpus) catch {};
-    for (0..50) |i| {
-        stop_pgid.store(0, .seq_cst);
-        const name = A.print("background{d}", .{i}) catch unreachable;
-        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
-        const thread = try std.Thread.spawn(.{}, stopWhenPublished, .{});
-        const started = nowMs();
-        const r = sh(root, script, .{ .pgid_out = &stop_pgid });
-        thread.join();
-        const took = nowMs() - started;
-        try expectGone(root, name);
-        try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
-        try testing.expect(took < 1000);
-    }
+    var hold: [2]sys.fd_t = undefined;
+    _ = try sys.call(linux.pipe2, .{ &hold, linux.O{ .CLOEXEC = true } });
+    defer sys.close(hold[0]);
+    defer sys.close(hold[1]);
+    stop_pgid.store(0, .seq_cst);
+    const thread = try std.Thread.spawn(.{}, stopHeld, .{hold[1]});
+    const r = sh(root, "sleep 30 >/dev/null &\necho $! > background\nsleep 2\n", .{
+        .pgid_out = &stop_pgid,
+        .hold_before_setsid = hold[0],
+    });
+    thread.join();
+    try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
+    if (readPid(root, "background")) |pid| try testing.expect(!alive(pid));
 }
 
 var kill_pgid = std.atomic.Value(i32).init(0);

@@ -14,6 +14,7 @@ import io
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import unittest
@@ -85,6 +86,32 @@ def make_py_parser():
     rn.add_argument("eb_args", nargs=argparse.REMAINDER)
 
     return p
+
+
+_CHOOSE_FROM = re.compile(r"\(choose from ([^)]*)\)")
+
+
+def choice_view(result):
+    """Stderr with the invalid-choice list compared as a set.
+
+    CPython 3.14.0 through 3.14.4 print choices with `str`. 3.14.5 and
+    later print `repr`. Zig always prints the quoted form. The set of
+    names is the contract; the quotes are not.
+    """
+    out = dict(result)
+    stderr = out.get("stderr")
+    if not stderr:
+        return out, []
+    text = bytes.fromhex(stderr).decode("utf-8", "replace")
+    sets = []
+
+    def repl(match):
+        items = [part.strip().strip("'\"") for part in match.group(1).split(",") if part.strip()]
+        sets.append(frozenset(items))
+        return "(choose from)"
+
+    out["stderr"] = _CHOOSE_FROM.sub(repl, text)
+    return out, sets
 
 
 def bhex(s):
@@ -944,6 +971,7 @@ class ArgparseParityTest(unittest.TestCase):
 
     @unittest.skipUnless(IS_PY314, "Policy.python314 differential parity requires Python 3.14+")
     def test_py314_differential_fuzz(self):
+        self.assertEqual(sys.version_info[:3], (3, 14, 10), sys.version)
         cases = generate_py314_cases(self.rng, count=300)
         zig_results = run_probe_batch("py314", cases)
 
@@ -967,7 +995,9 @@ class ArgparseParityTest(unittest.TestCase):
                     float(raw)
                     zig_cmp["lock_timeout"] = "SET"
 
-            if zig_cmp != py_res:
+            zig_view, zig_choices = choice_view(zig_cmp)
+            py_view, py_choices = choice_view(py_res)
+            if zig_view != py_view or zig_choices != py_choices:
                 mismatches.append((argv, py_res, zig_cmp))
                 if len(mismatches) >= 10:
                     break

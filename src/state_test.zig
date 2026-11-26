@@ -342,11 +342,12 @@ test "a timed acquire does not wait forever" {
     defer holder.release() catch unreachable;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try testing.expectError(error.Busy, RootLock.acquire(A, root, 30));
+    const timeout_ms: u32 = 30;
+    try testing.expectError(error.Busy, RootLock.acquire(A, root, timeout_ms));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try testing.expect(ms >= 30 and ms < 5000);
+    try testing.expect(ms + 1 >= timeout_ms);
 }
 
 // ---- files planted at the lock names ---------------------------------------

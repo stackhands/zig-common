@@ -78,6 +78,10 @@ pub const Options = struct {
     /// A failed exec is returned as its errno's error, as Python's Popen
     /// raises OSError, instead of a child that exits 127.
     exec_error: bool = false,
+    /// Read end the child blocks on, for one byte, after the fork and
+    /// before `setsid`. -1 does not block. A test holds the write end,
+    /// stops the child, then releases the pipe.
+    hold_before_setsid: sys.fd_t = -1,
 };
 
 /// What `run` returns once the child has ended: how, and what it wrote.
@@ -302,7 +306,18 @@ fn childExec(
     out_fd: sys.fd_t,
     err_fd: sys.fd_t,
     exec_err_fd: sys.fd_t,
+    hold_fd: sys.fd_t,
 ) noreturn {
+    if (hold_fd >= 0) {
+        var held: [1]u8 = undefined;
+        while (true) {
+            const rc = linux.read(hold_fd, &held, 1);
+            switch (linux.errno(rc)) {
+                .INTR => continue,
+                else => break,
+            }
+        }
+    }
     if (new_session) _ = linux.setsid();
     const empty = linux.sigemptyset();
     var act: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = empty, .flags = 0 };
@@ -372,12 +387,22 @@ fn reap(pid: linux.pid_t) sys.Error!Term {
 /// True while a live (not zombie) process is in process group `pgid`. A
 /// /proc read that fails mid-scan answers false, so a wait on this is best
 /// effort.
+/// Test double for `getdents64` inside `groupAlive`. Null calls the kernel.
+/// A test returns `EINTR` once and then the real scan, so the retry is not
+/// a signal delivered to this process.
+var test_getdents: ?*const fn (fd: linux.fd_t, buf: [*]u8, len: usize) usize = null;
+
+fn scanGetdents(fd: linux.fd_t, buf: [*]u8, len: usize) usize {
+    if (test_getdents) |hook| return hook(fd, buf, len);
+    return linux.getdents64(fd, buf, @intCast(len));
+}
+
 pub fn groupAlive(pgid: linux.pid_t) bool {
     const dir = sys.openat(linux.AT.FDCWD, "/proc", .{ .DIRECTORY = true }, 0) catch return false;
     defer sys.close(dir);
     var dents: [16 * 1024]u8 align(8) = undefined;
     while (true) {
-        const n = linux.getdents64(dir, &dents, dents.len);
+        const n = scanGetdents(dir, &dents, dents.len);
         // EINTR is not a failed scan. Treating it as "nobody is alive"
         // would let waitGroupGone return while the group is still running.
         if (linux.errno(n) == .INTR) continue;
@@ -539,7 +564,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
         if (exec_p) |p| sys.close(p.w);
         return e;
     };
-    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err, if (exec_p) |p| p.w else -1);
+    if (fork_rc == 0) childExec(zexe.ptr, zargv.ptr, envp, opts.new_session, child_in, out_p.w, child_err, if (exec_p) |p| p.w else -1, opts.hold_before_setsid);
     const pid: linux.pid_t = @intCast(fork_rc);
     if (opts.new_session) {
         if (opts.pgid_out) |p| p.store(pid, .seq_cst);
@@ -742,53 +767,23 @@ test "a set cancel flag kills the child" {
     try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
 }
 
-var usr1_caught = std.atomic.Value(u32).init(0);
+const GroupScan = struct {
+    var calls: usize = 0;
 
-fn onUsr1Proc(_: linux.SIG) callconv(.c) void {
-    _ = usr1_caught.fetchAdd(1, .monotonic);
-}
+    fn getdents(fd: linux.fd_t, buf: [*]u8, len: usize) usize {
+        calls += 1;
+        if (calls == 1) return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+        return linux.getdents64(fd, buf, @intCast(len));
+    }
+};
 
 test "groupAlive stays true for a live group while signals arrive" {
-    const handler: linux.Sigaction = .{ .handler = .{ .handler = &onUsr1Proc }, .mask = linux.sigemptyset(), .flags = 0 };
-    var prev: linux.Sigaction = undefined;
-    _ = linux.sigaction(.USR1, &handler, &prev);
-    defer _ = linux.sigaction(.USR1, &prev, null);
-    const Stop = struct {
-        var go = std.atomic.Value(bool).init(true);
-        fn buzz() void {
-            // This thread must not catch SIGUSR1, or the signal may interrupt
-            // it instead of the scan.
-            var blocked = linux.sigemptyset();
-            linux.sigaddset(&blocked, .USR1);
-            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            // Without the pause a signal is always pending, the scan takes
-            // one after every system call, and the checks below take a
-            // minute on more than one CPU.
-            while (go.load(.acquire)) {
-                _ = linux.kill(linux.getpid(), .USR1);
-                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
-        }
-    };
-    Stop.go.store(true, .release);
-    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
-    defer {
-        Stop.go.store(false, .release);
-        buzz.join();
-    }
+    GroupScan.calls = 0;
+    test_getdents = GroupScan.getdents;
+    defer test_getdents = null;
     const pgid: linux.pid_t = @intCast(linux.getpgid(0));
-    // At least 50 checks, and on until 10 have caught a signal mid-scan, so
-    // the test fails rather than passes when no signal lands.
-    const until = nowMs() + 10_000;
-    var checks: usize = 0;
-    var interrupted: usize = 0;
-    while (checks < 50 or (interrupted < 10 and nowMs() < until)) : (checks += 1) {
-        const caught = usr1_caught.load(.monotonic);
-        try std.testing.expect(groupAlive(pgid));
-        if (usr1_caught.load(.monotonic) != caught) interrupted += 1;
-    }
-    try std.testing.expect(interrupted >= 10);
+    try std.testing.expect(groupAlive(pgid));
+    try std.testing.expect(GroupScan.calls >= 2);
 }
 
 test "run refuses a relative program" {
