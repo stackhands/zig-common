@@ -477,6 +477,44 @@ test "a truncated or malformed escape is an encoding error" {
     try std.testing.expect(obj.get("a") == null);
 }
 
+test "an earlier duplicate that cannot decode is dropped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // json.loads keeps the last value of a duplicate key, so the
+    // earlier member the last one replaces is never part of the result
+    // and cannot fail the document
+    const v = try parse(a, "{\"k\": \"\\ud800\", \"k\": \"kept\"}");
+    const py = try toPy(a, v);
+    try std.testing.expectEqual(@as(usize, 1), py.dict.len);
+    try std.testing.expectEqualStrings("k", py.dict[0].key);
+    try std.testing.expectEqualStrings("kept", py.dict[0].value.str);
+}
+
+test "a raw byte in a dropped duplicate still refuses the document" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // the strict consumers decode the whole text before json.loads, so
+    // the raw byte refuses the document even in the member the
+    // duplicates rule drops
+    const v = try parse(a, "{\"k\": \"kept\", \"d\": \"a\x80b\", \"d\": \"kept\"}");
+    try std.testing.expectError(error.Encoding, toPy(a, v));
+
+    // a lone surrogate escape in a dropped member stays dropped, as
+    // json.loads keeps the last value and never carries it
+    const v2 = try parse(a, "{\"k\": \"kept\", \"d\": \"\\ud800\", \"d\": \"kept\"}");
+    const py2 = try toPy(a, v2);
+    try std.testing.expectEqual(@as(usize, 2), py2.dict.len);
+
+    // a raw byte in the key of an object nested in a dropped member
+    // refuses the same way
+    const v3 = try parse(a, "{\"d\": {\"a\x80\": 1}, \"d\": 1}");
+    try std.testing.expectError(error.Encoding, toPy(a, v3));
+}
+
 test "parse objects, duplicates and nesting" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -560,6 +598,29 @@ pub const Py = union(enum) {
     }
 };
 
+/// The raw bytes of a dropped member's value must still be valid
+/// UTF-8, as the consumers decode the whole document strictly before
+/// json.loads; escapes are ASCII and stay fine, so only a raw byte
+/// that is not UTF-8 refuses here.
+fn validateRawStrings(v: Value) error{Encoding}!void {
+    switch (v) {
+        .string => |raw| {
+            var i: usize = 0;
+            while (i < raw.len) {
+                const ch = text.nextChar(raw[i..]);
+                if (ch.cp == null) return error.Encoding;
+                i += ch.len;
+            }
+        },
+        .array => |items| for (items) |it| try validateRawStrings(it),
+        .object => |members| for (members) |mem| {
+            try validateRawStrings(.{ .string = mem.key });
+            try validateRawStrings(mem.value);
+        },
+        else => {},
+    }
+}
+
 /// A number as json.loads reads it: an int when the text has no fraction or
 /// exponent, a float otherwise. An int that does not fit an i64, which
 /// Python keeps exact, cannot be represented and is an error, not a
@@ -585,9 +646,36 @@ pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
             break :blk .{ .list = out };
         },
         .object => |members| blk: {
-            // A later duplicate key replaces the earlier one, in its place.
+            // A later duplicate key replaces the earlier one, in its
+            // place, as json.loads keeps the last value; the earlier
+            // member the last one replaces is never decoded, so a
+            // value the document drops cannot fail it.
+            const keys = try arena.alloc([]const u8, members.len);
+            const kept = try arena.alloc(bool, members.len);
+            for (members, 0..) |mem, i| {
+                keys[i] = try decodeCache(arena, mem.key);
+                kept[i] = true;
+            }
+            for (0..members.len) |i| {
+                for (i + 1..members.len) |j| {
+                    if (std.mem.eql(u8, keys[i], keys[j])) {
+                        kept[i] = false;
+                        break;
+                    }
+                }
+            }
             var m: std.StringArrayHashMapUnmanaged(Py) = .empty;
-            for (members) |mem| try m.put(arena, try decodeCache(arena, mem.key), try toPy(arena, mem.value));
+            for (members, 0..) |mem, i| {
+                if (!kept[i]) {
+                    // The strict consumers decode the whole text before
+                    // json.loads, so a raw byte that is not UTF-8
+                    // refuses the document even here; escapes stay
+                    // fine, the value is only dropped, not carried.
+                    try validateRawStrings(mem.value);
+                    continue;
+                }
+                try m.put(arena, keys[i], try toPy(arena, mem.value));
+            }
             const out = try arena.alloc(Py.Entry, m.count());
             for (m.keys(), m.values(), 0..) |k, val, i| out[i] = .{ .key = k, .value = val };
             break :blk .{ .dict = out };
@@ -736,6 +824,74 @@ pub fn dumps(gpa: Allocator, v: Py, indent: usize, sort: bool) Allocator.Error![
     errdefer out.deinit(gpa);
     try dumpsInner(&out, gpa, v, indent, 0, sort);
     return out.toOwnedSlice(gpa);
+}
+
+fn dumpsCompactInner(out: *std.ArrayList(u8), gpa: Allocator, v: Py, sort: bool) Allocator.Error!void {
+    switch (v) {
+        .null => try out.appendSlice(gpa, "null"),
+        .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
+        .int => |i| {
+            var buf: [24]u8 = undefined;
+            try out.appendSlice(gpa, std.mem.print(&buf, "{d}", .{i}) catch unreachable);
+        },
+        .float => |f| try writeFloat(out, gpa, f),
+        .str => |s| try writeCacheString(out, gpa, s),
+        .list => |items| {
+            try out.append(gpa, '[');
+            for (items, 0..) |it, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try dumpsCompactInner(out, gpa, it, sort);
+            }
+            try out.append(gpa, ']');
+        },
+        .dict => |entries| {
+            if (entries.len == 0) return out.appendSlice(gpa, "{}");
+            const sorted = try gpa.dupe(Py.Entry, entries);
+            defer gpa.free(sorted);
+            if (sort) std.mem.sort(Py.Entry, sorted, {}, lessKey);
+            try out.append(gpa, '{');
+            for (sorted, 0..) |e, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try writeCacheString(out, gpa, e.key);
+                try out.appendSlice(gpa, ": ");
+                try dumpsCompactInner(out, gpa, e.value, sort);
+            }
+            try out.append(gpa, '}');
+        },
+    }
+}
+
+/// json.dumps(v, sort_keys=sort) with the separators of the default call,
+/// one line and no indent, ensure_ascii as Python's default. The compact
+/// form the tools print for the --json lines.
+pub fn dumpsCompact(gpa: Allocator, v: Py, sort: bool) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try dumpsCompactInner(&out, gpa, v, sort);
+    return out.toOwnedSlice(gpa);
+}
+
+test "dumpsCompact matches json.dumps with the default separators" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v: Py = .{ .dict = &.{
+        .{ .key = "b", .value = .{ .list = &.{ .{ .int = 1 }, .null, .{ .bool = true } } } },
+        .{ .key = "a", .value = .{ .str = "\u{e9}\xff" } },
+        .{ .key = "c", .value = .{ .dict = &.{} } },
+        .{ .key = "d", .value = .{ .list = &.{} } },
+        .{ .key = "e", .value = .{ .float = 2.0 } },
+        .{ .key = "f", .value = .{ .str = "" } },
+    } };
+    const s = try dumpsCompact(a, v, true);
+    try std.testing.expectEqualStrings(
+        "{\"a\": \"\\u00e9\\udcff\", \"b\": [1, null, true], \"c\": {}, \"d\": [], \"e\": 2.0, \"f\": \"\"}",
+        s,
+    );
+    const bare = try dumpsCompact(a, .{ .list = &.{} }, false);
+    try std.testing.expectEqualStrings("[]", bare);
+    const wrapped = try dumpsCompact(a, .{ .list = &.{.{ .dict = &.{.{ .key = "k", .value = .{ .str = "v" } }} }} }, false);
+    try std.testing.expectEqualStrings("[{\"k\": \"v\"}]", wrapped);
 }
 
 test "dumps matches json.dumps(indent=2, sort_keys=True)" {

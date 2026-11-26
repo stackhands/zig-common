@@ -27,5 +27,7 @@ exclude = [
   '^https://eb-stack\.rgoswami\.me/',
   # The repository's own, each with its reason; apply.py keeps this block.
   # local:begin
+  # The gzip manual times out from CI runners, failing the check.
+  '^https://www\.gnu\.org/software/gzip/manual/gzip\.html$',
   # local:end
 ]

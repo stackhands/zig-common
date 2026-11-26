@@ -1,0 +1,1 @@
+Add a test that `state.RootLock.release` returns the error when the `fcntl` or `flock` release fails through `state.lock_ops`, returns the record lock error when both fail, and closes both lock descriptors in each case.

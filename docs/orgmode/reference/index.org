@@ -14,4 +14,6 @@ Each page states facts in the order the thing itself has them.
    cli-conventions
    compatibility
    api
+   environment-diff
+   env-scrub
 #+end_export

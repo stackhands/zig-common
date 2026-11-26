@@ -1,14 +1,15 @@
 //! Same-directory replacement of a file whose access metadata must survive:
 //! the bytes, owner, mode and every listed ACL form are written to a
-//! temporary file, read back, made durable, and only then renamed over the
-//! destination. The ACL forms are the GPFS native NFSv4 ACL, the generic
-//! NFSv4 ACL and the POSIX access ACL, most native first; a filesystem may
-//! expose one ACL through several of them.
+//! temporary file, read back, made durable, closed, and only then renamed
+//! over the destination. The ACL forms are the GPFS native NFSv4 ACL, the
+//! generic NFSv4 ACL and the POSIX access ACL, most native first; a
+//! filesystem may expose one ACL through several of them.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const pytext = @import("pytext.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,7 +22,9 @@ const posix_access = "system.posix_acl_access";
 /// filesystem's ACL model or a failing call, in a `replaceable` build only
 /// (this library's tests, a tool's -Dtest-ops artifact). `created` runs on
 /// the temporary file right after its O_EXCL creation, where a filesystem
-/// applies an inherited ACL.
+/// applies an inherited ACL. `close` is the temporary file's close before
+/// the rename, and the parent directory's close after its sync; the caller
+/// does not retry either.
 pub const Ops = struct {
     flistxattr: *const fn (fd: sys.fd_t, buf: []u8) usize = realList,
     fgetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize = realGet,
@@ -30,6 +33,7 @@ pub const Ops = struct {
     fchmod: *const fn (fd: sys.fd_t, mode: u32) usize = realChmod,
     fchown: *const fn (fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize = realChown,
     fsync: *const fn (fd: sys.fd_t) usize = realFsync,
+    close: *const fn (fd: sys.fd_t) usize = realClose,
     openat: *const fn (dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize = realOpenat,
     write: *const fn (fd: sys.fd_t, bytes: []const u8) usize = realWrite,
     renameat: *const fn (old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize = realRenameat,
@@ -69,6 +73,9 @@ fn realChown(fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize {
 fn realFsync(fd: sys.fd_t) usize {
     return linux.fsync(fd);
 }
+fn realClose(fd: sys.fd_t) usize {
+    return linux.close(fd);
+}
 fn realOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
     return linux.openat(dir, path, flags, mode);
 }
@@ -107,6 +114,22 @@ fn writeTemp(fd: sys.fd_t, bytes: []const u8) sys.Error!void {
     }
 }
 
+/// Close the temporary file once. EINTR is not retried, as Linux has
+/// freed the descriptor, and is not an error, as `sys.result` treats
+/// EINTR. Any other errno is returned with `sys.last_errno` set.
+fn closeTemp(fd: sys.fd_t) sys.Error!void {
+    _ = try sys.result(ops.close(fd));
+}
+
+/// Close a temporary file whose result is not the one being returned.
+/// Linux frees the descriptor whatever close reports, so the result is
+/// ignored, and `sys.last_errno` stays the errno of the failure in hand.
+fn closeDiscarded(fd: sys.fd_t) void {
+    const saved = sys.last_errno;
+    defer sys.last_errno = saved;
+    _ = ops.close(fd);
+}
+
 fn renameTemp(old_path: []const u8, new_path: []const u8) sys.Error!void {
     var za: [sys.path_max:0]u8 = undefined;
     var zb: [sys.path_max:0]u8 = undefined;
@@ -124,11 +147,40 @@ pub fn describe(err: Error) []const u8 {
     };
 }
 
-/// Why a replacement was refused; filled in when an error is returned. The
-/// message is allocated from the allocator given with `why` and belongs to
-/// the caller: `deinit` frees it.
+/// Python's text for an OSError from a step of `atomicWrite`. `path` is the
+/// filename and `path2` the second filename of a rename. A null path is a
+/// call that carries none, such as write or fsync of an open descriptor.
+/// The error itself is unchanged; `why.msg` holds the text.
+fn failOs(a: Allocator, why: *Why, err: sys.Error, path: ?[]const u8, path2: ?[]const u8) Error {
+    const text = sys.describe(err);
+    if (path2) |second| {
+        const q1 = pytext.reprStrAlloc(a, path orelse "") catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
+        defer a.free(q1);
+        const q2 = pytext.reprStrAlloc(a, second) catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
+        defer a.free(q2);
+        why.msg = a.print("{s}: {s} -> {s}", .{ text, q1, q2 }) catch unallocated_refusal;
+    } else if (path) |one| {
+        const q1 = pytext.reprStrAlloc(a, one) catch {
+            why.msg = unallocated_refusal;
+            return err;
+        };
+        defer a.free(q1);
+        why.msg = a.print("{s}: {s}", .{ text, q1 }) catch unallocated_refusal;
+    } else why.msg = a.print("{s}", .{text}) catch unallocated_refusal;
+    return err;
+}
+
+/// Why a replacement failed; filled in when an error is returned. The
+/// message may be allocated from the allocator given with `why` and belongs
+/// to the caller: call `deinit` after any error.
 pub const Why = struct {
-    /// The reason for the refusal; empty until there is one.
+    /// The reason for the failure; empty until there is one.
     msg: []const u8 = "",
 
     /// Free the message when it was allocated from `a`, and empty it. An
@@ -139,9 +191,9 @@ pub const Why = struct {
     }
 };
 
-/// The errors of this module: `error.Refused`, with the reason in the
-/// caller's `Why`; `error.OutOfMemory`; or the `sys.Error` of a failed
-/// call, which `describe` words as Python does.
+/// The errors of this module: `error.Refused`, `error.OutOfMemory`, or the
+/// `sys.Error` of a failed call, which `describe` words as Python does.
+/// `atomicWrite` callers deinitialize `Why` after any error.
 pub const Error = error{ Refused, OutOfMemory } || sys.Error;
 
 /// The message of a refusal that could not allocate its own.
@@ -402,26 +454,125 @@ pub fn fileMode(path: []const u8) u32 {
     return 0o644 & ~currentUmask();
 }
 
-/// Open `path` read-only and fsync it. For a directory, that makes a
-/// rename or a new name in it durable.
+/// Open `path` read-only, fsync it and close it. For a directory, that
+/// makes a rename or a new name in it durable. A failed close is returned
+/// with `sys.last_errno` set. A close that EINTR interrupts is not retried
+/// and is not an error, as `sys.result` treats EINTR. The close goes
+/// through `ops.close`. On an earlier error the cleanup close is ignored
+/// and that errno is kept.
 pub fn fsyncDir(path: []const u8) sys.Error!void {
     const fd = try sys.openat(fsx.cwd, path, .{}, 0);
-    defer sys.close(fd);
+    var open = true;
+    errdefer if (open) closeDiscarded(fd);
     try sys.fsync(fd);
+    open = false;
+    try closeTemp(fd);
 }
 
-/// os.makedirs(path, exist_ok=True).
+/// os.makedirs(path, exist_ok=True): a name that exists as something
+/// other than a directory is EEXIST, as Python re-raises FileExistsError,
+/// a name under a file is ENOTDIR, as its mkdir call reports, and a name
+/// under a dangling link is ENOENT. The recursion below a name only runs
+/// when that name is absent, as Python checks `exists(head)` first and
+/// swallows the recursion's FileExistsError.
 pub fn makedirs(path: []const u8) sys.Error!void {
+    var failed_path: ?[]const u8 = null;
+    return makedirsTracked(path, &failed_path);
+}
+
+/// `makedirs`, also returning the path passed to the system call that
+/// failed. The slice points into `path` and remains null on success.
+pub fn makedirsTracked(path: []const u8, failed_path: *?[]const u8) sys.Error!void {
+    failed_path.* = null;
     if (fsx.statAt(fsx.cwd, path, true)) |st| {
         if (st.isDir()) return;
-        return error.NotDir;
+        failed_path.* = path;
+        return error.Exists;
     } else |_| {}
-    if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) try makedirs(parent);
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = sys.call(linux.mkdirat, .{ fsx.cwd, (try sys.z(&zb, path)).ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
-        error.Exists => {},
-        else => return err,
+    if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) {
+        if (fsx.statAt(fsx.cwd, parent, true)) |_| {} else |_| {
+            makedirsTracked(parent, failed_path) catch |err| switch (err) {
+                error.Exists => failed_path.* = null,
+                else => return err,
+            };
+        }
     };
+    var zb: [sys.path_max:0]u8 = undefined;
+    const zpath = sys.z(&zb, path) catch |err| {
+        failed_path.* = path;
+        return err;
+    };
+    _ = sys.call(linux.mkdirat, .{ fsx.cwd, zpath.ptr, @as(linux.mode_t, 0o777) }) catch |err| switch (err) {
+        error.Exists => {
+            // A name another process created meanwhile passes only when
+            // it is a directory; anything else keeps Python's EEXIST.
+            const st = fsx.statAt(fsx.cwd, path, true) catch {
+                failed_path.* = path;
+                return error.Exists;
+            };
+            if (!st.isDir()) {
+                failed_path.* = path;
+                return error.Exists;
+            }
+        },
+        else => {
+            failed_path.* = path;
+            return err;
+        },
+    };
+}
+
+test "makedirs surfaces the errnos of os.makedirs with exist_ok" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-makedirs-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(base);
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+
+    // an existing directory passes, as Python's isdir branch does
+    try makedirs(base);
+
+    const file = try std.fmt.allocPrint(gpa, "{s}/f", .{base});
+    defer gpa.free(file);
+    const fd = try sys.openat(fsx.cwd, file, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    sys.close(fd);
+    try std.testing.expectError(error.Exists, makedirs(file));
+    try std.testing.expectEqualStrings("[Errno 17] File exists", sys.describe(error.Exists));
+
+    const below_file = try std.fmt.allocPrint(gpa, "{s}/f/child", .{base});
+    defer gpa.free(below_file);
+    try std.testing.expectError(error.NotDir, makedirs(below_file));
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", sys.describe(error.NotDir));
+
+    // a dangling link at the final name also raises EEXIST in Python
+    const dangling = try std.fmt.allocPrint(gpa, "{s}/dangling", .{base});
+    defer gpa.free(dangling);
+    _ = linux.symlinkat("nowhere", fsx.cwd, (try sys.z(&zb, dangling)).ptr);
+    try std.testing.expectError(error.Exists, makedirs(dangling));
+
+    // and with the dangling link above it, the missing parent is ENOENT
+    const below_dangling = try std.fmt.allocPrint(gpa, "{s}/dangling/child", .{base});
+    defer gpa.free(below_dangling);
+    try std.testing.expectError(error.NotFound, makedirs(below_dangling));
+    try std.testing.expectEqualStrings("[Errno 2] No such file or directory", sys.describe(error.NotFound));
+
+    // A caller receives the ancestor passed to the mkdir that failed, not
+    // the deeper leaf whose recursive creation was requested.
+    const nested_target = try std.fmt.allocPrint(gpa, "{s}/dangling/child/grandchild/file", .{base});
+    defer gpa.free(nested_target);
+    const failed_ancestor = try std.fmt.allocPrint(gpa, "{s}/dangling/child", .{base});
+    defer gpa.free(failed_ancestor);
+    var why: Why = .{};
+    defer why.deinit(gpa);
+    try std.testing.expectError(error.NotFound, atomicWrite(gpa, nested_target, "x", .{}, &why));
+    const quoted = try pytext.reprStrAlloc(gpa, failed_ancestor);
+    defer gpa.free(quoted);
+    const want = try std.fmt.allocPrint(gpa, "[Errno 2] No such file or directory: {s}", .{quoted});
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, why.msg);
 }
 
 /// What `atomicWrite` gives the new file besides its bytes, and the names
@@ -440,17 +591,28 @@ pub const WriteOptions = struct {
 };
 
 /// atomic_write: replace `path` only after its bytes and access metadata
-/// are durable. An existing file keeps its owner, mode and ACL forms,
-/// including the absence of one; `metadata_from` names another file whose
-/// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
-/// precede those operations, and in a replaceable build can fail them
-/// (Faults.fails); the destination is never unlinked first. Everything it
-/// allocates from `a` is freed before it returns, except the message of a
-/// refusal (see `Why`).
+/// are durable. The temporary file is synced and closed before the rename.
+/// A failed close is reported the way a failed write or fsync is, with
+/// no path in the message; the temporary file is removed and the
+/// destination is left as it was. The descriptor is closed once on every
+/// path. A close that EINTR interrupts is not retried, as Linux has freed
+/// the descriptor, and is not an error, as `sys.result` treats EINTR; the
+/// fsync before it has already flushed the bytes. An existing file keeps
+/// its owner, mode and ACL forms, including the absence of one;
+/// `metadata_from` names another file whose metadata to apply. Fault
+/// points STEP.write, STEP.fsync and STEP.rename precede those
+/// operations, and in a replaceable build can fail them (Faults.fails);
+/// the destination is never unlinked first. The close goes through
+/// `ops.close`. After the rename the parent directory is synced and closed
+/// through that same call. A failed close of the directory is reported
+/// with no path, and the destination keeps the bytes the rename published.
+/// Everything it allocates from `a` is freed before it returns, except the
+/// failure message in `why`. Call `why.deinit(a)` after any error.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
-    try makedirs(parent);
+    var failed_path: ?[]const u8 = null;
+    makedirsTracked(parent, &failed_path) catch |err| return failOs(a, why, err, failed_path orelse parent, null);
     if (fsx.statAt(fsx.cwd, path, false)) |st| {
         if (st.isLink()) return refuse(a, why, "refusing to replace a symlink: {s}", .{path});
     } else |_| {}
@@ -472,7 +634,7 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         const owner_ok = stale.uid == euid or (metadata != null and stale.uid == metadata.?.info.uid);
         if (!stale.isReg() or !owner_ok or stale.nlink != 1)
             return refuse(a, why, "temporary file must be an owned regular file with one link: {s}", .{tmp});
-        try sys.unlinkat(fsx.cwd, tmp, 0);
+        sys.unlinkat(fsx.cwd, tmp, 0) catch |err| return failOs(a, why, err, tmp, null);
     } else |_| {}
 
     {
@@ -480,28 +642,39 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    const fd = try openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    const fd = openTemp(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600) catch |err|
+        return failOs(a, why, err, tmp, null);
     const created = fsx.fstat(fd) catch |err| {
-        sys.close(fd);
-        // Created above with O_EXCL, so it is this call's file.
+        // os.fstat names no path. Record that before the cleanup calls.
+        const failed = failOs(a, why, err, null, null);
+        // Created above with O_EXCL, so it is this call's file. A failed
+        // cleanup must not replace the errno the message was built from.
+        closeDiscarded(fd);
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
         sys.unlinkat(fsx.cwd, tmp, 0) catch {};
-        return err;
+        return failed;
     };
     ops.created(fd);
-    errdefer discard(tmp, created);
+    var open = true;
+    var renamed = false;
+    errdefer if (!renamed) discard(tmp, created);
+    defer if (open) closeDiscarded(fd);
+    writeTemp(fd, data) catch |err| return failOs(a, why, err, null, null);
     {
-        defer sys.close(fd);
-        try writeTemp(fd, data);
         var inner: Why = .{};
         defer inner.deinit(a);
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
-        {
-            const step = try a.print("{s}.fsync", .{opts.step});
-            defer a.free(step);
-            if (opts.faults.fails(step)) return injected(a, why, step);
-        }
-        _ = try op(ops.fsync, .{fd});
     }
+    {
+        const step = try a.print("{s}.fsync", .{opts.step});
+        defer a.free(step);
+        if (opts.faults.fails(step)) return injected(a, why, step);
+    }
+    _ = op(ops.fsync, .{fd}) catch |err| return failOs(a, why, err, null, null);
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    closeTemp(fd) catch |err| return failOs(a, why, err, null, null);
     if (metadata) |m| {
         var inner: Why = .{};
         defer inner.deinit(a);
@@ -514,13 +687,92 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
         defer a.free(step);
         if (opts.faults.fails(step)) return injected(a, why, step);
     }
-    try renameTemp(tmp, path);
-    try fsyncDir(parent);
+    renameTemp(tmp, path) catch |err| return failOs(a, why, err, tmp, path);
+    renamed = true;
+    // Opening the directory names it. Flushing the descriptor names no file.
+    const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
+    var dir_open = true;
+    defer if (dir_open) closeDiscarded(directory);
+    sys.fsync(directory) catch |err| return failOs(a, why, err, null, null);
+    dir_open = false;
+    closeTemp(directory) catch |err| return failOs(a, why, err, null, null);
+}
+
+/// atomic_write pinned to an open directory: replace `dir/name` with
+/// `bytes` at exactly `mode`, whatever the process umask leaves, as
+/// the tools' metrics writer does with the descriptor it holds. The
+/// bytes go to a temporary file in the same directory, synced and
+/// closed, and only then renamed over the destination. A failed write,
+/// fchmod, fsync or close is returned with `sys.last_errno` set to its
+/// errno; the destination is left as it was and the temporary file is
+/// removed. A write lost on NFS may be reported only by the close. The
+/// descriptor is closed once on every path. A close that EINTR
+/// interrupts is not retried, as Linux has freed the descriptor, and is
+/// not an error, as `sys.result` treats EINTR; the fsync before it has
+/// already flushed the bytes. Shares atomicWrite's write, sync, close
+/// and rename steps, through the same ops a replaceable build may fail.
+/// Everything it allocates from `a` is freed before it returns.
+pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []const u8, mode: u32) (Allocator.Error || sys.Error)!void {
+    sys.last_errno = .SUCCESS;
+    var rnd: [4]u8 = undefined;
+    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
+    const tmp = try a.print(".{s}.{d}.{x:0>8}.tmp", .{ name, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
+    defer a.free(tmp);
+    var zb: [sys.path_max:0]u8 = undefined;
+    const ztmp = try sys.z(&zb, tmp);
+    const flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const fd: sys.fd_t = @intCast(try op(ops.openat, .{ dir, ztmp.ptr, flags, @as(linux.mode_t, 0o600) }));
+    var open = true;
+    var done = false;
+    defer {
+        if (open) closeDiscarded(fd);
+        if (!done) {
+            // The temporary name may already be gone. That failure is not
+            // the call the caller is reporting.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
+    }
+    // openat applies the umask to the create, so the exact mode the
+    // caller names is set on the descriptor before anything is written
+    _ = try op(ops.fchmod, .{ fd, mode });
+    try writeTemp(fd, data);
+    _ = try op(ops.fsync, .{fd});
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    try closeTemp(fd);
+    var zn: [sys.path_max:0]u8 = undefined;
+    _ = try op(ops.renameat, .{ dir, ztmp.ptr, dir, (try sys.z(&zn, name)).ptr });
+    done = true;
+    try sys.fsync(dir);
 }
 
 fn discard(tmp: []const u8, created: fsx.Stat) void {
+    // stat or unlink can fail when the temporary name was removed
+    // already. That failure is not the call the caller is reporting.
+    const saved = sys.last_errno;
+    defer sys.last_errno = saved;
     const cur = fsx.statAt(fsx.cwd, tmp, false) catch return;
     if (cur.dev == created.dev and cur.ino == created.ino) sys.unlinkat(fsx.cwd, tmp, 0) catch {};
+}
+
+var saved_nofile: linux.rlimit = undefined;
+var nofile_lowered = false;
+
+fn renameThenExhaustFiles(old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize {
+    const rc = linux.renameat(old_dir, old_path, new_dir, new_path);
+    if (linux.errno(rc) != .SUCCESS) return rc;
+    if (linux.errno(linux.prlimit(0, .NOFILE, null, &saved_nofile)) != .SUCCESS) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+    const none: linux.rlimit = .{ .cur = 0, .max = saved_nofile.max };
+    if (linux.errno(linux.prlimit(0, .NOFILE, &none, null)) != .SUCCESS) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+    nofile_lowered = true;
+    return rc;
+}
+
+fn restoreFileLimit() void {
+    if (nofile_lowered) _ = linux.prlimit(0, .NOFILE, &saved_nofile, null);
+    nofile_lowered = false;
 }
 
 test "Why.deinit frees a refusal's message only when it was allocated" {
@@ -537,6 +789,26 @@ test "Why.deinit frees a refusal's message only when it was allocated" {
     try std.testing.expectEqualStrings("", why.msg);
 }
 
+test "an OOM while formatting any OSError path keeps the system error" {
+    const gpa = std.testing.allocator;
+    var why: Why = .{};
+    try std.testing.expectEqual(error.NoSpace, failOs(std.testing.failing_allocator, &why, error.NoSpace, "path", null));
+    try std.testing.expectEqualStrings("refused", why.msg);
+    why.deinit(gpa);
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    try std.testing.expectEqual(error.NoSpace, failOs(failing.allocator(), &why, error.NoSpace, "path", null));
+    try std.testing.expectEqualStrings("refused", why.msg);
+    why.deinit(gpa);
+
+    for (0..3) |fail_index| {
+        var two_path_failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        try std.testing.expectEqual(error.NoSpace, failOs(two_path_failing.allocator(), &why, error.NoSpace, "old", "new"));
+        try std.testing.expectEqualStrings("refused", why.msg);
+        why.deinit(gpa);
+    }
+}
+
 test "atomicWrite keeps the mode and refuses a symlink" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -549,6 +821,7 @@ test "atomicWrite keeps the mode and refuses a symlink" {
     defer fsx.deleteTree(a, fsx.cwd, base) catch {};
     const p = try a.print("{s}/j.json", .{base});
     var why: Why = .{};
+    defer why.deinit(a);
     try atomicWrite(a, p, "one\n", .{ .mode = 0o640 }, &why);
     try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(fsx.cwd, p, false)).perm());
     try atomicWrite(a, p, "two\n", .{}, &why);
@@ -581,6 +854,7 @@ test "a step a test makes fail leaves the destination and no temporary file" {
     defer fsx.deleteTree(a, fsx.cwd, dir) catch {};
     const path = try a.print("{s}/f", .{dir});
     var why: Why = .{};
+    defer why.deinit(a);
     try atomicWrite(a, path, "old\n", .{}, &why);
     for ([_][]const u8{ "j.write", "j.fsync", "j.rename" }) |step| {
         var want: []const u8 = step;
@@ -591,7 +865,38 @@ test "a step a test makes fail leaves the destination and no temporary file" {
         defer sys.close(f.fd);
         try std.testing.expectEqualStrings("old\n", try fsx.readAll(a, f.fd, 16));
         try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, try a.print("{s}/.f.new", .{dir}), false));
+        why.deinit(a);
     }
+}
+
+test "opening a file in an unwritable directory names the temporary file" {
+    if (linux.geteuid() == 0) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try a.print("{s}/.zig-cache/atomic-ro-{d}", .{ cwd, linux.getpid() });
+    try makedirs(dir);
+    const directory = try sys.openat(fsx.cwd, dir, .{ .DIRECTORY = true }, 0);
+    _ = linux.fchmod(directory, 0o555);
+    sys.close(directory);
+    defer {
+        const again = sys.openat(fsx.cwd, dir, .{ .DIRECTORY = true }, 0) catch unreachable;
+        _ = linux.fchmod(again, 0o755);
+        sys.close(again);
+        fsx.deleteTree(a, fsx.cwd, dir) catch {};
+    }
+    const path = try a.print("{s}/metrics.prom", .{dir});
+    var why: Why = .{};
+    defer why.deinit(a);
+    try std.testing.expectError(error.AccessDenied, atomicWrite(a, path, "x\n", .{}, &why));
+    const tmp = try a.print("{s}/.metrics.prom.new", .{dir});
+    const quoted = try pytext.reprStrAlloc(a, tmp);
+    defer a.free(quoted);
+    const want = try a.print("[Errno 13] Permission denied: {s}", .{quoted});
+    try std.testing.expectEqualStrings(want, why.msg);
+    try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, tmp, false));
 }
 
 test "atomicWrite frees what it allocates" {
@@ -608,6 +913,38 @@ test "atomicWrite frees what it allocates" {
     try atomicWrite(gpa, path, "one\n", .{}, &why);
     try atomicWrite(gpa, path, "two\n", .{}, &why);
     try std.testing.expectEqual(@as(usize, 0), why.msg.len);
+}
+
+test "a post-rename parent-open failure keeps its errno" {
+    const gpa = std.testing.allocator;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/atomic-parent-open-{d}", .{ cwd, linux.getpid() });
+    defer gpa.free(dir);
+    try makedirs(dir);
+    defer fsx.deleteTree(gpa, fsx.cwd, dir) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/f", .{dir});
+    defer gpa.free(path);
+    var why: Why = .{};
+    defer why.deinit(gpa);
+    const old_ops = ops.*;
+    defer ops.* = old_ops;
+    ops.renameat = renameThenExhaustFiles;
+    defer restoreFileLimit();
+
+    try std.testing.expectError(error.Unexpected, atomicWrite(gpa, path, "new\n", .{}, &why));
+    try std.testing.expectEqual(linux.E.MFILE, sys.last_errno);
+    const quoted = try pytext.reprStrAlloc(gpa, dir);
+    defer gpa.free(quoted);
+    const want = try std.fmt.allocPrint(gpa, "[Errno 24] Too many open files: {s}", .{quoted});
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, why.msg);
+    restoreFileLimit();
+    const live = try fsx.openRegular(fsx.cwd, path, false);
+    defer sys.close(live.fd);
+    const bytes = try fsx.readAll(gpa, live.fd, 16);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("new\n", bytes);
 }
 
 test "an interrupted ACL read is retried" {
@@ -641,6 +978,63 @@ test "an interrupted ACL read is retried" {
     var why: Why = .{};
     const acls = try readAcls(gpa, fd, &why);
     defer acls.deinit(gpa);
+}
+
+test "atomicWriteAt publishes the exact mode under any umask" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-atomic-at-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+
+    // the umask bites the create but not the published mode, which is
+    // exactly what the caller names, as the metrics writer's chmod does
+    const old: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old);
+    try atomicWriteAt(gpa, dir, "metrics", "first\n", 0o644);
+    const first = try fsx.statAt(dir, "metrics", false);
+    try std.testing.expectEqual(@as(u32, 0o644), first.perm());
+
+    // an existing destination is replaced with the mode it is given and
+    // keeps its bytes when a step fails, with no temporary left behind
+    try atomicWriteAt(gpa, dir, "metrics", "second\n", 0o640);
+    const second = try fsx.statAt(dir, "metrics", false);
+    try std.testing.expectEqual(@as(u32, 0o640), second.perm());
+    const f = try fsx.openRegular(dir, "metrics", false);
+    defer sys.close(f.fd);
+    const second_text = try fsx.readAll(gpa, f.fd, 100);
+    defer gpa.free(second_text);
+    try std.testing.expectEqualStrings("second\n", second_text);
+
+    const S = struct {
+        var fail_fsync = false;
+        fn fsync(fd_: sys.fd_t) usize {
+            if (fail_fsync) return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+            return linux.fsync(fd_);
+        }
+    };
+    defer ops.* = .{};
+    S.fail_fsync = true;
+    ops.fsync = S.fsync;
+    try std.testing.expectError(error.Unexpected, atomicWriteAt(gpa, dir, "metrics", "broken\n", 0o644));
+    S.fail_fsync = false;
+    const after = try fsx.openRegular(dir, "metrics", false);
+    defer sys.close(after.fd);
+    const after_text = try fsx.readAll(gpa, after.fd, 100);
+    defer gpa.free(after_text);
+    try std.testing.expectEqualStrings("second\n", after_text);
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.name, ".tmp") == null);
+    }
 }
 
 test "the umask is read without changing it" {

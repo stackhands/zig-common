@@ -8,6 +8,7 @@ const state = @import("state.zig");
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 const atomic = @import("atomic.zig");
+const test_support = @import("test_support.zig");
 const testing = std.testing;
 const RootLock = state.RootLock;
 
@@ -37,16 +38,6 @@ fn err(e: linux.E) usize {
     return @bitCast(-@as(isize, @backingInt(e)));
 }
 
-fn fdCount(gpa: std.mem.Allocator) usize {
-    const fd = fsx.openDir(fsx.cwd, "/proc/self/fd", true) catch unreachable;
-    defer sys.close(fd);
-    var it = fsx.DirIter.init(gpa, fd) catch unreachable;
-    defer it.deinit(gpa);
-    var n: usize = 0;
-    while (it.next() catch null) |_| n += 1;
-    return n - 1; // the directory's own descriptor
-}
-
 fn waitExit(pid: isize) u32 {
     var status: u32 = 0;
     _ = linux.wait4(@intCast(pid), @ptrCast(&status), 0, null);
@@ -65,7 +56,7 @@ fn assertRemoteExcluded(root: []const u8) !void {
     if (pid == 0) {
         state.lock_ops.flock = noFlock;
         if (RootLock.acquire(A, root, 0)) |l| {
-            l.release();
+            l.release() catch unreachable;
             linux.exit_group(1);
         } else |e| linux.exit_group(if (e == error.Busy) 0 else 2);
     }
@@ -82,7 +73,7 @@ fn assertGateHeld(root: []const u8) !void {
 
 fn acquireAndRelease(root: []const u8) !void {
     const l = try RootLock.acquire(A, root, 0);
-    l.release();
+    l.release() catch unreachable;
 }
 
 test "the record lock excludes an independent kernel gate" {
@@ -90,10 +81,10 @@ test "the record lock excludes an independent kernel gate" {
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
     assertRemoteExcluded(root) catch |e| {
-        holder.release();
+        holder.release() catch unreachable;
         return e;
     };
-    holder.release();
+    holder.release() catch unreachable;
     try acquireAndRelease(root);
 }
 
@@ -101,16 +92,48 @@ test "failed local contenders keep the record lock" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
-    for (0..4) |_| try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
+    defer holder.release() catch unreachable;
+    for (0..4) |_| {
+        try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
+        try testing.expect(state.osFailure() == null);
+    }
     try assertRemoteExcluded(root);
+}
+
+var eintr_left: u8 = 0;
+
+fn eintrFlock(fd: fsx.fd_t, op: i32) usize {
+    if (eintr_left > 0 and (op & std.posix.LOCK.NB) != 0) {
+        eintr_left -= 1;
+        return err(.INTR);
+    }
+    return linux.flock(fd, op);
+}
+
+test "an interrupted non-blocking flock is retried" {
+    const root = begin();
+    defer end(root);
+    eintr_left = 1;
+    state.lock_ops.flock = eintrFlock;
+    const held = try RootLock.acquire(A, root, 0);
+    held.release() catch unreachable;
+    try testing.expectEqual(@as(u8, 0), eintr_left);
+
+    eintr_left = 1;
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const fd = (try state.openPrivate(dir, "extra", true)).?;
+    defer sys.close(fd);
+    try state.lockExclusive(fd, 0);
+    _ = linux.flock(fd, std.posix.LOCK.UN);
+    try testing.expectEqual(@as(u8, 0), eintr_left);
 }
 
 test "a second acquire by the holder keeps both locks" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     try testing.expectError(error.Busy, RootLock.acquire(A, root, 0));
     try assertGateHeld(root);
     try assertRemoteExcluded(root);
@@ -130,6 +153,9 @@ fn eioFtruncate(_: fsx.fd_t, _: i64) usize {
 fn eioWrite(_: fsx.fd_t, _: []const u8) usize {
     return err(.IO);
 }
+fn shortWrite(_: fsx.fd_t, bytes: []const u8) usize {
+    return bytes.len - 1;
+}
 fn eioOpen(_: fsx.fd_t, _: [*:0]const u8) usize {
     return err(.IO);
 }
@@ -138,19 +164,69 @@ test "acquisition errors release the descriptors and the gate" {
     const root = begin();
     defer end(root);
     inline for (.{ "flock", "fcntl", "ftruncate", "write" }) |target| {
-        const before = fdCount(A);
+        const before = try test_support.fdCount(A);
         if (comptime std.mem.eql(u8, target, "flock")) state.lock_ops.flock = eioFlock;
         if (comptime std.mem.eql(u8, target, "fcntl")) state.lock_ops.fcntl = eioFcntl;
         if (comptime std.mem.eql(u8, target, "ftruncate")) state.lock_ops.ftruncate = eioFtruncate;
         if (comptime std.mem.eql(u8, target, "write")) state.lock_ops.write = eioWrite;
         if (RootLock.acquire(A, root, null)) |l| {
-            l.release();
+            l.release() catch unreachable;
             return error.TestUnexpectedResult;
         } else |_| {}
+        const failure = state.osFailure() orelse unreachable;
+        try testing.expectEqualStrings("", failure.path);
+        try testing.expectEqualStrings("[Errno 5] Input/output error", failure.text);
         state.lock_ops.* = .{};
-        try testing.expectEqual(before, fdCount(A));
+        try testing.expectEqual(before, try test_support.fdCount(A));
         try acquireAndRelease(root);
     }
+}
+
+test "a blocking record lock records EAGAIN and EACCES" {
+    const root = begin();
+    defer end(root);
+    const Hooks = struct {
+        var code: linux.E = .AGAIN;
+        fn fail(_: fsx.fd_t, _: i32, _: usize) usize {
+            return err(code);
+        }
+    };
+    defer state.lock_ops.* = .{};
+    state.lock_ops.fcntl = Hooks.fail;
+    for ([_]linux.E{ .AGAIN, .ACCES }) |code| {
+        Hooks.code = code;
+        sys.last_errno = .SUCCESS;
+        if (RootLock.acquire(A, root, null)) |_| {
+            return error.TestUnexpectedResult;
+        } else |failed| {
+            const failure = state.osFailure() orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings("", failure.path);
+            try testing.expectEqualStrings(sys.describeErrno(code), failure.text);
+            try testing.expectEqual(code, sys.last_errno);
+            // describe of the returned error must name this errno. Returning
+            // Unexpected for EACCES makes it print an I/O error instead.
+            const sys_err = sys.asError(failed) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(failure.text, sys.describe(sys_err));
+            switch (code) {
+                .AGAIN => try testing.expectEqual(error.Unexpected, sys_err),
+                .ACCES => try testing.expectEqual(error.AccessDenied, sys_err),
+                else => unreachable,
+            }
+        }
+    }
+}
+
+test "a short pid write does not reuse a stale errno" {
+    const root = begin();
+    defer end(root);
+    const initialized = try RootLock.acquire(A, root, 0);
+    initialized.release() catch unreachable;
+    sys.last_errno = .DQUOT;
+    state.lock_ops.write = shortWrite;
+    try testing.expectError(error.NoSpace, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings("", failure.path);
+    try testing.expectEqualStrings("[Errno 28] No space left on device", failure.text);
 }
 
 test "a sidecar open failure releases the local gate" {
@@ -158,18 +234,38 @@ test "a sidecar open failure releases the local gate" {
     defer end(root);
     state.lock_ops.open_sidecar = eioOpen;
     try testing.expectError(error.Unexpected, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings(try A.print("{s}/.lock.posix", .{root}), failure.path);
+    try testing.expectEqualStrings("[Errno 5] Input/output error", failure.text);
     state.lock_ops.* = .{};
     try acquireAndRelease(root);
+}
+
+fn oPathOpen(dir: fsx.fd_t, name: [*:0]const u8) usize {
+    return linux.openat(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+}
+
+test "an fchmod failure carries no filename" {
+    const root = begin();
+    defer end(root);
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try createFile(dir, ".lock.posix", "");
+    state.lock_ops.open_sidecar = oPathOpen;
+    try testing.expectError(error.InvalidArgument, RootLock.acquire(A, root, 0));
+    const failure = state.osFailure() orelse unreachable;
+    try testing.expectEqualStrings("", failure.path);
+    try testing.expectEqualStrings("[Errno 9] Bad file descriptor", failure.text);
 }
 
 test "a forked child's release does not unlock the parent" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     const pid: isize = @bitCast(linux.fork());
     if (pid == 0) {
-        holder.release();
+        holder.release() catch unreachable;
         linux.exit_group(0);
     }
     try testing.expectEqual(@as(u32, 0), waitExit(pid));
@@ -182,12 +278,48 @@ test "a release error still closes both layers" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    const before = fdCount(A);
+    const before = try test_support.fdCount(A);
     state.lock_ops.fcntl = eioFcntl;
-    holder.release();
+    try testing.expectError(error.Unexpected, holder.release());
     state.lock_ops.* = .{};
-    try testing.expectEqual(before - 2, fdCount(A));
+    try testing.expectEqual(before - 2, try test_support.fdCount(A));
     try acquireAndRelease(root);
+}
+
+fn einvalFlock(_: fsx.fd_t, _: i32) usize {
+    return err(.INVAL);
+}
+
+fn isOpen(fd: fsx.fd_t) bool {
+    return linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) != .BADF;
+}
+
+test "a failed unlock is returned with both descriptors closed" {
+    const root = begin();
+    defer end(root);
+    const Case = struct { fcntl: bool, flock: bool, want: sys.Error, errno: linux.E, text: []const u8 };
+    // with both unlocks failing, the record lock's error and errno are the
+    // ones returned and kept, not the gate's
+    for ([_]Case{
+        .{ .fcntl = true, .flock = false, .want = error.Unexpected, .errno = .IO, .text = "[Errno 5] Input/output error" },
+        .{ .fcntl = false, .flock = true, .want = error.InvalidArgument, .errno = .INVAL, .text = "[Errno 22] Invalid argument" },
+        .{ .fcntl = true, .flock = true, .want = error.Unexpected, .errno = .IO, .text = "[Errno 5] Input/output error" },
+    }) |c| {
+        const holder = try RootLock.acquire(A, root, 0);
+        const before = try test_support.fdCount(A);
+        if (c.fcntl) state.lock_ops.fcntl = eioFcntl;
+        if (c.flock) state.lock_ops.flock = einvalFlock;
+        sys.last_errno = .SUCCESS;
+        const released = holder.release();
+        state.lock_ops.* = .{};
+        try testing.expectError(c.want, released);
+        try testing.expectEqual(c.errno, sys.last_errno);
+        try testing.expectEqualStrings(c.text, sys.describe(c.want));
+        try testing.expect(!isOpen(holder.posix));
+        try testing.expect(!isOpen(holder.gate));
+        try testing.expectEqual(before - 2, try test_support.fdCount(A));
+        try acquireAndRelease(root);
+    }
 }
 
 test "a hard-linked sidecar is refused" {
@@ -200,20 +332,22 @@ test "a hard-linked sidecar is refused" {
     var zb: [sys.path_max:0]u8 = undefined;
     _ = linux.linkat(linux.AT.FDCWD, (try sys.z(&za, sidecar)).ptr, linux.AT.FDCWD, (try sys.z(&zb, try A.print("{s}/sidecar-alias", .{root}))).ptr, 0);
     try testing.expectError(error.NotPrivate, RootLock.acquire(A, root, 0));
+    try testing.expect(state.osFailure() == null);
 }
 
 test "a timed acquire does not wait forever" {
     const root = begin();
     defer end(root);
     const holder = try RootLock.acquire(A, root, 0);
-    defer holder.release();
+    defer holder.release() catch unreachable;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try testing.expectError(error.Busy, RootLock.acquire(A, root, 200));
+    const timeout_ms: u32 = 30;
+    try testing.expectError(error.Busy, RootLock.acquire(A, root, timeout_ms));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try testing.expect(ms >= 150 and ms < 5000);
+    try testing.expect(ms + 1 >= timeout_ms);
 }
 
 // ---- files planted at the lock names ---------------------------------------
@@ -301,6 +435,7 @@ test "a gate hard-linked to another file is refused and the file keeps its bytes
     try createFile(dir, "victim", "secret");
     _ = try sys.call(linux.linkat, .{ dir, "victim", dir, ".lock", @as(u32, 0) });
     try testing.expectError(error.GateNotPrivate, RootLock.acquire(gpa, root, 0));
+    try testing.expect(state.osFailure() == null);
     try expectContents(gpa, dir, "victim", "secret");
 }
 
@@ -313,14 +448,14 @@ test "a hard link planted while the gate is awaited stops the truncate" {
     try createFile(dir, ".lock", "secret");
     plant_dir = dir;
     state.lock_ops.flock = linkThenFlock;
-    const before = fdCount(gpa);
+    const before = try test_support.fdCount(gpa);
     try testing.expectError(error.GateNotPrivate, RootLock.acquire(gpa, root, 0));
-    try testing.expectEqual(before, fdCount(gpa));
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
     try expectContents(gpa, dir, "alias", "secret");
     state.lock_ops.* = .{};
     try sys.unlinkat(dir, "alias", 0);
     const l = try RootLock.acquire(gpa, root, 0);
-    l.release();
+    l.release() catch unreachable;
 }
 
 test "a gate moved to another name while it is awaited is not truncated" {
@@ -390,7 +525,205 @@ test "both lock files are created mode 0600" {
     const root = try scratchRoot(gpa);
     defer removeRoot(gpa, root);
     const l = try RootLock.acquire(gpa, root, 0);
-    defer l.release();
+    defer l.release() catch unreachable;
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
     try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
+}
+
+test "acquire tightens existing owned lock files to mode 0600" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+
+    const gate = try sys.openat(dir, ".lock", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o644);
+    sys.close(gate);
+    const sidecar = try sys.openat(dir, ".lock.posix", .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o644);
+    sys.close(sidecar);
+    try testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, ".lock", false)).perm());
+    try testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, ".lock.posix", false)).perm());
+
+    const l = try RootLock.acquire(gpa, root, 0);
+    defer l.release() catch unreachable;
+    try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.gate)).perm());
+    try testing.expectEqual(@as(u32, 0o600), (try fsx.fstat(l.posix)).perm());
+}
+
+// ---- writePrivate: the sync and the close come before the rename ----------
+
+const WriteHooks = struct {
+    var closes: usize = 0;
+    var close_errno: linux.E = .SUCCESS;
+    var fsync_errno: linux.E = .SUCCESS;
+
+    fn set(fsync_e: linux.E, close_e: linux.E) void {
+        closes = 0;
+        fsync_errno = fsync_e;
+        close_errno = close_e;
+        state.write_ops.* = .{ .fsync = fsync, .close = close };
+    }
+    fn fsync(fd: fsx.fd_t) usize {
+        if (fsync_errno != .SUCCESS) return err(fsync_errno);
+        return linux.fsync(fd);
+    }
+    /// Linux frees the descriptor whatever close returns, so the hook
+    /// closes it for real and then reports the errno it was given, on the
+    /// first call only: a second close of the descriptor is EBADF.
+    fn close(fd: fsx.fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (close_errno == .SUCCESS or closes > 1) return rc;
+        return err(close_errno);
+    }
+};
+
+fn expectNoTemporary(gpa: std.mem.Allocator, dir: fsx.fd_t) !void {
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| try testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+}
+
+const WriteCase = struct { fsync: linux.E = .SUCCESS, close: linux.E = .SUCCESS, want: sys.Error };
+
+fn expectWriteRefused(gpa: std.mem.Allocator, cases: []const WriteCase) !void {
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try state.writePrivate(gpa, dir, "c.json", "old\n");
+    for (cases) |c| {
+        const code = if (c.close != .SUCCESS) c.close else c.fsync;
+        for ([_][]const u8{ "c.json", "fresh.json" }) |name| {
+            const before = try test_support.fdCount(gpa);
+            WriteHooks.set(c.fsync, c.close);
+            sys.last_errno = .SUCCESS;
+            const wrote = state.writePrivate(gpa, dir, name, "new\n");
+            state.write_ops.* = .{};
+            try testing.expectError(c.want, wrote);
+            try testing.expectEqual(code, sys.last_errno);
+            try testing.expectEqualStrings(sys.describeErrno(code), sys.describe(c.want));
+            try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+            try testing.expectEqual(before, try test_support.fdCount(gpa));
+            try expectNoTemporary(gpa, dir);
+        }
+        try expectContents(gpa, dir, "c.json", "old\n");
+        try testing.expectError(error.NotFound, fsx.statAt(dir, "fresh.json", false));
+    }
+}
+
+test "a failed close of the written file is returned and the name is not replaced" {
+    try expectWriteRefused(testing.allocator, &.{
+        .{ .close = .IO, .want = error.Unexpected },
+        .{ .close = .NOSPC, .want = error.NoSpace },
+        .{ .close = .DQUOT, .want = error.NoSpace },
+    });
+}
+
+test "a failed fsync of the written file is returned and the file is closed once" {
+    try expectWriteRefused(testing.allocator, &.{
+        .{ .fsync = .IO, .want = error.Unexpected },
+        .{ .fsync = .NOSPC, .want = error.NoSpace },
+    });
+}
+
+test "a close that EINTR interrupts is not retried and is not an error" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    try state.writePrivate(gpa, dir, "c.json", "old\n");
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .INTR);
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
+
+test "a sync that EINTR interrupts is retried" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const Intr = struct {
+        var syncs: usize = 0;
+        fn fsync(fd: fsx.fd_t) usize {
+            syncs += 1;
+            if (syncs == 1) return err(.INTR);
+            return linux.fsync(fd);
+        }
+    };
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .SUCCESS);
+    Intr.syncs = 0;
+    state.write_ops.fsync = Intr.fsync;
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 2), Intr.syncs);
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
+
+test "writePrivate closes the written file once when it succeeds" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .SUCCESS);
+    try state.writePrivate(gpa, dir, "c.json", "new\n");
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "c.json", "new\n");
+    try expectNoTemporary(gpa, dir);
+}
+
+test "a failed close of the file createPrivateAt creates is returned" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .IO);
+    sys.last_errno = .SUCCESS;
+    const created = state.createPrivateAt(dir, "new", "bytes\n", 0o640);
+    state.write_ops.* = .{};
+    try testing.expectError(error.Unexpected, created);
+    try testing.expectEqual(linux.E.IO, sys.last_errno);
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "new", "bytes\n");
+    try testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(dir, "new", false)).perm());
+}
+
+test "a close that EINTR interrupts is success for the file createPrivateAt creates" {
+    const gpa = testing.allocator;
+    const root = try scratchRoot(gpa);
+    defer removeRoot(gpa, root);
+    defer state.write_ops.* = .{};
+    const dir = try fsx.openDir(fsx.cwd, root, false);
+    defer sys.close(dir);
+    const before = try test_support.fdCount(gpa);
+    WriteHooks.set(.SUCCESS, .INTR);
+    try state.createPrivateAt(dir, "new", "bytes\n", 0o640);
+    state.write_ops.* = .{};
+    try testing.expectEqual(@as(usize, 1), WriteHooks.closes);
+    try testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectContents(gpa, dir, "new", "bytes\n");
+    try testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(dir, "new", false)).perm());
 }

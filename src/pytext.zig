@@ -5,6 +5,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
+const nd = @import("pytext_nd.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -97,6 +98,42 @@ pub fn pyWhitespace(cp: u21) bool {
         ' ', '\t', '\n', 0x0b, 0x0c, '\r', 0x1c...0x1f, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
         else => false,
     };
+}
+
+/// The value of the decimal digit `cp`, as unicodedata.decimal gives it, or
+/// null when `cp` has no decimal value. These are the characters Python's
+/// float() and int() read as digits.
+pub fn decimalDigit(cp: u21) ?u4 {
+    var lo: usize = 0;
+    var hi: usize = nd.zeros.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (nd.zeros[mid] <= cp) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return null;
+    const offset = cp - nd.zeros[lo - 1];
+    return if (offset < 10) @intCast(offset) else null;
+}
+
+/// `s` with each decimal digit written as the ASCII digit of its value, the
+/// way Python's float() and int() read their text before they parse it. The
+/// other characters, and the bytes that are not valid UTF-8, are copied as
+/// they are. The caller owns the result.
+pub fn decimalToAscii(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(gpa, s.len);
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = nextChar(s[i..]);
+        if (ch.cp) |cp| if (decimalDigit(cp)) |d| {
+            out.appendAssumeCapacity('0' + @as(u8, d));
+            i += ch.len;
+            continue;
+        };
+        out.appendSliceAssumeCapacity(s[i .. i + ch.len]);
+        i += ch.len;
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 /// str.strip(): `s` without leading and trailing Unicode whitespace.
@@ -283,4 +320,35 @@ test "osError and osErrorErrno format OSError messages with Python path quoting"
     const e3 = try osErrorErrno(gpa, .NAMETOOLONG, "/long");
     defer gpa.free(e3);
     try std.testing.expectEqualStrings("[Errno 36] File name too long: '/long'", e3);
+}
+
+test "decimalDigit reads the runs of ten decimal digits" {
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(0x2f));
+    try std.testing.expectEqual(@as(?u4, 0), decimalDigit('0'));
+    try std.testing.expectEqual(@as(?u4, 9), decimalDigit('9'));
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(':'));
+    try std.testing.expectEqual(@as(?u4, 3), decimalDigit(0x663));
+    try std.testing.expectEqual(@as(?u4, 9), decimalDigit(0xff19));
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(0xff1a));
+    try std.testing.expectEqual(@as(?u4, 0), decimalDigit(0x1d7ce));
+    try std.testing.expectEqual(@as(?u4, 9), decimalDigit(0x1d7ff));
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(0x1d800));
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(0xb2));
+    try std.testing.expectEqual(@as(?u4, null), decimalDigit(0x10ffff));
+}
+
+test "decimalToAscii writes decimal digits as ASCII and keeps the rest" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "", "" },
+        .{ "12.5", "12.5" },
+        .{ "\xd9\xa3", "3" },
+        .{ "\xef\xbc\x91\xef\xbc\x90_\xef\xbc\x90", "10_0" },
+        .{ "\xc2\xb2x\xff\xd9\xa7", "\xc2\xb2x\xff7" },
+    };
+    for (cases) |cs| {
+        const r = try decimalToAscii(gpa, cs[0]);
+        defer gpa.free(r);
+        try std.testing.expectEqualStrings(cs[1], r);
+    }
 }

@@ -68,6 +68,7 @@ pub threadlocal var last_errno: linux.E = .SUCCESS;
 /// null for an errno it does not name.
 pub fn errnoText(e: linux.E) ?[]const u8 {
     return switch (e) {
+        .SUCCESS => "Success",
         .PERM => "Operation not permitted",
         .NOENT => "No such file or directory",
         .SRCH => "No such process",
@@ -266,11 +267,10 @@ fn describeNamed(comptime e: linux.E) []const u8 {
         std.fmt.comptimePrint("[Errno {d}] Unknown error {d}", .{ @backingInt(e), @backingInt(e) });
 }
 
-/// The strerror text for `e`, the Zig enum tag name when `errnoText` does not
-/// name a known tag, or `"Unknown error N"` for an unnamed errno value.
+/// The strerror text for `e`, or `"Unknown error N"` when `errnoText` does
+/// not name it, matching glibc's `strerror` and Python's `os.strerror`.
 pub fn strerror(e: linux.E) []const u8 {
     if (errnoText(e)) |text| return text;
-    if (std.enums.tagName(linux.E, e)) |name| return name;
     const S = struct {
         threadlocal var buf: [32]u8 = undefined;
     };
@@ -353,6 +353,17 @@ pub fn close(fd: fd_t) void {
     _ = linux.close(fd);
 }
 
+/// Move an open descriptor out of the standard-stream slots 0, 1 and 2.
+/// A descriptor already at 3 or above is returned unchanged; one in 0..2
+/// is duplicated to 3 or above with `FD_CLOEXEC` set and closed at its
+/// original slot. On error the original descriptor is left open.
+pub fn keepAboveStdio(fd: fd_t) Error!fd_t {
+    if (fd >= 3) return fd;
+    const moved = try call(linux.fcntl, .{ fd, linux.F.DUPFD_CLOEXEC, @as(usize, 3) });
+    close(fd);
+    return @intCast(moved);
+}
+
 /// read(2) into `buf`: the number of bytes read, 0 at the end of the file.
 pub fn read(fd: fd_t, buf: []u8) Error!usize {
     return call(linux.read, .{ fd, buf.ptr, buf.len });
@@ -426,18 +437,6 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
     try std.testing.expectEqualStrings("No such file or directory", strerror(.NOENT));
     try std.testing.expectEqualStrings("File name too long", strerror(.NAMETOOLONG));
-    const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
-    defer close(compat_fd);
-    var compat: std.ArrayList(u8) = .empty;
-    defer compat.deinit(std.testing.allocator);
-    var chunk: [512]u8 = undefined;
-    while (true) {
-        const n = try read(compat_fd, &chunk);
-        if (n == 0) break;
-        try compat.appendSlice(std.testing.allocator, chunk[0..n]);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
 }
 
 test "strerror formats unnamed errno values instead of panicking" {
@@ -449,8 +448,8 @@ test "strerror formats unnamed errno values instead of panicking" {
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
 }
 
-test "errnoText returns null for unknown errnos and sys wrappers surface expected errors" {
-    try std.testing.expectEqual(@as(?[]const u8, null), errnoText(.SUCCESS));
+test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {
+    try std.testing.expectEqualStrings("Success", errnoText(.SUCCESS).?);
     var raw: u16 = 134;
     try std.testing.expectEqual(@as(?[]const u8, null), errnoText(@fromBackingInt(raw)));
     raw = 999;
@@ -479,4 +478,114 @@ test "errnoText returns null for unknown errnos and sys wrappers surface expecte
         defer close(full_fd);
         try std.testing.expectError(error.NoSpace, writeAll(full_fd, "x"));
     } else |_| {}
+}
+
+test "keepAboveStdio moves descriptors 0, 1 and 2 above 2 with close-on-exec" {
+    const high_fd = try openat(linux.AT.FDCWD, "/dev/null", .{}, 0);
+    defer close(high_fd);
+    try std.testing.expect(high_fd >= 3);
+    try std.testing.expectEqual(high_fd, try keepAboveStdio(high_fd));
+    try std.testing.expectError(error.InvalidArgument, keepAboveStdio(-1));
+    try std.testing.expectEqual(linux.E.BADF, last_errno);
+
+    const pid: isize = @bitCast(linux.fork());
+    if (pid == 0) {
+        close(0);
+        close(1);
+        close(2);
+        const a = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(10);
+        const b = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(11);
+        const c = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(12);
+        if (a != 0 or b != 1 or c != 2) linux.exit_group(13);
+
+        for ([_]fd_t{ a, b, c }) |low| {
+            const moved = keepAboveStdio(low) catch linux.exit_group(14);
+            if (moved < 3) linux.exit_group(15);
+            const flags = linux.fcntl(moved, linux.F.GETFD, 0);
+            if (linux.errno(flags) != .SUCCESS or (flags & linux.FD_CLOEXEC) == 0) linux.exit_group(16);
+            if (linux.errno(linux.fcntl(low, linux.F.GETFD, 0)) != .BADF) linux.exit_group(17);
+            defer close(moved);
+        }
+
+        _ = keepAboveStdio(0) catch |err| {
+            if (err != error.InvalidArgument or last_errno != .BADF) linux.exit_group(18);
+            linux.exit_group(0);
+        };
+        linux.exit_group(19);
+    }
+    try std.testing.expect(pid > 0);
+    var status: i32 = 0;
+    _ = try call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
+    try std.testing.expectEqual(@as(i32, 0), status);
+}
+
+test "keepAboveStdio reports duplication failure when the descriptor table is full" {
+    // A limit of 3 makes F_DUPFD with a minimum of 3 return EINVAL. The
+    // soft limit stays above that, and the child fills every slot it
+    // allows, so the failure is EMFILE. The limit is restored before
+    // the child exits.
+    const Child = struct {
+        fn run() u8 {
+            var saved: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &saved)) != .SUCCESS) return 20;
+            if (linux.errno(linux.fcntl(0, linux.F.GETFD, 0)) != .SUCCESS) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch return 21;
+                if (fd != 0) {
+                    if (linux.errno(linux.dup2(fd, 0)) != .SUCCESS) {
+                        close(fd);
+                        return 22;
+                    }
+                    close(fd);
+                }
+            }
+            if (saved.max < 4) return 23;
+            const cap = @min(saved.max, @as(linux.rlim_t, 8));
+            const tightened: linux.rlimit = .{ .cur = cap, .max = saved.max };
+            if (linux.errno(linux.setrlimit(.NOFILE, &tightened)) != .SUCCESS) return 24;
+            defer _ = linux.setrlimit(.NOFILE, &saved);
+
+            var extras: [16]fd_t = undefined;
+            var n_extra: usize = 0;
+            defer for (extras[0..n_extra]) |fd| close(fd);
+
+            var hit = false;
+            while (n_extra < extras.len) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch |err| {
+                    if (err == error.Unexpected and last_errno == .MFILE) {
+                        hit = true;
+                        break;
+                    }
+                    return 25;
+                };
+                if (@as(linux.rlim_t, @intCast(fd)) >= cap) {
+                    close(fd);
+                    return 26;
+                }
+                extras[n_extra] = fd;
+                n_extra += 1;
+            }
+            if (!hit) return 27;
+
+            const low: fd_t = 0;
+            if (keepAboveStdio(low)) |_| {
+                return 28;
+            } else |err| {
+                // EMFILE is not its own error. The call reports it as
+                // Unexpected, and last_errno keeps the kernel's value.
+                if (err != error.Unexpected or last_errno != .MFILE) return 29;
+                if (!std.mem.eql(u8, describe(err), "[Errno 24] Too many open files")) return 30;
+            }
+            // On error the original descriptor is left open.
+            if (linux.errno(linux.fcntl(low, linux.F.GETFD, 0)) != .SUCCESS) return 31;
+
+            if (linux.errno(linux.setrlimit(.NOFILE, &saved)) != .SUCCESS) return 32;
+            var back: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &back)) != .SUCCESS) return 33;
+            if (back.cur != saved.cur or back.max != saved.max) return 34;
+            return 0;
+        }
+    };
+
+    const test_support = @import("test_support.zig");
+    try test_support.expectChildPasses(Child.run);
 }

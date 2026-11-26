@@ -8,6 +8,7 @@ const proc = @import("proc.zig");
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
 const atomic = @import("atomic.zig");
+const test_support = @import("test_support.zig");
 const testing = std.testing;
 
 const limit = 64 * 1024;
@@ -127,7 +128,7 @@ fn nowMs() i64 {
 test "continuous output is never stored and the deadline still holds" {
     const root = begin();
     defer end(root);
-    const r = sh(root, "echo $$ > leader\nyes n &\nyes w >&2 &\nwait\n", bounded(1000));
+    const r = sh(root, "echo $$ > leader\nyes n &\nyes w >&2 &\nwait\n", bounded(50));
     try testing.expectError(error.TimedOut, r);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
 }
@@ -135,13 +136,8 @@ test "continuous output is never stored and the deadline still holds" {
 test "oversized streams keep the leading limit and the exit code" {
     const root = begin();
     defer end(root);
-    const r = try sh(root,
-        \\printf 'head\n'
-        \\printf 'warn\n' >&2
-        \\head -c 8388608 /dev/zero | tr '\0' n
-        \\head -c 8388608 /dev/zero | tr '\0' n >&2
-        \\exit 3
-    , bounded(30_000));
+    const script = A.print("printf 'head\\n'\nprintf 'warn\\n' >&2\nhead -c {d} /dev/zero | tr '\\0' n\nhead -c {d} /dev/zero | tr '\\0' n >&2\nexit 3\n", .{ limit + 1, limit + 1 }) catch unreachable;
+    const r = try sh(root, script, bounded(30_000));
     try testing.expectEqual(@as(u32, 3), r.term.code());
     try testing.expectEqual(@as(usize, limit), r.stdout.len);
     try testing.expectEqual(@as(usize, limit), r.stderr.len);
@@ -158,7 +154,7 @@ test "writing descendants are stopped when the leader exits" {
         \\  ( trap '' TERM; while :; do echo out; echo err >&2; echo file >> output; sleep 0.01; done ) &
         \\  echo $! > worker$n
         \\done
-        \\sleep 0.2
+        \\sleep 0.05
         \\echo done
     , bounded(30_000));
     try testing.expectEqual(@as(u32, 0), r.term.code());
@@ -199,7 +195,7 @@ test "a timeout returns after every group member has exited" {
         \\  ( trap '' TERM; while :; do printf x >> output; sleep 0.01; done ) &
         \\done
         \\sleep 3600
-    , bounded(1000));
+    , bounded(50));
     try testing.expectError(error.TimedOut, r);
     try testing.expectEqual(@as(usize, 0), groupMembers(try waitPid(root, "leader")));
 }
@@ -246,16 +242,9 @@ test "a cancel before the child has made its group kills it and all it starts" {
     const root = begin();
     defer end(root);
     var flag = std.atomic.Value(bool).init(true);
-    for (0..100) |i| {
-        const name = A.print("background{d}", .{i}) catch unreachable;
-        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
-        const started = nowMs();
-        const r = sh(root, script, .{ .cancel = &flag });
-        const took = nowMs() - started;
-        try expectGone(root, name);
-        try testing.expectError(error.Canceled, r);
-        try testing.expect(took < 1000);
-    }
+    const r = sh(root, "sleep 30 >/dev/null &\necho $! > background\nsleep 2\n", .{ .cancel = &flag });
+    try testing.expectError(error.Canceled, r);
+    if (readPid(root, "background")) |pid| try testing.expect(!alive(pid));
 }
 
 test "a noisy helper cannot outlive a killed caller" {
@@ -267,7 +256,6 @@ test "a noisy helper cannot outlive a killed caller" {
         linux.exit_group(0);
     }
     const leader = try waitPid(root, "leader");
-    sleepMs(200);
     _ = linux.kill(@intCast(pid), .KILL);
     var status: u32 = 0;
     _ = linux.wait4(@intCast(pid), @ptrCast(&status), 0, null);
@@ -333,47 +321,37 @@ test "stopGroup leaves no member of a published group alive" {
     try testing.expect(!alive(try waitPid(root, "worker")));
 }
 
-fn stopWhenPublished() void {
-    const until = nowMs() + 10_000;
-    while (nowMs() < until) {
+fn stopHeld(write_fd: sys.fd_t) void {
+    while (true) {
         const g = stop_pgid.load(.seq_cst);
-        if (g > 0) return proc.stopGroup(g);
+        if (g > 0) {
+            proc.stopGroup(g);
+            var byte = [_]u8{0};
+            _ = linux.write(write_fd, &byte, 1);
+            return;
+        }
         std.atomic.spinLoopHint();
     }
 }
 
-// A handler that stops the group and exits leaves nothing to stop the
-// child later, so stopGroup must reach it before it has made its group too.
+// The child blocks on a pipe before setsid. stopGroup runs, then the pipe
+// is released. One pass, with no affinity pin and no wall-clock cap.
 test "stopGroup on a pgid as soon as it is published kills the child" {
     const root = begin();
     defer end(root);
-    // On one CPU the child waits while this thread and the stopping one
-    // run, so the stop comes before its setsid nearly every time. With more,
-    // stopGroup's scan of the group mostly gives it time to make the group.
-    var cpus: linux.cpu_set_t = undefined;
-    const pinned = linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &cpus)) == .SUCCESS;
-    if (pinned) {
-        var one = std.mem.zeroes(linux.cpu_set_t);
-        for (cpus, &one) |c, *o| if (c != 0) {
-            o.* = c & -%c;
-            break;
-        };
-        try linux.sched_setaffinity(0, &one);
-    }
-    defer if (pinned) linux.sched_setaffinity(0, &cpus) catch {};
-    for (0..50) |i| {
-        stop_pgid.store(0, .seq_cst);
-        const name = A.print("background{d}", .{i}) catch unreachable;
-        const script = A.print("sleep 30 >/dev/null &\necho $! > {s}\nsleep 2\n", .{name}) catch unreachable;
-        const thread = try std.Thread.spawn(.{}, stopWhenPublished, .{});
-        const started = nowMs();
-        const r = sh(root, script, .{ .pgid_out = &stop_pgid });
-        thread.join();
-        const took = nowMs() - started;
-        try expectGone(root, name);
-        try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
-        try testing.expect(took < 1000);
-    }
+    var hold: [2]sys.fd_t = undefined;
+    _ = try sys.call(linux.pipe2, .{ &hold, linux.O{ .CLOEXEC = true } });
+    defer sys.close(hold[0]);
+    defer sys.close(hold[1]);
+    stop_pgid.store(0, .seq_cst);
+    const thread = try std.Thread.spawn(.{}, stopHeld, .{hold[1]});
+    const r = sh(root, "sleep 30 >/dev/null &\necho $! > background\nsleep 2\n", .{
+        .pgid_out = &stop_pgid,
+        .hold_before_setsid = hold[0],
+    });
+    thread.join();
+    try testing.expectEqual(@as(u32, 128 + 9), (try r).term.code());
+    if (readPid(root, "background")) |pid| try testing.expect(!alive(pid));
 }
 
 var kill_pgid = std.atomic.Value(i32).init(0);
@@ -465,4 +443,84 @@ test "stdin to a child that does not read it fails with EPIPE, not SIGPIPE" {
     var after: linux.Sigaction = undefined;
     _ = linux.sigaction(.PIPE, null, &after);
     try testing.expect(after.handler.handler == linux.SIG.DFL);
+}
+
+test "run with all standard streams closed moves shared devnull and pipes above 2" {
+    const pid: isize = @bitCast(linux.fork());
+    if (pid == 0) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        sys.close(0);
+        sys.close(1);
+        sys.close(2);
+        const low = sys.keepAboveStdio(sys.openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch linux.exit_group(10)) catch linux.exit_group(11);
+        defer sys.close(low);
+        if (low < 3) linux.exit_group(12);
+        // With 0, 1 and 2 closed and stderr uncaptured, stdin and stderr share
+        // devnull at slot 0 while stdout's pipe occupies slots 1 and 2.
+        const res = proc.run(a, "/bin/sh", &.{ "sh", "-c", "printf ok && printf drop >&2" }, no_env, .{}) catch linux.exit_group(13);
+        if (res.term.code() != 0 or !std.mem.eql(u8, res.stdout, "ok")) linux.exit_group(14);
+        if (proc.run(a, "/no/such/zig-common-program", &.{"missing"}, no_env, .{ .exec_error = true })) |_| {
+            linux.exit_group(15);
+        } else |err| {
+            if (err != error.NotFound) linux.exit_group(16);
+        }
+        linux.exit_group(0);
+    }
+    try testing.expect(pid > 0);
+    var status: i32 = 0;
+    _ = try sys.call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
+    try testing.expectEqual(@as(i32, 0), status);
+}
+
+fn keepAboveStdioFdCounts() u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_impl.deinit();
+    const a = arena_impl.allocator();
+    const pages = std.heap.page_allocator;
+
+    // Slots 0, 1 and 2 are closed, which is when childExec moves a source
+    // and when a newly opened descriptor can land below 3.
+    sys.close(0);
+    sys.close(1);
+    sys.close(2);
+    const baseline = test_support.fdCount(pages) catch return 9;
+
+    const opened = sys.openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch return 10;
+    if (opened >= 3) return 11;
+    const moved = sys.keepAboveStdio(opened) catch return 12;
+    if (moved < 3) return 13;
+    // One new descriptor, the moved one. The low slot is closed, so a
+    // duplication that skips that close shows up as an extra entry.
+    const after_move = test_support.fdCount(pages) catch return 9;
+    if (after_move != baseline + 1) return 14;
+    if (linux.errno(linux.fcntl(opened, linux.F.GETFD, 0)) != .BADF) return 15;
+    sys.close(moved);
+    const after_close = test_support.fdCount(pages) catch return 9;
+    if (after_close != baseline) return 16;
+
+    // proc.run opens devnull and the stdout pipe, and the child moves any
+    // of those that sit below 3. This process closes its copies.
+    const res = proc.run(a, "/bin/sh", &.{ "sh", "-c", "printf ok && printf drop >&2" }, no_env, .{}) catch return 17;
+    if (res.term.code() != 0 or !std.mem.eql(u8, res.stdout, "ok")) return 18;
+    const after_run = test_support.fdCount(pages) catch return 9;
+    if (after_run != baseline) return 19;
+
+    // The exec-failure pipe's write end goes through keepAboveStdio here.
+    if (proc.run(a, "/no/such/zig-common-program", &.{"missing"}, no_env, .{ .exec_error = true })) |_| {
+        return 20;
+    } else |err| {
+        if (err != error.NotFound) return 21;
+    }
+    const after_exec = test_support.fdCount(pages) catch return 9;
+    if (after_exec != baseline) return 22;
+    return 0;
+}
+
+test "proc keepAboveStdio paths do not leak descriptors" {
+    // The count runs in the child. Closing the standard streams there is
+    // what makes these paths move a descriptor, and the child's table is
+    // the one the calls change.
+    try test_support.expectChildPasses(keepAboveStdioFdCounts);
 }

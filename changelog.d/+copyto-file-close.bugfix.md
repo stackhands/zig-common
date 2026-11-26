@@ -1,0 +1,1 @@
+`fsx.copyTo` closes the temporary file before the rename that publishes it. A failed close is returned with `sys.last_errno` set, the destination keeps its old contents, and the temporary file is removed. A close that `EINTR` interrupts counts as success and is not retried. The caller still gets an open descriptor of the published file.

@@ -30,6 +30,7 @@ Error set: [[zig:zig_common.sys.Error]].
 | [[zig:zig_common.sys.z]]               | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.openat]]          | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.close]]           | none                          |
+| [[zig:zig_common.sys.keepAboveStdio]]  | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.read]]            | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.writeAll]]        | [[zig:zig_common.sys.Error]]  |
 | [[zig:zig_common.sys.fchmod]]          | [[zig:zig_common.sys.Error]]  |
@@ -83,19 +84,25 @@ Error set: [[zig:zig_common.proc.Error]].
 *** =zig_common.logs=
 
 Error set: [[zig:zig_common.logs.GzipError]].
+Step set: [[zig:zig_common.logs.GzipStep]], which =gzipInPlaceAtStep= sets to the step an error came from.
 
-| Function                               | Error set                           |
-|----------------------------------------+-------------------------------------|
-| [[zig:zig_common.logs.gzipInPlace]]    | [[zig:zig_common.logs.GzipError]]   |
-| [[zig:zig_common.logs.renameInList]]   | =Allocator.Error=                   |
+| Function                                   | Error set                           |
+|--------------------------------------------+-------------------------------------|
+| [[zig:zig_common.logs.gzipInPlace]]        | [[zig:zig_common.logs.GzipError]]   |
+| [[zig:zig_common.logs.gzipInPlaceAtStep]]  | [[zig:zig_common.logs.GzipError]]   |
+| [[zig:zig_common.logs.renameInList]]       | =Allocator.Error=                   |
 
 *** =zig_common.cli=
 
 | Function                               | Error set |
 |----------------------------------------+-----------|
+| [[zig:zig_common.cli.Stdout.write]]    | none      |
+| [[zig:zig_common.cli.Stdout.print]]    | none      |
+| [[zig:zig_common.cli.Stdout.finish]]   | none      |
 | [[zig:zig_common.cli.put]]             | none      |
 | [[zig:zig_common.cli.print]]           | none      |
 | [[zig:zig_common.cli.out]]             | none      |
+| [[zig:zig_common.cli.writeOut]]        | none      |
 | [[zig:zig_common.cli.err]]             | none      |
 | [[zig:zig_common.cli.die]]             | none      |
 | [[zig:zig_common.cli.versionLine]]     | none      |
@@ -123,7 +130,7 @@ Error sets: [[zig:zig_common.state.Error]], [[zig:zig_common.state.RootLock.Acqu
 | Function                                    | Error set                                         |
 |---------------------------------------------+---------------------------------------------------|
 | [[zig:zig_common.state.RootLock.acquire]]   | [[zig:zig_common.state.RootLock.AcquireError]]    |
-| [[zig:zig_common.state.RootLock.release]]   | none                                              |
+| [[zig:zig_common.state.RootLock.release]]   | [[zig:zig_common.sys.Error]]                      |
 | [[zig:zig_common.state.privateOk]]          | none                                              |
 | [[zig:zig_common.state.openPrivate]]        | [[zig:zig_common.state.Error]]                    |
 | [[zig:zig_common.state.lockExclusive]]      | [[zig:zig_common.state.LockError]]                |
@@ -157,6 +164,8 @@ Error sets: [[zig:zig_common.json.ParseError]], [[zig:zig_common.json.DecodeErro
 | [[zig:zig_common.pytext.decodeReplace]]| =Allocator.Error= |
 | [[zig:zig_common.pytext.pyWhitespace]] | none              |
 | [[zig:zig_common.pytext.pyStrip]]      | none              |
+| [[zig:zig_common.pytext.decimalDigit]] | none              |
+| [[zig:zig_common.pytext.decimalToAscii]]| =Allocator.Error= |
 | [[zig:zig_common.pytext.pySplit]]      | =Allocator.Error= |
 | [[zig:zig_common.pytext.shellQuote]]   | =Allocator.Error= |
 | [[zig:zig_common.pytext.reprStr]]      | =Allocator.Error= |

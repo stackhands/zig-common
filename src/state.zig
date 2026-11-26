@@ -12,6 +12,69 @@ const Allocator = std.mem.Allocator;
 /// The errors of this module's calls: `sys.Error`.
 pub const Error = sys.Error;
 
+/// Python's text for the OSError that made the latest `RootLock.acquire`
+/// fail, snapshotted before a later close. `path` is empty when Python
+/// names no file (a write, flush, or lock on an open descriptor). Absent
+/// when the failure was not an operating-system error.
+pub const OsFailure = struct { text: []const u8, path: []const u8 };
+
+threadlocal var os_noted: bool = false;
+threadlocal var os_text: [128]u8 = undefined;
+threadlocal var os_text_len: usize = 0;
+threadlocal var os_path: [sys.path_max]u8 = undefined;
+threadlocal var os_path_len: usize = 0;
+
+/// The OSError recorded for the latest `RootLock.acquire` on this thread.
+/// Null when that acquire has not failed, or failed for a reason that is
+/// not an operating-system error. `text` is Python's "[Errno N] ..." line
+/// without a filename. `path` is the file that call would name, or empty
+/// when it names none, such as a write or a lock on an open descriptor.
+///
+/// Both slices refer to thread-local storage. The next `RootLock.acquire`
+/// on this thread reuses that storage, so copy them before calling it
+/// again.
+pub fn osFailure() ?OsFailure {
+    if (!os_noted) return null;
+    return .{ .text = os_text[0..os_text_len], .path = os_path[0..os_path_len] };
+}
+
+fn clearOsFailure() void {
+    os_noted = false;
+    os_text_len = 0;
+    os_path_len = 0;
+}
+
+fn noteText(text: []const u8, path: ?[]const u8) void {
+    const n = @min(text.len, os_text.len);
+    @memcpy(os_text[0..n], text[0..n]);
+    os_text_len = n;
+    if (path) |p| {
+        const m = @min(p.len, os_path.len);
+        @memcpy(os_path[0..m], p[0..m]);
+        os_path_len = m;
+    } else os_path_len = 0;
+    os_noted = true;
+}
+
+fn noted(err: Error, path: ?[]const u8) Error {
+    noteText(sys.describe(err), path);
+    return err;
+}
+
+fn notedUnder(err: Error, root: []const u8, name: []const u8) Error {
+    noteText(sys.describe(err), null);
+    var n: usize = 0;
+    const root_part = if (std.mem.eql(u8, root, "/")) "" else root;
+    const parts = [_][]const u8{ root_part, "/", name };
+    for (parts) |part| {
+        const take = @min(part.len, os_path.len - n);
+        @memcpy(os_path[n..][0..take], part[0..take]);
+        n += take;
+    }
+    os_path_len = n;
+    return err;
+}
+
 /// Regular, owned by `uid`, one link, mode & 0o077 == 0.
 pub fn privateOk(st: fsx.Stat, uid: linux.uid_t) bool {
     return st.isReg() and st.uid == uid and st.nlink == 1 and st.mode & 0o077 == 0;
@@ -41,7 +104,25 @@ pub fn openPrivate(dir: fsx.fd_t, name: []const u8, create: bool) Error!?fsx.fd_
     return fd;
 }
 
-/// The errors of `lockExclusive`: the `sys.Error` of a failed flock, or
+/// The state root pre-check `RootLock.acquire` applies: a root that
+/// exists and is not a directory once symbolic links are followed is
+/// ENOTDIR, a dangling link and a link loop among them, and a missing
+/// name passes for makedirs to create. The Python tool reaches its
+/// lexists-and-not-isdir line only after its component check has found
+/// no symlink, since that check refuses a symlinked root as unsafe
+/// first; a symlinked root is not this pre-check's to refuse either
+/// way, and RootLock keeps its own NotDir from the open that does not
+/// follow it, a known difference in the message alone.
+pub fn preflightRoot(root: []const u8) Error!void {
+    if (fsx.statAt(fsx.cwd, root, true)) |st| {
+        if (st.isDir()) return;
+        return error.NotDir;
+    } else |_| {}
+    // isdir says no; a name that still exists is a link it could not
+    // follow, a dangling link among them, and is ENOTDIR.
+    if (fsx.statAt(fsx.cwd, root, false)) |_| return error.NotDir else |_| {}
+}
+
 /// `error.TimedOut` when another holder kept the lock past the timeout.
 pub const LockError = Error || error{TimedOut};
 
@@ -50,11 +131,14 @@ pub const LockError = Error || error{TimedOut};
 pub const LockCancelError = LockError || error{Canceled};
 
 /// flock(LOCK_EX) on `fd`, giving up after `timeout_ms` when one is given.
-/// The deadline is read from the monotonic clock. A signal that cuts a
-/// sleep short does not consume the whole wait: the next check looks at
-/// the clock again. A failure other than contention is the flock error,
-/// with its errno in `sys.last_errno`.
-pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
+/// The timeout is u64 milliseconds, wide enough for the seconds callers
+/// like flock -w take: the largest a tool passes is 999_999_999 seconds,
+/// whose milliseconds a u32 could not hold. The deadline is read from
+/// the monotonic clock. A signal that cuts a sleep short does not
+/// consume the whole wait: the next check looks at the clock again. A
+/// failure other than contention is the flock error, with its errno in
+/// `sys.last_errno`.
+pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u64) LockError!void {
     return lockExclusiveCancel(fd, timeout_ms, null) catch |err| switch (err) {
         error.Canceled => unreachable,
         else => |e| return e,
@@ -63,8 +147,8 @@ pub fn lockExclusive(fd: fsx.fd_t, timeout_ms: ?u32) LockError!void {
 
 /// Like `lockExclusive`, also stopping with `error.Canceled` if `cancel`
 /// becomes true while waiting.
-pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
-    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + ms else null;
+pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u64, cancel: ?*const std.atomic.Value(bool)) LockCancelError!void {
+    const deadline: ?i64 = if (timeout_ms) |ms| nowMs() + @as(i64, @intCast(ms)) else null;
     if (deadline == null and cancel == null) {
         _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
         return;
@@ -74,7 +158,8 @@ pub fn lockExclusiveCancel(fd: fsx.fd_t, timeout_ms: ?u32, cancel: ?*const std.a
         const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
         switch (linux.errno(rc)) {
             .SUCCESS => return,
-            .AGAIN, .INTR => {},
+            .INTR => continue,
+            .AGAIN => {},
             else => return mapped(rc),
         }
         var sleep_ms: i64 = 20;
@@ -99,23 +184,134 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
     };
 }
 
+/// Create `dir/name` with `bytes` at exactly `mode`, never replacing an
+/// existing name: the create is O_EXCL with O_NOFOLLOW, an existing
+/// name is `error.Exists`, and the mode is set on the descriptor so the
+/// umask cannot bite it. The name is created and closed in one step;
+/// nothing is renamed, so another name's file is never touched. A
+/// symbolic link at the name is refused without being followed, as
+/// `openPrivate` refuses one. The descriptor is closed once on every
+/// path. A failed close is returned with
+/// `sys.last_errno` set to its errno. The created name is left in place
+/// on a failed close, and on a failed fchmod or write: nothing unlinks
+/// it. A write lost on NFS may be reported only by the close. A close
+/// that EINTR interrupts is not retried, as Linux has freed the
+/// descriptor, and is not an error, as `sys.result` treats EINTR. A
+/// close that only releases the descriptor after an earlier error
+/// ignores its result, so `sys.last_errno` stays that error's errno.
+pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode: u32) Error!void {
+    const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, 0o600);
+    var open = true;
+    defer {
+        if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = write_ops.close(fd);
+        }
+    }
+    try sys.fchmod(fd, mode);
+    try sys.writeAll(fd, bytes);
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
+}
+
 /// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
-/// mode 0600, then renamed over the name.
+/// mode 0600, flushed with fsync and closed, then renamed over the name.
+/// A failed write, fchmod, fsync or close is returned with `sys.last_errno`
+/// set to its errno; the name is left as it was and the temporary file is
+/// removed. A write lost on NFS may be reported only by the close. The
+/// descriptor is closed once on every path. A close that EINTR
+/// interrupts is not retried, as Linux has freed the descriptor, and is
+/// not an error, as `sys.result` treats EINTR; the fsync before it has
+/// already flushed the bytes.
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const tmp = try gpa.print(".{s}.{d}.{x}.tmp", .{ name, linux.getpid(), rnd });
+    const parent = std.fs.path.dirname(name) orelse ".";
+    const base = std.fs.path.basename(name);
+    const tmp = try gpa.print("{s}/.{s}.{d}.{x}.tmp", .{ parent, base, linux.getpid(), rnd });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (open) _ = write_ops.close(fd);
+        if (!done) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     try sys.writeAll(fd, bytes);
     try sys.fchmod(fd, 0o600);
+    _ = try lockCall(write_ops.fsync, .{fd});
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
     try sys.renameat(dir, tmp, dir, name);
     done = true;
+}
+
+/// Raw results of the calls `writePrivate` makes on its temporary file
+/// (`fsync` and `close`) and of the close `createPrivateAt` checks on
+/// the file it creates. Replaceable in the same builds as `lock_ops`;
+/// constant real calls in any other build.
+pub const WriteOps = struct {
+    fsync: *const fn (fd: fsx.fd_t) usize = realFsync,
+    close: *const fn (fd: fsx.fd_t) usize = realClose,
+};
+
+var test_write_ops: WriteOps = .{};
+const real_write_ops: WriteOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`write_ops.* = ...`); any other build points it at constant real calls.
+pub const write_ops = if (@import("atomic.zig").replaceable) &test_write_ops else &real_write_ops;
+
+fn realFsync(fd: fsx.fd_t) usize {
+    return linux.fsync(fd);
+}
+fn realClose(fd: fsx.fd_t) usize {
+    return linux.close(fd);
+}
+
+test "createPrivateAt creates without clobbering" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-create-at-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(d);
+
+    // a fresh name at an exact mode under a restrictive umask
+    const old: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old);
+    try createPrivateAt(d, "new", "bytes\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(d, "new", false)).perm());
+
+    // an existing name is refused with its bytes untouched
+    try std.testing.expectError(error.Exists, createPrivateAt(d, "new", "second\n", 0o600));
+    const f = try fsx.openRegular(d, "new", false);
+    defer sys.close(f.fd);
+    const got = try fsx.readAll(gpa, f.fd, 100);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("bytes\n", got);
+
+    // a symbolic link at the name is refused, not followed
+    _ = linux.symlinkat("new", d, (try sys.z(&zb, "link")).ptr);
+    try std.testing.expectError(error.Exists, createPrivateAt(d, "link", "x\n", 0o600));
+
+    // a name under a directory the caller already holds is created there
+    var nb: [sys.path_max]u8 = undefined;
+    const nested_name = try std.mem.print(&nb, "{s}/nested", .{base});
+    try createPrivateAt(fsx.cwd, nested_name, "n\n", 0o600);
+    const nested = try fsx.openRegular(fsx.cwd, nested_name, false);
+    defer sys.close(nested.fd);
+    try std.testing.expectEqual(@as(u32, 0o600), nested.stat.perm());
 }
 
 test "a file that is not private is not read" {
@@ -148,6 +344,27 @@ test "a file that is not private is not read" {
     try lockExclusive(lk, 100);
 }
 
+test "writePrivate handles nested names under the opened directory" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-state-nested-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+    _ = linux.mkdirat(d, (try sys.z(&zb, "sub")).ptr, 0o700);
+
+    try writePrivate(gpa, d, "sub/c.json", "{\"v\":2}\n");
+    const got = (try readPrivate(gpa, d, "sub/c.json", 1024)).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("{\"v\":2}\n", got);
+}
+
 fn onUsr1(_: linux.SIG) callconv(.c) void {}
 
 test "lockExclusive waits out the timeout while signals arrive" {
@@ -174,40 +391,72 @@ test "lockExclusive waits out the timeout while signals arrive" {
     var prev: linux.Sigaction = undefined;
     _ = linux.sigaction(.USR1, &handler, &prev);
     defer _ = linux.sigaction(.USR1, &prev, null);
-    const Stop = struct {
-        var go = std.atomic.Value(bool).init(true);
-        fn buzz() void {
-            // This thread must not catch SIGUSR1, or the waiter's sleep is
-            // never the one the signal interrupts.
-            var blocked = linux.sigemptyset();
-            linux.sigaddset(&blocked, .USR1);
-            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            while (go.load(.acquire)) {
-                _ = linux.kill(linux.getpid(), .USR1);
-                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
+    const Ping = struct {
+        var go = std.atomic.Value(bool).init(false);
+        fn once() void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            _ = linux.kill(linux.getpid(), .USR1);
         }
     };
-    Stop.go.store(true, .release);
-    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
+    Ping.go.store(false, .release);
+    const ping = try std.Thread.spawn(.{}, Ping.once, .{});
+    defer ping.join();
+    const timeout_ms: u64 = 30;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 400));
+    Ping.go.store(true, .release);
+    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, timeout_ms));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
-    Stop.go.store(false, .release);
-    buzz.join();
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try std.testing.expect(ms >= 300 and ms < 5000);
+    try std.testing.expect(ms + 1 >= timeout_ms);
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
-    for ([_]?u32{ null, 0, 50 }) |timeout| {
+    for ([_]?u64{ null, 0, 50 }) |timeout| {
         sys.last_errno = .SUCCESS;
         try std.testing.expectError(error.InvalidArgument, lockExclusive(-1, timeout));
         try std.testing.expectEqualStrings("[Errno 9] Bad file descriptor", sys.describe(error.InvalidArgument));
     }
+}
+
+test "lockExclusive takes the timeout flock -w seconds give" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-locku64-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+
+    // the 999_999_999 seconds a tool may pass, as milliseconds: wider
+    // than a u32 holds, and with the lock free it returns at once
+    const fd1 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+    defer sys.close(fd1);
+    try lockExclusive(fd1, 999_999_999 * std.time.ms_per_s);
+
+    // with the lock held, a timeout past u32 range still waits for the
+    // release instead of wrapping to a deadline already past
+    const fd2 = try sys.openat(d, "L", .{ .ACCMODE = .RDWR }, 0);
+    defer sys.close(fd2);
+    const Holder = struct {
+        var fd: fsx.fd_t = -1;
+        fn letGo() void {
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            _ = linux.flock(fd, std.posix.LOCK.UN);
+        }
+    };
+    Holder.fd = fd1;
+    const thread = try std.Thread.spawn(.{}, Holder.letGo, .{});
+    thread.join();
+    try lockExclusive(fd2, 500_000_000 * std.time.ms_per_s);
+    _ = linux.flock(fd2, std.posix.LOCK.UN);
 }
 
 // ---- the state-root lock: a flock gate and a POSIX record lock -------------
@@ -254,15 +503,16 @@ pub const RootLock = struct {
 
     fn takeFlock(fd: fsx.fd_t, deadline_ms: ?i64) AcquireError!void {
         const d = deadline_ms orelse {
-            _ = try lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) });
+            _ = lockCall(lock_ops.flock, .{ fd, @as(i32, std.posix.LOCK.EX) }) catch |err| return noted(err, null);
             return;
         };
         while (true) {
             const rc = lock_ops.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
             switch (linux.errno(rc)) {
                 .SUCCESS => return,
-                .AGAIN, .ACCES, .INTR => {},
-                else => return mapped(rc),
+                .INTR => continue,
+                .AGAIN, .ACCES => {},
+                else => return noted(mapped(rc), null),
             }
             if (try pause(d)) return error.Busy;
         }
@@ -280,8 +530,13 @@ pub const RootLock = struct {
                 .INTR => continue,
                 .AGAIN, .ACCES => if (deadline_ms) |d| {
                     if (try pause(d)) return error.Busy;
-                } else return error.Unexpected,
-                else => return mapped(rc),
+                } else {
+                    // F_SETLKW does not treat these as contention. Return the
+                    // mapped error so describe agrees with the snapshot:
+                    // EAGAIN is Unexpected, EACCES is AccessDenied.
+                    return noted(mapped(rc), null);
+                },
+                else => return noted(mapped(rc), null),
             }
         }
     }
@@ -302,28 +557,39 @@ pub const RootLock = struct {
     /// a symbolic link there is NotDir. Each lock file is opened relative to
     /// that descriptor with O_NOFOLLOW, created mode 0600, only when its name
     /// is absent or a regular file of this user with one link, and its
-    /// descriptor must be that file. The gate is checked again once both
-    /// locks are held, right before it is truncated. Allocates nothing;
-    /// `gpa` stays for source compatibility.
+    /// descriptor must be that file. An accepted descriptor is tightened to
+    /// mode 0600. The gate is checked again once both locks are held, right
+    /// before it is truncated. Allocates nothing; `gpa` stays for source
+    /// compatibility.
     pub fn acquire(gpa: Allocator, state_root: []const u8, timeout_ms: ?u32) AcquireError!RootLock {
         _ = gpa;
         const atomic = @import("atomic.zig");
         const root = withoutTrailingSlashes(state_root);
-        try atomic.makedirs(root);
+        sys.last_errno = .SUCCESS;
+        // The Python tool pre-checks the root before makedirs; a
+        // non-directory root is ENOTDIR here whatever makedirs alone
+        // would say. A root that is a directory once links are followed
+        // passes this and is refused below only when the root itself is
+        // a link, as the root is opened without following it.
+        clearOsFailure();
+        preflightRoot(root) catch |err| return noted(err, root);
+        var failed_path: ?[]const u8 = null;
+        atomic.makedirsTracked(root, &failed_path) catch |err| return noted(err, failed_path orelse root);
         const deadline: ?i64 = if (timeout_ms) |t| nowMs() + t else null;
-        const dir = try fsx.openDir(fsx.cwd, root, false);
+        const dir = fsx.openDir(fsx.cwd, root, false) catch |err| return noted(err, root);
         defer sys.close(dir);
-        const gate = (try openLockFile(dir, gate_name, realOpenLock)) orelse return error.GateNotPrivate;
+        const gate = (try openLockFile(dir, root, gate_name, realOpenLock)) orelse return error.GateNotPrivate;
         errdefer sys.close(gate);
         try takeFlock(gate, deadline);
-        const posix = (try openLockFile(dir, sidecar_name, lock_ops.open_sidecar)) orelse return error.NotPrivate;
+        const posix = (try openLockFile(dir, root, sidecar_name, lock_ops.open_sidecar)) orelse return error.NotPrivate;
         errdefer sys.close(posix);
         try takeRecord(posix, deadline);
-        if (!try isSoleLink(dir, gate_name, gate)) return error.GateNotPrivate;
-        _ = try lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) });
+        if (!try isSoleLink(dir, root, gate_name, gate)) return error.GateNotPrivate;
+        _ = lockCall(lock_ops.ftruncate, .{ gate, @as(i64, 0) }) catch |err| return noted(err, null);
         var buf: [24]u8 = undefined;
         const line = std.mem.print(&buf, "{d}\n", .{linux.getpid()}) catch unreachable;
-        if ((try lockCall(lock_ops.write, .{ gate, line })) != line.len) return error.NoSpace;
+        const n = lockCall(lock_ops.write, .{ gate, line }) catch |err| return noted(err, null);
+        if (n != line.len) return noted(error.NoSpace, null);
         return .{ .gate = gate, .posix = posix, .owner = linux.getpid() };
     }
 
@@ -331,19 +597,22 @@ pub const RootLock = struct {
     /// absent or a regular file of this user with one link before the open,
     /// so a FIFO, device or symbolic link there is never opened, and the
     /// descriptor is that file after it.
-    fn openLockFile(dir: fsx.fd_t, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
+    fn openLockFile(dir: fsx.fd_t, root: []const u8, name: [:0]const u8, open: *const fn (dir: fsx.fd_t, name: [*:0]const u8) usize) Error!?fsx.fd_t {
         if (fsx.statAt(dir, name, false)) |st| {
             if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return null;
         } else |err| switch (err) {
             error.NotFound => {},
-            else => |e| return e,
+            else => |e| return notedUnder(e, root, name),
         }
         const fd: fsx.fd_t = @intCast(lockCall(open, .{ dir, name.ptr }) catch |err| switch (err) {
             error.SymLink, error.IsDir => return null,
-            else => |e| return e,
+            else => |e| return notedUnder(e, root, name),
         });
         errdefer sys.close(fd);
-        if (try isSoleLink(dir, name, fd)) return fd;
+        if (try isSoleLink(dir, root, name, fd)) {
+            sys.fchmod(fd, 0o600) catch |err| return noted(err, null);
+            return fd;
+        }
         sys.close(fd);
         return null;
     }
@@ -352,12 +621,12 @@ pub const RootLock = struct {
     /// `dir/name`. The name is looked up as well as the descriptor: a
     /// planted hard link unlinked while the lock is awaited leaves the
     /// descriptor on the other name's file, with one link.
-    fn isSoleLink(dir: fsx.fd_t, name: []const u8, fd: fsx.fd_t) Error!bool {
-        const st = try fsx.fstat(fd);
+    fn isSoleLink(dir: fsx.fd_t, root: []const u8, name: []const u8, fd: fsx.fd_t) Error!bool {
+        const st = fsx.fstat(fd) catch |err| return noted(err, null);
         if (!st.isReg() or st.nlink != 1 or st.uid != linux.geteuid()) return false;
         const at = fsx.statAt(dir, name, false) catch |err| switch (err) {
             error.NotFound => return false,
-            else => |e| return e,
+            else => |e| return notedUnder(e, root, name),
         };
         return at.dev == st.dev and at.ino == st.ino and at.nlink == 1;
     }
@@ -371,16 +640,34 @@ pub const RootLock = struct {
 
     /// Unlock the record lock, close its descriptor, then unlock and close
     /// the gate. Both descriptors are closed whatever an unlock returns; a
-    /// forked child only closes them.
-    pub fn release(l: RootLock) void {
+    /// forked child only closes them. The first unlock error is returned
+    /// after both closes, as Python's release lets the OSError out, and
+    /// `sys.last_errno` holds that error's errno, not a later one's.
+    pub fn release(l: RootLock) sys.Error!void {
+        var first: ?sys.Error = null;
+        var first_errno: linux.E = .SUCCESS;
         if (linux.getpid() == l.owner) {
             var fl: linux.Flock = std.mem.zeroes(linux.Flock);
             fl.type = linux.F.UNLCK;
-            _ = lock_ops.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+            _ = lockCall(lock_ops.fcntl, .{ l.posix, linux.F.SETLK, @intFromPtr(&fl) }) catch |err| {
+                first = err;
+                first_errno = sys.last_errno;
+            };
         }
         sys.close(l.posix);
-        if (linux.getpid() == l.owner) _ = lock_ops.flock(l.gate, std.posix.LOCK.UN);
+        if (linux.getpid() == l.owner) {
+            _ = lockCall(lock_ops.flock, .{ l.gate, std.posix.LOCK.UN }) catch |err| {
+                if (first == null) {
+                    first = err;
+                    first_errno = sys.last_errno;
+                }
+            };
+        }
         sys.close(l.gate);
+        if (first) |err| {
+            sys.last_errno = first_errno;
+            return err;
+        }
     }
 };
 
@@ -417,7 +704,7 @@ fn realOpenLock(dir: fsx.fd_t, name: [*:0]const u8) usize {
     return linux.openat(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
 }
 
-/// One of `lock_ops`, retrying on EINTR.
+/// One of `lock_ops` or `write_ops`, retrying on EINTR.
 fn lockCall(f: anytype, args: anytype) Error!usize {
     while (true) {
         if (try sys.result(@call(.auto, f, args))) |rc| return rc;
@@ -435,6 +722,123 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
+test "the state root preflight matches lexists and isdir" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-preflight-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer sys.close(dir);
+
+    const fd = try sys.openat(dir, "plain", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(fd);
+    _ = linux.mkdirat(dir, (try sys.z(&zb, "real")).ptr, 0o700);
+    _ = linux.symlinkat("real", dir, (try sys.z(&zb, "link-dir")).ptr);
+    _ = linux.symlinkat("plain", dir, (try sys.z(&zb, "link-file")).ptr);
+    _ = linux.symlinkat("nowhere", dir, (try sys.z(&zb, "link-dangling")).ptr);
+    _ = linux.symlinkat("link-loop", dir, (try sys.z(&zb, "link-loop")).ptr);
+
+    var nb: [sys.path_max]u8 = undefined;
+    const at = struct {
+        fn at(b: []const u8, name: []const u8, out: *[sys.path_max]u8) []const u8 {
+            return std.fmt.bufPrint(out, "{s}/{s}", .{ b, name }) catch unreachable;
+        }
+    };
+
+    // accepted: a directory, a missing name that makedirs will create,
+    // and a link to a directory, which the expression in isolation
+    // follows as isdir does. A symlinked root never reaches this line
+    // in the Python tool, whose component check refuses it as unsafe
+    // first, and RootLock refuses it after the pre-check with NotDir.
+    try preflightRoot(at.at(base, "real", &nb));
+    try preflightRoot(at.at(base, "link-dir", &nb));
+    try preflightRoot(at.at(base, "absent", &nb));
+
+    // refused with ENOTDIR: a file, a link to a file, a dangling link
+    // and a link loop, all lexists-true and isdir-false
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "plain", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-file", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-dangling", &nb)));
+    try std.testing.expectError(error.NotDir, preflightRoot(at.at(base, "link-loop", &nb)));
+}
+
+test "lock filenames are joined to every state-root spelling without allocation" {
+    try std.testing.expectEqual(error.Unexpected, notedUnder(error.Unexpected, "/", ".lock.posix"));
+    var failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings("/.lock.posix", failure.path);
+
+    try std.testing.expectEqual(error.Unexpected, notedUnder(error.Unexpected, ".lock", ".lock"));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(".lock/.lock", failure.path);
+}
+
+test "RootLock refuses a non-directory state root with NotDir" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-rootfile-{d}", .{ cwd, linux.getpid() });
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+
+    // a regular file as the root
+    const file_root = try std.fmt.allocPrint(gpa, "{s}/file-root", .{base});
+    defer gpa.free(file_root);
+    const fd = try sys.openat(fsx.cwd, file_root, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    sys.close(fd);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, file_root, 0));
+    var failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(file_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+
+    // a dangling symbolic link as the root
+    const dangling_root = try std.fmt.allocPrint(gpa, "{s}/dangling-root", .{base});
+    defer gpa.free(dangling_root);
+    _ = linux.symlinkat("nowhere", fsx.cwd, (try sys.z(&zb, dangling_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, dangling_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(dangling_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+
+    // Recursive creation names the ancestor at which mkdir failed.
+    const nested_root = try std.fmt.allocPrint(gpa, "{s}/child/grandchild", .{dangling_root});
+    defer gpa.free(nested_root);
+    const failed_ancestor = try std.fmt.allocPrint(gpa, "{s}/child", .{dangling_root});
+    defer gpa.free(failed_ancestor);
+    try std.testing.expectError(error.NotFound, RootLock.acquire(gpa, nested_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(failed_ancestor, failure.path);
+    try std.testing.expectEqualStrings("[Errno 2] No such file or directory", failure.text);
+
+    // a symbolic-link loop as the root
+    const loop_root = try std.fmt.allocPrint(gpa, "{s}/loop-root", .{base});
+    defer gpa.free(loop_root);
+    _ = linux.symlinkat("loop-root", fsx.cwd, (try sys.z(&zb, loop_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, loop_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(loop_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+
+    // a symlink to a directory as the root: the Python tool refuses it
+    // as unsafe through its component check, RootLock with the NotDir
+    // of the open that does not follow it, and neither accepts it
+    const real_root = try std.fmt.allocPrint(gpa, "{s}/real-root", .{base});
+    defer gpa.free(real_root);
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, real_root)).ptr, 0o700);
+    const link_root = try std.fmt.allocPrint(gpa, "{s}/link-root", .{base});
+    defer gpa.free(link_root);
+    _ = linux.symlinkat("real-root", fsx.cwd, (try sys.z(&zb, link_root)).ptr);
+    try std.testing.expectError(error.NotDir, RootLock.acquire(gpa, link_root, 0));
+    failure = osFailure() orelse unreachable;
+    try std.testing.expectEqualStrings(link_root, failure.path);
+    try std.testing.expectEqualStrings("[Errno 20] Not a directory", failure.text);
+}
+
 test "RootLock refuses a second holder and is free after release" {
     const gpa = std.testing.allocator;
     var pb: [sys.path_max]u8 = undefined;
@@ -444,9 +848,9 @@ test "RootLock refuses a second holder and is free after release" {
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     const first = try RootLock.acquire(gpa, base, 0);
     try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));
-    first.release();
+    first.release() catch unreachable;
     const again = try RootLock.acquire(gpa, base, 0);
-    again.release();
+    again.release() catch unreachable;
 }
 
 test "lockExclusiveCancel returns Canceled when cancel is set" {
@@ -506,10 +910,36 @@ test "lockExclusive covers timeout 0, bounded timeout, and unsupported flock" {
     lock_ops.flock = Hooks.fail;
     for ([_]linux.E{ .OPNOTSUPP, .NOSYS }) |e| {
         Hooks.err_code = e;
-        for ([_]?u32{ null, 0, 25 }) |timeout| {
+        for ([_]?u64{ null, 0, 25 }) |timeout| {
             sys.last_errno = .SUCCESS;
             try std.testing.expectError(error.Unsupported, lockExclusive(fd2, timeout));
             try std.testing.expectEqual(e, sys.last_errno);
         }
     }
+}
+
+test "creating the gate in a read-only directory names .lock" {
+    if (linux.geteuid() == 0) return;
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-ro-{d}", .{ cwd, linux.getpid() });
+    const held = try RootLock.acquire(gpa, base, 0);
+    held.release() catch unreachable;
+    var zb: [sys.path_max:0]u8 = undefined;
+    const gate = try std.mem.print(zb[0..zb.len], "{s}/.lock", .{base});
+    try sys.unlinkat(fsx.cwd, gate, 0);
+    const sidecar = try std.mem.print(zb[0..zb.len], "{s}/.lock.posix", .{base});
+    sys.unlinkat(fsx.cwd, sidecar, 0) catch {};
+    const zbase = try sys.z(&zb, base);
+    try std.testing.expect(linux.errno(linux.fchmodat(fsx.cwd, zbase.ptr, 0o555)) == .SUCCESS);
+    defer _ = linux.fchmodat(fsx.cwd, zbase.ptr, 0o755);
+    defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    try std.testing.expectError(error.AccessDenied, RootLock.acquire(gpa, base, 0));
+    const note = osFailure() orelse unreachable;
+    const want_gate = try std.fmt.allocPrint(gpa, "{s}/.lock", .{base});
+    defer gpa.free(want_gate);
+    try std.testing.expectEqualStrings(want_gate, note.path);
+    try std.testing.expectEqualStrings("[Errno 13] Permission denied", note.text);
 }

@@ -1,0 +1,27 @@
+#+TITLE: Variables cleared for a child
+#+OPTIONS: toc:nil todo:nil num:nil author:nil title:nil
+#+STARTUP: content
+
+* Variables cleared for a child
+
+=src/env-scrub.json= is a JSON array of environment names.
+[[zig:zig_common.env_scrub.childClearNames]] returns them in the order the file has them, which is the order =eb-local env= prints its =unset= lines.
+A child command clears each name, so an install location inherited from the parent shell does not decide where the child writes.
+
+| Name                                |
+|-------------------------------------|
+| =EESSI_CVMFS_INSTALL=               |
+| =EESSI_SITE_INSTALL=                |
+| =EESSI_USER_INSTALL=                |
+| =EESSI_PROJECT_INSTALL=             |
+| =EESSI_SITE_SOFTWARE_PREFIX=        |
+| =EESSI_SOFTWARE_SUBDIR_OVERRIDE=    |
+| =EESSI_ACCELERATOR_TARGET_OVERRIDE= |
+| =EESSI_OVERRIDE_GPU_CHECK=          |
+| =EASYBUILD_INSTALLPATH=             |
+| =EASYBUILD_INSTALLPATH_SOFTWARE=    |
+| =EASYBUILD_INSTALLPATH_MODULES=     |
+| =EASYBUILD_PREFIX=                  |
+
+eb-staged-rebuild also clears =EASYBUILD_REMOVE_GHOST_INSTALL_DIRS=, and =EASYBUILD_BUILDPATH= when the build path is private.
+Those two are that tool's own.

@@ -25,8 +25,42 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
-      - run: zig fmt --check build.zig build.zig.zon src
+      # The decimal digit table is pinned to Unicode 16.0.0, the unicodedata
+      # of Python 3.14; the parity test skips its comparison under another.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14.10"
+      - run: zig fmt --check build.zig build.zig.zon src tests
       - run: zig build test --summary all
+      - name: parity with python's json and text calls
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found, skipping the parity test"
+            exit 0
+          fi
+          zig build parity-probe
+          python3 tests/test_json_pytext_parity.py
+      - name: parity with python's filesystem and lock calls
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found, skipping the parity test"
+            exit 0
+          fi
+          zig build fs-lock-parity-probe
+          python3 tests/test_fs_lock_parity.py
+      - name: parity with python's tempfile.gettempdir
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found, skipping the parity test"
+            exit 0
+          fi
+          zig build tempdir-probe
+          python3 tests/test_gettempdir_parity.py
+      - name: parity with python 3.14 argparse calls
+        run: |
+          python3 -c "import sys; assert sys.version_info[:3] == (3, 14, 10), 'argparse parity is pinned to Python 3.14.10; found ' + sys.version.split()[0]"
+          zig build argparse-parity-probe
+          python3 tests/test_argparse_parity.py
       - name: no site names in the tree
         run: |
           ! git grep -nIiE 'snellius|surf\.nl|/gpfs/|/projects/0|rg\.terra|scratch-shared' -- . ':!.github/workflows/ci.yml'

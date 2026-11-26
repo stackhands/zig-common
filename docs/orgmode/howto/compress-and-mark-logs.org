@@ -36,7 +36,7 @@ Such a log is marked by a line in its directory's =.licensed-logs= list, which n
    #+end_src
 
    Each archive keeps the log's mode and its access and modification times, and its header carries the log's name.
-   The archive is written under a temporary name and renamed into place, and only then is the log removed.
+   The archive is written under a temporary name, flushed, synced and closed, then renamed into place, and only then is the log removed. A failed close leaves the log as it was and removes the temporary file.
 
 3. Rewrite the list when it names any of them:
 
@@ -92,9 +92,24 @@ The archives keep the logs' mode, 0600, and their modification time, 10:15.
 | =error.SymLink=         | the name is a symbolic link                                 | compress the file it points to, in its own directory               |
 | =error.InvalidArgument= | the name is a directory, a named pipe or a device           | pass the names of regular files only                               |
 
+The errors share one set, so an error alone does not say whether the log was compressed.
+[[zig:zig_common.logs.gzipInPlaceAtStep]] is =gzipInPlace= that also sets a [[zig:zig_common.logs.GzipStep]] to the step the error came from:
+
+#+begin_src zig
+var failed_at: common.logs.GzipStep = undefined;
+common.logs.gzipInPlaceAtStep(gpa, init.io, dir, name, &failed_at) catch |err| switch (failed_at) {
+    .archive => return err,
+    .directory_sync => {},
+};
+#+end_src
+
+With =archive=, the log is where it was, and the call tries to remove any =NAME.gz= it made.
+With =directory_sync=, =NAME.gz= is in place and the log is gone, and only whether that survives a crash is in doubt: count the log as compressed and rename it in the list.
+
 ** Related
 
 - [[zig:zig_common.logs.GzipError]]: the errors =gzipInPlace= returns.
+- [[zig:zig_common.logs.GzipStep]]: the steps =gzipInPlaceAtStep= reports.
 - [[zig:zig_common.logs.licensed_list]]: the list's name and format.
 - [[https://github.com/stackhands/eb-keep-logs][eb-keep-logs]], which writes the list and rotates log trees.
 - [[https://www.gnu.org/software/gzip/manual/gzip.html][The gzip manual]], for the format and the checks.

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: 'zig-common: the Linux Zig library under the stackhands tools'
+message: If you use zig-common, please cite it using the metadata below.
+type: software
+authors:
+- given-names: Rohit
+  family-names: Goswami
+  email: rgoswami@ieee.org
+  orcid: https://orcid.org/0000-0002-2393-8056
+license: MIT
+repository-code: https://github.com/stackhands/zig-common
+url: https://stackhands.github.io/zig-common/
+keywords:
+- Zig
+- Linux
+- system calls
+- atomic writes
+abstract: 'Linux-only Zig library shared by the stackhands tools: system calls with
+  named errors, descriptor-checked file handling, child processes, atomic ACL-preserving
+  writes, Python-compatible JSON, text and argparse, and syslog or journald events.'
