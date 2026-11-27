@@ -20,7 +20,7 @@ The messages, exit statuses and version line that the stackhands Zig tools share
 | [[zig:zig_common.cli.die]]           | =TOOL: message= and a newline, then exits 2          | stderr, descriptor 2 |
 
 - Only =die= adds a newline.
-- =put=, =print=, =out= and =err= ignore write errors. When stdout carries what a caller captures or evaluates, [[zig:zig_common.cli.writeOut]] and [[zig:zig_common.cli.Stdout]] check the write, print =TOOL: cannot write output (ERRNO)= on stderr once, and [[zig:zig_common.cli.Stdout.finish]] turns exit status 0 into 1.
+- =put=, =print=, =out= and =err= ignore write errors. A closed pipe does not kill the process: those writes, and =Stdout=, ignore the broken-pipe signal for the write and then restore the previous action. When stdout carries what a caller captures or evaluates, [[zig:zig_common.cli.writeOut]] and [[zig:zig_common.cli.Stdout]] check the write, print =TOOL: cannot write output (ERRNO)= on stderr once, and [[zig:zig_common.cli.Stdout.finish]] turns exit status 0 into 1.
 - A message longer than 8 KiB is formatted on the heap; when that allocation fails, =print= writes nothing and =Stdout.print= marks output failed.
 
 ** Exit status

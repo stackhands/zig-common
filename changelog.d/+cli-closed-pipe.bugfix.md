@@ -1,0 +1,1 @@
+A write to a closed pipe no longer kills the process. The `cli.put` and `cli.Stdout` writers ignore the broken-pipe signal for that write and then restore it. The unchecked writer still drops the error, and the checked one reports it once and turns a zero status into 1.

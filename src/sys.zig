@@ -369,6 +369,32 @@ pub fn read(fd: fd_t, buf: []u8) Error!usize {
     return call(linux.read, .{ fd, buf.ptr, buf.len });
 }
 
+/// The broken-pipe signal action saved around a write. The write ignores
+/// that signal and then puts the previous action back, so a closed pipe
+/// returns an error instead of killing the process.
+pub const PipeSignal = struct {
+    /// The action in force before the signal was ignored.
+    old: linux.Sigaction,
+    /// True when the signal was set to ignore and `restore` must undo that.
+    ignored: bool,
+
+    /// Put the saved action back when this value changed it.
+    pub fn restore(self: PipeSignal) void {
+        if (self.ignored) {
+            _ = linux.sigaction(.PIPE, &self.old, null);
+        }
+    }
+};
+
+/// Ignore the broken-pipe signal and return the previous action. When the
+/// call fails, `ignored` is false and `restore` changes nothing.
+pub fn ignorePipeSignal() PipeSignal {
+    var old: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    const ignored = linux.errno(linux.sigaction(.PIPE, &ignore, &old)) == .SUCCESS;
+    return .{ .old = old, .ignored = ignored };
+}
+
 /// write(2) until all of `bytes` is written, going on after a short write.
 /// A write that returns 0 is `error.NoSpace`.
 pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {

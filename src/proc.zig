@@ -583,12 +583,8 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
     // Writing stdin to a child that stopped reading raises SIGPIPE, which
     // would end this process; with it ignored the write fails with EPIPE,
     // as in Python, which ignores SIGPIPE at startup. Restored on return.
-    var old_pipe: linux.Sigaction = undefined;
-    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
-    const pipe_ignored = fds[0] >= 0 and linux.errno(linux.sigaction(.PIPE, &ignore, &old_pipe)) == .SUCCESS;
-    defer if (pipe_ignored) {
-        _ = linux.sigaction(.PIPE, &old_pipe, null);
-    };
+    const pipe_signal: ?sys.PipeSignal = if (fds[0] >= 0) sys.ignorePipeSignal() else null;
+    defer if (pipe_signal) |saved| saved.restore();
     if (exec_p) |p| {
         sys.close(p.w);
         var e: u32 = 0;
