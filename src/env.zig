@@ -101,7 +101,7 @@ pub const Builder = struct {
 
     /// Set `name` to `value`, both copied. A name already set keeps its
     /// place in the order; a new name goes last. The name is checked only
-    /// when `envp` builds the block.
+    /// when `envp` builds the block. A failure leaves the builder unchanged.
     pub fn set(b: *Builder, name: []const u8, value: []const u8) Allocator.Error!void {
         const a = b.arena.allocator();
         const v = try a.dupe(u8, value);
@@ -110,8 +110,9 @@ pub const Builder = struct {
             return;
         }
         const n = try a.dupe(u8, name);
-        try b.names.append(a, n);
         try b.values.put(a, n, v);
+        errdefer _ = b.values.remove(n);
+        try b.names.append(a, n);
     }
 
     /// Remove `name`. A name that is not set is no error.
@@ -373,4 +374,31 @@ test "a name the execve block cannot carry is refused" {
     defer d.deinit();
     try d.set("BASH_FUNC_f%%", "() { :; }");
     _ = try d.envp();
+}
+
+test "a failed set does not record the name" {
+    const gpa = std.testing.allocator;
+    // A refused resize makes the map insert its own allocation. An in-place
+    // growth would hide a failure between the name list and the map.
+    var fail_at: usize = 0;
+    while (fail_at < 6) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        var b = Builder.init(failing.allocator());
+        defer b.deinit();
+        if (b.set("A", "1")) |_| {
+            try std.testing.expectEqualStrings("1", b.get("A").?);
+            try std.testing.expectEqual(@as(usize, 1), b.names.items.len);
+            if (b.envp()) |block| {
+                try std.testing.expectEqualStrings("A=1", std.mem.span(block[0].?));
+                try std.testing.expect(block[1] == null);
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(b.get("A") == null);
+            try std.testing.expectEqual(@as(usize, 0), b.names.items.len);
+        }
+    }
 }
