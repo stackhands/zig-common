@@ -477,6 +477,24 @@ test "a truncated or malformed escape is an encoding error" {
     try std.testing.expect(obj.get("a") == null);
 }
 
+test "a later duplicate key keeps the first member's place" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // json.loads leaves the key where it first appeared and stores the
+    // last value there. A key written with a \u escape is the same key.
+    const plain = try toPy(a, try parse(a, "{\"b\": 1, \"a\": 2, \"b\": 3}"));
+    try std.testing.expectEqualStrings("{\"b\": 3, \"a\": 2}", try dumpsCompact(a, plain, false));
+    const escaped = try toPy(a, try parse(a, "{\"\\u0062\": 1, \"a\": 2, \"b\": 3}"));
+    try std.testing.expectEqualStrings("{\"b\": 3, \"a\": 2}", try dumpsCompact(a, escaped, false));
+
+    // The value the last member replaces is not decoded, and the kept
+    // key stays ahead of the member that sat between the two copies.
+    const dropped = try toPy(a, try parse(a, "{\"k\": \"\\ud800\", \"m\": 1, \"k\": \"kept\"}"));
+    try std.testing.expectEqualStrings("{\"k\": \"kept\", \"m\": 1}", try dumpsCompact(a, dropped, false));
+}
+
 test "an earlier duplicate that cannot decode is dropped" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -646,39 +664,43 @@ pub fn toPy(arena: Allocator, v: Value) DecodeError!Py {
             break :blk .{ .list = out };
         },
         .object => |members| blk: {
-            // A later duplicate key replaces the earlier one, in its
-            // place, as json.loads keeps the last value; the earlier
-            // member the last one replaces is never decoded, so a
-            // value the document drops cannot fail it.
+            // A later duplicate key replaces the earlier one in its
+            // place, as json.loads keeps the last value at the first
+            // key's index. Keys match once escapes are decoded, so
+            // "\u0062" is "b". The earlier member is never decoded, so
+            // a value the document drops cannot fail it.
             const keys = try arena.alloc([]const u8, members.len);
-            const kept = try arena.alloc(bool, members.len);
+            for (members, 0..) |mem, i| keys[i] = try decodeCache(arena, mem.key);
+
+            var last_of: std.StringHashMapUnmanaged(usize) = .empty;
+            for (0..members.len) |i| try last_of.put(arena, keys[i], i);
+
+            var slot_of: std.StringHashMapUnmanaged(usize) = .empty;
+            var entries: std.ArrayList(Py.Entry) = .empty;
             for (members, 0..) |mem, i| {
-                keys[i] = try decodeCache(arena, mem.key);
-                kept[i] = true;
-            }
-            for (0..members.len) |i| {
-                for (i + 1..members.len) |j| {
-                    if (std.mem.eql(u8, keys[i], keys[j])) {
-                        kept[i] = false;
-                        break;
+                const last = last_of.get(keys[i]).?;
+                if (slot_of.get(keys[i])) |slot| {
+                    if (i == last) {
+                        entries.items[slot].value = try toPy(arena, mem.value);
+                    } else {
+                        // The strict consumers decode the whole text before
+                        // json.loads, so a raw byte that is not UTF-8
+                        // refuses the document even here; escapes stay
+                        // fine, the value is only dropped, not carried.
+                        try validateRawStrings(mem.value);
+                    }
+                } else {
+                    const slot = entries.items.len;
+                    try slot_of.put(arena, keys[i], slot);
+                    if (i == last) {
+                        try entries.append(arena, .{ .key = keys[i], .value = try toPy(arena, mem.value) });
+                    } else {
+                        try validateRawStrings(mem.value);
+                        try entries.append(arena, .{ .key = keys[i], .value = .null });
                     }
                 }
             }
-            var m: std.StringArrayHashMapUnmanaged(Py) = .empty;
-            for (members, 0..) |mem, i| {
-                if (!kept[i]) {
-                    // The strict consumers decode the whole text before
-                    // json.loads, so a raw byte that is not UTF-8
-                    // refuses the document even here; escapes stay
-                    // fine, the value is only dropped, not carried.
-                    try validateRawStrings(mem.value);
-                    continue;
-                }
-                try m.put(arena, keys[i], try toPy(arena, mem.value));
-            }
-            const out = try arena.alloc(Py.Entry, m.count());
-            for (m.keys(), m.values(), 0..) |k, val, i| out[i] = .{ .key = k, .value = val };
-            break :blk .{ .dict = out };
+            break :blk .{ .dict = entries.items };
         },
     };
 }
