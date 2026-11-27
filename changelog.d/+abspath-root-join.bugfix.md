@@ -1,0 +1,1 @@
+`fsx.absPath` now joins a relative path onto a working directory of `/` with one slash. `os.path.abspath` does the same. `fsx.TempDir` normalizes a relative candidate this way too. The old join gave `//...`, and `fsx.normPath` kept both slashes.
