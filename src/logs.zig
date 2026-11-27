@@ -4,6 +4,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 const fsx = @import("fsx.zig");
+const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -28,7 +29,45 @@ pub const GzipError = sys.Error || Allocator.Error || error{WriteFailed};
 /// bits and access and modification times, and the original is removed.
 /// A file with other hard links, a symbolic link, a non-regular file and an
 /// existing `name.gz` are refused, as gzip refuses them.
+/// The compressed bytes go to a temporary file, which is flushed, synced
+/// and closed before it is renamed over `name.gz`. A failed close is
+/// returned with `sys.last_errno` set to its errno; the temporary file is
+/// removed and both `name` and `name.gz` are left as they were. A write
+/// lost on NFS may be reported only by the close. That descriptor is
+/// closed once on every path. A close that EINTR interrupts is not
+/// retried, as Linux has freed the descriptor, and is not an error, as
+/// `sys.result` treats EINTR.
 pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) GzipError!void {
+    var failed_at: GzipStep = undefined;
+    return gzipInPlaceAtStep(gpa, io, dir, name, &failed_at);
+}
+
+/// The step of `gzipInPlaceAtStep` an error came from. Every error shares
+/// one set, so the error alone cannot say whether the log was compressed.
+pub const GzipStep = enum {
+    /// Up to renaming the archive into place and removing the original.
+    /// When opening `name` fails, the call has changed nothing: a `name`
+    /// that was already absent, as after an earlier run compressed it,
+    /// stays absent, and any `name.gz` already there is left alone. Once
+    /// `name` is open, the original is still there, and `name.gz` is absent
+    /// unless it was there before the call, or removing the original failed
+    /// and so did the removal of the archive that follows; then both are
+    /// present.
+    archive,
+    /// Opening the archive's directory, syncing it and closing it, after the
+    /// rename of the archive and the removal of the original. `name.gz` is
+    /// in place and the original is gone; only whether that survives a crash
+    /// is in doubt. A failed close of that directory is this same step.
+    directory_sync,
+};
+
+/// `gzipInPlace`, which also sets `failed_at` to the step an error came
+/// from. It reads `.archive` until the archive is in place and the original
+/// removed, and `.directory_sync` from right before the final sync of the
+/// archive's directory. A failed close of the temporary archive is
+/// `.archive`: the rename has not run.
+pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8, failed_at: *GzipStep) GzipError!void {
+    failed_at.* = .archive;
     const src = try fsx.openRegular(dir, name, false);
     defer sys.close(src.fd);
     if (src.stat.nlink > 1) return error.TooManyLinks;
@@ -68,10 +107,21 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
         .EXCL = true,
         .NOFOLLOW = true,
     }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(dst);
-        if (!done) sys.unlinkat(dir, tmp_name, 0) catch {};
+        if (open) {
+            // Linux frees the descriptor whatever close reports. Keep the
+            // errno of the failure being returned.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = gzip_ops.close(dst);
+        }
+        if (!done) {
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp_name, 0) catch {};
+        }
     }
 
     const file: Io.File = .{ .handle = dst, .flags = .{ .nonblocking = false } };
@@ -96,6 +146,7 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
     var crc = std.hash.Crc32.init();
     var size: u64 = 0;
     var in_buf: [64 * 1024]u8 = undefined;
+    if (gzip_ops.fail_compress) return error.WriteFailed;
     while (true) {
         const n = try sys.read(src.fd, &in_buf);
         if (n == 0) break;
@@ -118,6 +169,9 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
     const times = [2]linux.timespec{ src.stat.atime, src.stat.mtime };
     _ = try sys.call(linux.futimens, .{ dst, &times });
     try sys.fsync(dst);
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    _ = try sys.result(gzip_ops.close(dst));
     try sys.renameat(dir, tmp_name, dir, gz_name);
     sys.unlinkat(dir, name, 0) catch |err| {
         // The archive is complete, but the original is still there. Drop
@@ -127,9 +181,40 @@ pub fn gzipInPlace(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8) Gzip
         return err;
     };
     done = true;
+    failed_at.* = .directory_sync;
     const parent_fd = try fsx.openDir(dir, gz_parent, true);
-    defer sys.close(parent_fd);
+    var parent_open = true;
+    errdefer if (parent_open) {
+        // The error being returned keeps its errno.
+        const saved = sys.last_errno;
+        defer sys.last_errno = saved;
+        _ = gzip_ops.close(parent_fd);
+    };
     try sys.fsync(parent_fd);
+    parent_open = false;
+    _ = try sys.result(gzip_ops.close(parent_fd));
+}
+
+/// The close of the temporary archive `gzipInPlaceAtStep` publishes, and of
+/// the directory synced once that archive is in place, as a raw system-call
+/// result. Replaceable in the same builds as `atomic.ops`; a constant real
+/// close in any other build. The caller does not retry it.
+pub const GzipOps = struct {
+    close: *const fn (fd: fsx.fd_t) usize = realClose,
+    /// Fail the compressor with `error.WriteFailed` before the archive is
+    /// renamed. A real run leaves this false; a test sets it to show the
+    /// final name is unpublished when compression stops early.
+    fail_compress: bool = false,
+};
+
+var test_gzip_ops: GzipOps = .{};
+const real_gzip_ops: GzipOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`gzip_ops.* = ...`); any other build points it at a constant real close.
+pub const gzip_ops = if (@import("atomic.zig").replaceable) &test_gzip_ops else &real_gzip_ops;
+
+fn realClose(fd: fsx.fd_t) usize {
+    return linux.close(fd);
 }
 
 /// The lines of a `.licensed-logs` list with every line found in `renames`
@@ -275,59 +360,21 @@ test "gunzip reads over trailing zero padding" {
 
 test "gzip does not publish a partial archive under the final name" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    const base = try std.fmt.allocPrint(gpa, "{s}/.zig-cache/zig-common-gzip-{d}", .{ here, linux.getpid() });
-    defer gpa.free(base);
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "gzip");
+    defer scratch.deinit();
+    const dir = scratch.fd;
     const src = try sys.openat(dir, "a.log", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
-    const ur = try sys.openat(fsx.cwd, "/dev/urandom", .{}, 0);
-    defer sys.close(ur);
-    var buf: [64 * 1024]u8 = undefined;
-    var left: usize = 6 << 20;
-    while (left > 0) {
-        const n = try sys.read(ur, buf[0..@min(buf.len, left)]);
-        if (n == 0) return error.Unexpected;
-        try sys.writeAll(src, buf[0..n]);
-        left -= n;
-    }
+    var body: [4096]u8 = undefined;
+    @memset(&body, 'a');
+    try sys.writeAll(src, &body);
     sys.close(src);
-    const gz = try std.fmt.allocPrint(gpa, "{s}/a.log.gz", .{base});
-    defer gpa.free(gz);
-    var gz_z: [sys.path_max:0]u8 = undefined;
-    const gz_sent = try sys.z(&gz_z, gz);
 
-    const Watch = struct {
-        var stop = std.atomic.Value(bool).init(false);
-        var partial = std.atomic.Value(bool).init(false);
-        var path: [*:0]const u8 = undefined;
-        fn run() void {
-            while (!stop.load(.acquire)) {
-                if (fsx.statAt(fsx.cwd, std.mem.span(path), false)) |_| {
-                    if (!archiveIntact(path)) partial.store(true, .release);
-                } else |_| {}
-                var ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
-        }
-    };
-    Watch.path = gz_sent.ptr;
-    Watch.stop.store(false, .release);
-    Watch.partial.store(false, .release);
-    const watch = try std.Thread.spawn(.{}, Watch.run, .{});
+    gzip_ops.fail_compress = true;
+    defer gzip_ops.fail_compress = false;
     const io = std.Io.Threaded.global_single_threaded.io();
-    try gzipInPlace(gpa, io, dir, "a.log");
-    Watch.stop.store(true, .release);
-    watch.join();
-    try std.testing.expect(!Watch.partial.load(.acquire));
-    try std.testing.expect(archiveIntact(gz_sent.ptr));
-    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    try std.testing.expectError(error.WriteFailed, gzipInPlace(gpa, io, dir, "a.log"));
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log.gz", false));
+    try std.testing.expect((try fsx.statAt(dir, "a.log", false)).isReg());
 }
 
 test "renameInList" {
@@ -343,17 +390,9 @@ test "renameInList" {
 
 test "gzipInPlace refuses missing files, symlinks, directories, hard links, and existing archives" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-err-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-err");
+    defer scratch.deinit();
+    const dir = scratch.fd;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.testing.expectError(error.NotFound, gzipInPlace(gpa, io, dir, "missing.log"));
@@ -383,17 +422,10 @@ test "gzipInPlace refuses missing files, symlinks, directories, hard links, and 
 
 test "gzipInPlace handles nested paths like gzip -9 sub/file" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-sub-{d}", .{ here, linux.getpid() });
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-sub");
+    defer scratch.deinit();
+    const dir = scratch.fd;
     var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
     _ = linux.mkdirat(dir, (try sys.z(&zb, "sub")).ptr, 0o700);
     const src = try sys.openat(dir, "sub/nested.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     try sys.writeAll(src, "nested\n");
@@ -407,17 +439,9 @@ test "gzipInPlace handles nested paths like gzip -9 sub/file" {
 
 test "gzipInPlace compresses a name its own temporary file alone would overflow" {
     const gpa = std.testing.allocator;
-    var cwd_buf: [sys.path_max]u8 = undefined;
-    const here = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
-    var pb: [sys.path_max]u8 = undefined;
-    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-logs-long-{d}", .{ here, linux.getpid() });
-    var zb: [sys.path_max:0]u8 = undefined;
-    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
-    const dir = try fsx.openDir(fsx.cwd, base, false);
-    defer {
-        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
-        sys.close(dir);
-    }
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-long");
+    defer scratch.deinit();
+    const dir = scratch.fd;
 
     // 240 bytes: short enough that `gzip -9` on the real reference
     // compressor takes it (its own overhead is the 3 bytes of `.gz`), long
@@ -437,4 +461,227 @@ test "gzipInPlace compresses a name its own temporary file alone would overflow"
     var gz_buf: [244]u8 = undefined;
     const gz_name = try std.fmt.bufPrint(&gz_buf, "{s}.gz", .{name});
     try std.testing.expect((fsx.statAt(dir, gz_name, false) catch null) != null);
+}
+
+fn writeLog(dir: fsx.fd_t, name: []const u8) !void {
+    const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o644);
+    defer sys.close(fd);
+    try sys.writeAll(fd, "a log\n");
+}
+
+test "gzipInPlaceAtStep reports archive when the log is left as it was" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-step-archive");
+    defer scratch.deinit();
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "kept.log");
+    try writeLog(dir, "kept.log.gz");
+    var failed_at: GzipStep = .directory_sync;
+    try std.testing.expectError(error.Exists, gzipInPlaceAtStep(gpa, io, dir, "kept.log", &failed_at));
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+    try std.testing.expect((try fsx.statAt(dir, "kept.log", false)).isReg());
+
+    failed_at = .directory_sync;
+    try std.testing.expectError(error.NotFound, gzipInPlaceAtStep(gpa, io, dir, "missing.log", &failed_at));
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+}
+
+test "gzipInPlaceAtStep reports directory_sync when only the directory sync fails" {
+    const Child = struct {
+        fn run() u8 {
+            const gpa = std.heap.page_allocator;
+            const scratch = test_support.ScratchDir.init(gpa, "logs-step-sync") catch return 20;
+            defer scratch.deinit();
+            const base = scratch.path;
+            const dir = scratch.fd;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            writeLog(dir, "a.log") catch return 22;
+
+            // The temporary archive is closed before the directory is
+            // opened, so a limit set in advance would hand that descriptor
+            // to the directory open. Close the archive for real, then leave
+            // no free descriptor. Rename and unlink need none, and the
+            // directory open is the call that is refused.
+            const Limit = struct {
+                var saved: linux.rlimit = .{ .cur = 0, .max = 0 };
+                var lowered = false;
+                fn close(fd: fsx.fd_t) usize {
+                    const rc = linux.close(fd);
+                    if (linux.errno(rc) != .SUCCESS) return rc;
+                    if (linux.errno(linux.prlimit(0, .NOFILE, null, &saved)) != .SUCCESS)
+                        return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+                    const none: linux.rlimit = .{ .cur = 0, .max = saved.max };
+                    if (linux.errno(linux.prlimit(0, .NOFILE, &none, null)) != .SUCCESS)
+                        return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+                    lowered = true;
+                    return rc;
+                }
+            };
+            gzip_ops.* = .{ .close = Limit.close };
+            defer gzip_ops.* = .{};
+
+            var failed_at: GzipStep = .archive;
+            const got = gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+            const got_errno = sys.last_errno;
+            if (Limit.lowered and linux.errno(linux.prlimit(0, .NOFILE, &Limit.saved, null)) != .SUCCESS) return 27;
+            if (got) |_| return 28 else |err| if (err != error.Unexpected) return 29;
+            if (got_errno != .MFILE) return 30;
+            if (failed_at != .directory_sync) return 31;
+            var gz_buf: [sys.path_max]u8 = undefined;
+            var gz_z: [sys.path_max:0]u8 = undefined;
+            const gz_path = std.mem.print(&gz_buf, "{s}/a.log.gz", .{base}) catch return 32;
+            const gz_path_z = sys.z(&gz_z, gz_path) catch return 33;
+            if (!archiveIntact(gz_path_z.ptr)) return 34;
+            if (fsx.statAt(dir, "a.log", false)) |_| return 35 else |err| {
+                if (err != error.NotFound) return 36;
+            }
+            return 0;
+        }
+    };
+    try test_support.expectChildPasses(Child.run);
+}
+
+const GzipClose = struct {
+    var closes: usize = 0;
+    var close_errno: linux.E = .SUCCESS;
+
+    fn set(close_e: linux.E) void {
+        closes = 0;
+        close_errno = close_e;
+        gzip_ops.* = .{ .close = close };
+    }
+
+    /// Linux frees the descriptor whatever close returns, so the hook
+    /// closes it for real and then reports the errno it was given, on the
+    /// first call only: a second close of the descriptor is EBADF.
+    fn close(fd: fsx.fd_t) usize {
+        closes += 1;
+        const rc = linux.close(fd);
+        if (close_errno == .SUCCESS or closes > 1) return rc;
+        return @bitCast(-@as(isize, @backingInt(close_errno)));
+    }
+};
+
+fn expectNoGzTemp(gpa: Allocator, dir: fsx.fd_t) !void {
+    var it = try fsx.DirIter.init(gpa, dir);
+    defer it.deinit(gpa);
+    while (try it.next()) |e| try std.testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
+}
+
+test "gzip close EIO leaves the log and publishes nothing" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-close-eio");
+    defer scratch.deinit();
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    defer gzip_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    GzipClose.set(.IO);
+    sys.last_errno = .SUCCESS;
+    var failed_at: GzipStep = .directory_sync;
+    const got = gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    gzip_ops.* = .{};
+    try std.testing.expectError(error.Unexpected, got);
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(GzipStep.archive, failed_at);
+    try std.testing.expectEqual(@as(usize, 1), GzipClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectNoGzTemp(gpa, dir);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log.gz", false));
+    const f = try fsx.openRegular(dir, "a.log", false);
+    defer sys.close(f.fd);
+    const body = try fsx.readAll(gpa, f.fd, 64);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("a log\n", body);
+}
+
+test "gzip close EINTR publishes the archive and does not retry" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-close-eintr");
+    defer scratch.deinit();
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    defer gzip_ops.* = .{};
+    const before = try test_support.fdCount(gpa);
+    GzipClose.set(.INTR);
+    var failed_at: GzipStep = .archive;
+    try gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    gzip_ops.* = .{};
+    // The archive close, then the directory close. EINTR is not retried.
+    try std.testing.expectEqual(@as(usize, 2), GzipClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try expectNoGzTemp(gpa, dir);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    const f = try fsx.openRegular(dir, "a.log.gz", false);
+    defer sys.close(f.fd);
+    const raw = try fsx.readAll(gpa, f.fd, 1 << 20);
+    defer gpa.free(raw);
+    const plain = try gunzip(gpa, raw, 64);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("a log\n", plain);
+}
+
+const GzipDirClose = struct {
+    var closes: usize = 0;
+    var errno: linux.E = .SUCCESS;
+
+    fn arm(e: linux.E) void {
+        closes = 0;
+        errno = e;
+        gzip_ops.* = .{ .close = close };
+    }
+
+    /// The archive close stays the real call. Only the directory close is
+    /// counted and, on the first one, replaced, so this hook can share
+    /// `gzip_ops.close` with the archive-close tests.
+    fn close(fd: fsx.fd_t) usize {
+        const is_dir = if (fsx.fstat(fd)) |st| st.isDir() else |_| false;
+        const rc = linux.close(fd);
+        if (!is_dir) return rc;
+        closes += 1;
+        if (errno == .SUCCESS or closes > 1) return rc;
+        return @bitCast(-@as(isize, @backingInt(errno)));
+    }
+};
+
+test "dir close: gzip directory close returns EIO and leaves the archive" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-dir-close-eio");
+    defer scratch.deinit();
+    defer gzip_ops.* = .{};
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    GzipDirClose.arm(.IO);
+    var failed_at: GzipStep = .archive;
+    sys.last_errno = .SUCCESS;
+    const before = try test_support.fdCount(gpa);
+    try std.testing.expectError(error.Unexpected, gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at));
+    try std.testing.expectEqual(GzipStep.directory_sync, failed_at);
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(usize, 1), GzipDirClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    try std.testing.expect((try fsx.statAt(dir, "a.log.gz", false)).isReg());
+}
+
+test "dir close: gzip directory close publishes on EINTR" {
+    const gpa = std.testing.allocator;
+    const scratch = try test_support.ScratchDir.init(gpa, "logs-dir-close-eintr");
+    defer scratch.deinit();
+    defer gzip_ops.* = .{};
+    const dir = scratch.fd;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try writeLog(dir, "a.log");
+    GzipDirClose.arm(.INTR);
+    var failed_at: GzipStep = .archive;
+    const before = try test_support.fdCount(gpa);
+    try gzipInPlaceAtStep(gpa, io, dir, "a.log", &failed_at);
+    try std.testing.expectEqual(@as(usize, 1), GzipDirClose.closes);
+    try std.testing.expectEqual(before, try test_support.fdCount(gpa));
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "a.log", false));
+    try std.testing.expect((try fsx.statAt(dir, "a.log.gz", false)).isReg());
 }

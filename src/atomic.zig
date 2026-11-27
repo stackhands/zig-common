@@ -1,9 +1,9 @@
 //! Same-directory replacement of a file whose access metadata must survive:
 //! the bytes, owner, mode and every listed ACL form are written to a
-//! temporary file, read back, made durable, and only then renamed over the
-//! destination. The ACL forms are the GPFS native NFSv4 ACL, the generic
-//! NFSv4 ACL and the POSIX access ACL, most native first; a filesystem may
-//! expose one ACL through several of them.
+//! temporary file, read back, made durable, closed, and only then renamed
+//! over the destination. The ACL forms are the GPFS native NFSv4 ACL, the
+//! generic NFSv4 ACL and the POSIX access ACL, most native first; a
+//! filesystem may expose one ACL through several of them.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
@@ -22,7 +22,9 @@ const posix_access = "system.posix_acl_access";
 /// filesystem's ACL model or a failing call, in a `replaceable` build only
 /// (this library's tests, a tool's -Dtest-ops artifact). `created` runs on
 /// the temporary file right after its O_EXCL creation, where a filesystem
-/// applies an inherited ACL.
+/// applies an inherited ACL. `close` is the temporary file's close before
+/// the rename, and the parent directory's close after its sync; the caller
+/// does not retry either.
 pub const Ops = struct {
     flistxattr: *const fn (fd: sys.fd_t, buf: []u8) usize = realList,
     fgetxattr: *const fn (fd: sys.fd_t, name: [:0]const u8, buf: []u8) usize = realGet,
@@ -31,6 +33,7 @@ pub const Ops = struct {
     fchmod: *const fn (fd: sys.fd_t, mode: u32) usize = realChmod,
     fchown: *const fn (fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize = realChown,
     fsync: *const fn (fd: sys.fd_t) usize = realFsync,
+    close: *const fn (fd: sys.fd_t) usize = realClose,
     openat: *const fn (dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize = realOpenat,
     write: *const fn (fd: sys.fd_t, bytes: []const u8) usize = realWrite,
     renameat: *const fn (old_dir: sys.fd_t, old_path: [*:0]const u8, new_dir: sys.fd_t, new_path: [*:0]const u8) usize = realRenameat,
@@ -70,6 +73,9 @@ fn realChown(fd: sys.fd_t, uid: linux.uid_t, gid: linux.gid_t) usize {
 fn realFsync(fd: sys.fd_t) usize {
     return linux.fsync(fd);
 }
+fn realClose(fd: sys.fd_t) usize {
+    return linux.close(fd);
+}
 fn realOpenat(dir: sys.fd_t, path: [*:0]const u8, flags: sys.O, mode: linux.mode_t) usize {
     return linux.openat(dir, path, flags, mode);
 }
@@ -106,6 +112,22 @@ fn writeTemp(fd: sys.fd_t, bytes: []const u8) sys.Error!void {
         if (n == 0) return error.NoSpace;
         off += n;
     }
+}
+
+/// Close the temporary file once. EINTR is not retried, as Linux has
+/// freed the descriptor, and is not an error, as `sys.result` treats
+/// EINTR. Any other errno is returned with `sys.last_errno` set.
+fn closeTemp(fd: sys.fd_t) sys.Error!void {
+    _ = try sys.result(ops.close(fd));
+}
+
+/// Close a temporary file whose result is not the one being returned.
+/// Linux frees the descriptor whatever close reports, so the result is
+/// ignored, and `sys.last_errno` stays the errno of the failure in hand.
+fn closeDiscarded(fd: sys.fd_t) void {
+    const saved = sys.last_errno;
+    defer sys.last_errno = saved;
+    _ = ops.close(fd);
 }
 
 fn renameTemp(old_path: []const u8, new_path: []const u8) sys.Error!void {
@@ -432,12 +454,19 @@ pub fn fileMode(path: []const u8) u32 {
     return 0o644 & ~currentUmask();
 }
 
-/// Open `path` read-only and fsync it. For a directory, that makes a
-/// rename or a new name in it durable.
+/// Open `path` read-only, fsync it and close it. For a directory, that
+/// makes a rename or a new name in it durable. A failed close is returned
+/// with `sys.last_errno` set. A close that EINTR interrupts is not retried
+/// and is not an error, as `sys.result` treats EINTR. The close goes
+/// through `ops.close`. On an earlier error the cleanup close is ignored
+/// and that errno is kept.
 pub fn fsyncDir(path: []const u8) sys.Error!void {
     const fd = try sys.openat(fsx.cwd, path, .{}, 0);
-    defer sys.close(fd);
+    var open = true;
+    errdefer if (open) closeDiscarded(fd);
     try sys.fsync(fd);
+    open = false;
+    try closeTemp(fd);
 }
 
 /// os.makedirs(path, exist_ok=True): a name that exists as something
@@ -562,13 +591,23 @@ pub const WriteOptions = struct {
 };
 
 /// atomic_write: replace `path` only after its bytes and access metadata
-/// are durable. An existing file keeps its owner, mode and ACL forms,
-/// including the absence of one; `metadata_from` names another file whose
-/// metadata to apply. Fault points STEP.write, STEP.fsync and STEP.rename
-/// precede those operations, and in a replaceable build can fail them
-/// (Faults.fails); the destination is never unlinked first. Everything it
-/// allocates from `a` is freed before it returns, except the failure message
-/// in `why`. Call `why.deinit(a)` after any error.
+/// are durable. The temporary file is synced and closed before the rename.
+/// A failed close is reported the way a failed write or fsync is, with
+/// no path in the message; the temporary file is removed and the
+/// destination is left as it was. The descriptor is closed once on every
+/// path. A close that EINTR interrupts is not retried, as Linux has freed
+/// the descriptor, and is not an error, as `sys.result` treats EINTR; the
+/// fsync before it has already flushed the bytes. An existing file keeps
+/// its owner, mode and ACL forms, including the absence of one;
+/// `metadata_from` names another file whose metadata to apply. Fault
+/// points STEP.write, STEP.fsync and STEP.rename precede those
+/// operations, and in a replaceable build can fail them (Faults.fails);
+/// the destination is never unlinked first. The close goes through
+/// `ops.close`. After the rename the parent directory is synced and closed
+/// through that same call. A failed close of the directory is reported
+/// with no path, and the destination keeps the bytes the rename published.
+/// Everything it allocates from `a` is freed before it returns, except the
+/// failure message in `why`. Call `why.deinit(a)` after any error.
 pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: WriteOptions, why: *Why) Error!void {
     sys.last_errno = .SUCCESS;
     const parent = if (std.fs.path.dirname(path)) |d| (if (d.len > 0) d else ".") else ".";
@@ -608,30 +647,34 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     const created = fsx.fstat(fd) catch |err| {
         // os.fstat names no path. Record that before the cleanup calls.
         const failed = failOs(a, why, err, null, null);
-        sys.close(fd);
         // Created above with O_EXCL, so it is this call's file. A failed
         // cleanup must not replace the errno the message was built from.
+        closeDiscarded(fd);
         const saved = sys.last_errno;
         defer sys.last_errno = saved;
         sys.unlinkat(fsx.cwd, tmp, 0) catch {};
         return failed;
     };
     ops.created(fd);
+    var open = true;
     var renamed = false;
     errdefer if (!renamed) discard(tmp, created);
+    defer if (open) closeDiscarded(fd);
+    writeTemp(fd, data) catch |err| return failOs(a, why, err, null, null);
     {
-        defer sys.close(fd);
-        writeTemp(fd, data) catch |err| return failOs(a, why, err, null, null);
         var inner: Why = .{};
         defer inner.deinit(a);
         restoreMetadata(a, fd, metadata, mode, &inner) catch |err| return refuse(a, why, "cannot preserve access metadata for {s}: {s}", .{ path, if (err == error.Refused) inner.msg else describe(err) });
-        {
-            const step = try a.print("{s}.fsync", .{opts.step});
-            defer a.free(step);
-            if (opts.faults.fails(step)) return injected(a, why, step);
-        }
-        _ = op(ops.fsync, .{fd}) catch |err| return failOs(a, why, err, null, null);
     }
+    {
+        const step = try a.print("{s}.fsync", .{opts.step});
+        defer a.free(step);
+        if (opts.faults.fails(step)) return injected(a, why, step);
+    }
+    _ = op(ops.fsync, .{fd}) catch |err| return failOs(a, why, err, null, null);
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    closeTemp(fd) catch |err| return failOs(a, why, err, null, null);
     if (metadata) |m| {
         var inner: Why = .{};
         defer inner.deinit(a);
@@ -648,19 +691,27 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     renamed = true;
     // Opening the directory names it. Flushing the descriptor names no file.
     const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
-    defer sys.close(directory);
+    var dir_open = true;
+    defer if (dir_open) closeDiscarded(directory);
     sys.fsync(directory) catch |err| return failOs(a, why, err, null, null);
+    dir_open = false;
+    closeTemp(directory) catch |err| return failOs(a, why, err, null, null);
 }
 
 /// atomic_write pinned to an open directory: replace `dir/name` with
 /// `bytes` at exactly `mode`, whatever the process umask leaves, as
 /// the tools' metrics writer does with the descriptor it holds. The
-/// bytes go to a temporary file in the same directory, made durable,
-/// and only then renamed over the destination; a failure leaves the
-/// destination as it was and removes the temporary file. Shares
-/// atomicWrite's write, sync and rename steps, through the same ops a
-/// replaceable build may fail. Everything it allocates from `a` is
-/// freed before it returns.
+/// bytes go to a temporary file in the same directory, synced and
+/// closed, and only then renamed over the destination. A failed write,
+/// fchmod, fsync or close is returned with `sys.last_errno` set to its
+/// errno; the destination is left as it was and the temporary file is
+/// removed. A write lost on NFS may be reported only by the close. The
+/// descriptor is closed once on every path. A close that EINTR
+/// interrupts is not retried, as Linux has freed the descriptor, and is
+/// not an error, as `sys.result` treats EINTR; the fsync before it has
+/// already flushed the bytes. Shares atomicWrite's write, sync, close
+/// and rename steps, through the same ops a replaceable build may fail.
+/// Everything it allocates from `a` is freed before it returns.
 pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []const u8, mode: u32) (Allocator.Error || sys.Error)!void {
     sys.last_errno = .SUCCESS;
     var rnd: [4]u8 = undefined;
@@ -671,9 +722,10 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
     const ztmp = try sys.z(&zb, tmp);
     const flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
     const fd: sys.fd_t = @intCast(try op(ops.openat, .{ dir, ztmp.ptr, flags, @as(linux.mode_t, 0o600) }));
+    var open = true;
     var done = false;
     defer {
-        sys.close(fd);
+        if (open) closeDiscarded(fd);
         if (!done) {
             // The temporary name may already be gone. That failure is not
             // the call the caller is reporting.
@@ -687,6 +739,9 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
     _ = try op(ops.fchmod, .{ fd, mode });
     try writeTemp(fd, data);
     _ = try op(ops.fsync, .{fd});
+    // Once, before the rename. A later failure must not close again.
+    open = false;
+    try closeTemp(fd);
     var zn: [sys.path_max:0]u8 = undefined;
     _ = try op(ops.renameat, .{ dir, ztmp.ptr, dir, (try sys.z(&zn, name)).ptr });
     done = true;

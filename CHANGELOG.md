@@ -2,6 +2,46 @@
 
 <!-- towncrier release notes start -->
 
+## 0.14.0 (2026-11-26)
+
+### Features
+
+- `env_scrub.childClearNames` returns the install-location names in
+  `src/env-scrub.json`, in the order `eb-local env` prints them.
+- `logs.gzipInPlaceAtStep` compresses a log as `logs.gzipInPlace` does, and on an error sets a `logs.GzipStep` that says whether the error came before the archive was in place (`archive`) or from the sync of its directory afterwards (`directory_sync`). `gzipInPlace` keeps its signature and calls it.
+
+### Fixes
+
+- `atomic.atomicWrite` and `atomic.atomicWriteAt` sync and close the temporary file before renaming it over the destination. A failed close is returned as `sys.Error`, the destination is left as it was, and the temporary file is removed. `atomicWrite` puts that errno in `why` with no path, as it does for a failed write or fsync. Before this change, `atomicWrite` ignored the close, and `atomicWriteAt` closed only after the rename and ignored the result. A write that the Network File System (NFS) reported lost at the close then replaced the destination and was returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The call is replaceable through `atomic.ops.close` in the same builds as the other `atomic.ops` calls.
+- `fsx.TempDir.get` does not keep a directory whose probe file close fails, so a write that a network file system (NFS) reported lost at the close is not committed as the temporary directory. The probe file is removed. A close that `EINTR` interrupts counts as success and is not retried. The close goes through `fsx.temp_probe_ops`.
+- `fsx.absPath` returns `Error` as well as `Allocator.Error` in its error set, which is a source-breaking change for callers that switch exhaustively on its errors. It handles a removed working directory, reporting `error.NotFound`.
+- `fsx.appendLine` closes the list after the line is written and returns that close. A failed close is returned as `sys.Error` with `sys.last_errno` set. The line is not removed, because the descriptor is already gone and the file is not shortened back to its old size. Before this change the close result was ignored, so a write that a network file system (NFS) reported lost at the close was returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The close is replaceable through `fsx.publish_ops` in the same builds as `atomic.ops`. A cleanup close on an earlier error still ignores its result so the earlier error keeps its errno.
+- `fsx.copyTo` closes the temporary file before the rename that publishes it. A failed close is returned with `sys.last_errno` set, the destination keeps its old contents, and the temporary file is removed. A close that `EINTR` interrupts counts as success and is not retried. The caller still gets an open descriptor of the published file.
+- `fsx.moveAcross` closes a copied directory after syncing it and before the rename that publishes the copy, including each directory of a copied tree. `fsx.copyTo` and `moveAcross` close the parent directory after the sync that makes the new name durable. `atomic.fsyncDir` and the parent directory sync in `atomic.atomicWrite` check that close as well, as does the directory sync at the end of `logs.gzipInPlace`. A failed close is returned as `sys.Error`. A close on the way out of an earlier error is ignored and that errno is kept. Before this change those closes were ignored, so a directory sync that a network file system (NFS) reported lost only at the close was returned as success. Before the rename, a failure leaves the destination name as it was and removes the temporary path. After the rename, the published name keeps what the rename put there. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The closes go through `fsx.publish_ops`, `atomic.ops.close` and `logs.gzip_ops` in the same builds as the other replaceable calls.
+- `fsx.replaceContents` closes the file before the rename that publishes it. So does the cross-device copy inside `fsx.moveAcross`, for a regular file and for each regular file of a copied tree. A failed close is returned as `sys.Error`, the destination is left as it was, and the temporary path is removed. Before this change, the close of `replaceContents` ran after the rename, and the copy ignored the result of its close. A write that the Network File System (NFS) reported lost at the close was then published and returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The close is replaceable through `fsx.publish_ops` in the same builds as `atomic.ops`.
+- `logs.gzipInPlace` and `logs.gzipInPlaceAtStep` sync and close the temporary archive before renaming it over `name.gz`. A failed close is returned as `sys.Error`, the temporary file is removed, and the log and any existing archive are left as they were. Before this change the archive was closed after the rename and the close error was dropped, so a write that a network file system (NFS) reported lost at the close published `name.gz`, removed the log, and was returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The call is replaceable through `logs.gzip_ops` in the same builds as `atomic.ops`.
+- `state.RootLock.release` reports a failed release of the state-root lock. It closes both lock files and returns the first error as `sys.Error`. It used to drop that error, so callers that discarded the result have to handle it.
+- `state.createPrivateAt` returns a failed close of the file it creates as `sys.Error`, with that errno in `sys.last_errno`. The created name is left in place, including when the close fails. Before this change the close was ignored, so a write that a network file system (NFS) reported lost at the close was returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. After an earlier error, the cleanup close ignores its result and keeps that error's errno. The close goes through `state.write_ops.close`, the same replaceable call `state.writePrivate` uses.
+- `state.writePrivate` syncs and closes the temporary file before it renames it over the name. A failed fsync or close is returned as `sys.Error`, the name is left as it was, and the temporary file is removed. Before this change the file was closed after the rename and the close error was dropped, so a write that a network file system (NFS) reported lost at the close replaced the name and was returned as success. A close that `EINTR` interrupts is not retried and is not an error, as `sys.result` treats `EINTR`. The calls are replaceable through `state.write_ops` in the same builds as `state.lock_ops`.
+
+### Documentation
+
+- The API reference and the compress-and-mark-logs how-to list `logs.GzipStep` and `logs.gzipInPlaceAtStep`, and the how-to shows how to read the step an error came from.
+- The README module table lists `argparse`, and COMPAT.md names eb-local as a consumer of 0.13.0.
+- `logs.GzipStep` says that an `archive` error from opening `name` changes nothing, so a `name` that was already absent stays absent and any `name.gz` already there is left alone, that after a later `archive` error the original is still there and `name.gz` is absent unless it existed before or both the removal of the original and the removal of the archive failed, and that `directory_sync` follows one rename and one unlink.
+
+### Miscellaneous
+
+- Add a descriptor count around the `proc` paths that call `sys.keepAboveStdio`, checking `/proc/self/fd` before and after so a leaked descriptor fails the test.
+- Add a test that `state.RootLock.release` returns the error when the `fcntl` or `flock` release fails through `state.lock_ops`, returns the record lock error when both fail, and closes both lock descriptors in each case.
+- Add a test that `sys.keepAboveStdio` returns `error.Unexpected` and leaves the original descriptor open when duplication fails with `EMFILE`.
+- Add tests that `state.writePrivate` returns a failed `fsync` or `close` injected through `state.write_ops`, closes the descriptor once, leaves the name and no temporary file, retries an `fsync` that `EINTR` interrupts, and treats a `close` that `EINTR` interrupts as success without a retry.
+- Move the forked-child wait that retries an interrupted `wait4` into the shared test helper.
+- Move the open-descriptor count into a shared test helper and return an error when reading `/proc/self/fd` fails.
+- Move the scratch directory the `logs` tests and the `fsx` `moveAcross` fixture make into `test_support.ScratchDir`, which removes a directory left by an earlier run of the same pid before it creates its own.
+- Prepare `zig-common` `0.14.0` in `COMPAT.md` for callers of `fsx.absPath`, whose error set now includes `Error` as well as `Allocator.Error`.
+
+
 ## 0.13.0 (2026-11-24)
 
 ### Features

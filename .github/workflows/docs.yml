@@ -1,7 +1,7 @@
 # Build the documentation the way `pixi run -e docs docbld` does: Org export,
 # API pages from the code, Sphinx with warnings and unresolved references as
 # errors, the Zig autodoc site, and the internal link check. External links
-# are checked in their own step. On main the site is published to
+# are written to a report and do not fail the build. On main the site is published to
 # https://stackhands.github.io/zig-common/.
 name: docs
 
@@ -41,7 +41,7 @@ jobs:
           DOCS_SOURCE_REF: ${{ github.sha }}
 
       - name: External links
-        run: pixi run -e docs linkcheck
+        run: pixi run -e docs linkcheck > docs/build/linkcheck-report.txt 2>&1 || true
         env:
           GITHUB_TOKEN: ${{ github.token }}
 

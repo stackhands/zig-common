@@ -190,16 +190,41 @@ pub fn readPrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, limit: usize
 /// umask cannot bite it. The name is created and closed in one step;
 /// nothing is renamed, so another name's file is never touched. A
 /// symbolic link at the name is refused without being followed, as
-/// `openPrivate` refuses one.
+/// `openPrivate` refuses one. The descriptor is closed once on every
+/// path. A failed close is returned with
+/// `sys.last_errno` set to its errno. The created name is left in place
+/// on a failed close, and on a failed fchmod or write: nothing unlinks
+/// it. A write lost on NFS may be reported only by the close. A close
+/// that EINTR interrupts is not retried, as Linux has freed the
+/// descriptor, and is not an error, as `sys.result` treats EINTR. A
+/// close that only releases the descriptor after an earlier error
+/// ignores its result, so `sys.last_errno` stays that error's errno.
 pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode: u32) Error!void {
     const fd = try sys.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, 0o600);
-    defer sys.close(fd);
+    var open = true;
+    defer {
+        if (open) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            _ = write_ops.close(fd);
+        }
+    }
     try sys.fchmod(fd, mode);
     try sys.writeAll(fd, bytes);
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
 }
 
 /// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
-/// mode 0600, then renamed over the name.
+/// mode 0600, flushed with fsync and closed, then renamed over the name.
+/// A failed write, fchmod, fsync or close is returned with `sys.last_errno`
+/// set to its errno; the name is left as it was and the temporary file is
+/// removed. A write lost on NFS may be reported only by the close. The
+/// descriptor is closed once on every path. A close that EINTR
+/// interrupts is not retried, as Linux has freed the descriptor, and is
+/// not an error, as `sys.result` treats EINTR; the fsync before it has
+/// already flushed the bytes.
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
@@ -208,15 +233,46 @@ pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []co
     const tmp = try gpa.print("{s}/.{s}.{d}.{x}.tmp", .{ parent, base, linux.getpid(), rnd });
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
+    var open = true;
     var done = false;
     defer {
-        sys.close(fd);
-        if (!done) sys.unlinkat(dir, tmp, 0) catch {};
+        if (open) _ = write_ops.close(fd);
+        if (!done) {
+            // The error being returned keeps its errno.
+            const saved = sys.last_errno;
+            defer sys.last_errno = saved;
+            sys.unlinkat(dir, tmp, 0) catch {};
+        }
     }
     try sys.writeAll(fd, bytes);
     try sys.fchmod(fd, 0o600);
+    _ = try lockCall(write_ops.fsync, .{fd});
+    open = false;
+    _ = try sys.result(write_ops.close(fd));
     try sys.renameat(dir, tmp, dir, name);
     done = true;
+}
+
+/// Raw results of the calls `writePrivate` makes on its temporary file
+/// (`fsync` and `close`) and of the close `createPrivateAt` checks on
+/// the file it creates. Replaceable in the same builds as `lock_ops`;
+/// constant real calls in any other build.
+pub const WriteOps = struct {
+    fsync: *const fn (fd: fsx.fd_t) usize = realFsync,
+    close: *const fn (fd: fsx.fd_t) usize = realClose,
+};
+
+var test_write_ops: WriteOps = .{};
+const real_write_ops: WriteOps = .{};
+/// The calls in use. A replaceable build may assign through it
+/// (`write_ops.* = ...`); any other build points it at constant real calls.
+pub const write_ops = if (@import("atomic.zig").replaceable) &test_write_ops else &real_write_ops;
+
+fn realFsync(fd: fsx.fd_t) usize {
+    return linux.fsync(fd);
+}
+fn realClose(fd: fsx.fd_t) usize {
+    return linux.close(fd);
 }
 
 test "createPrivateAt creates without clobbering" {
@@ -335,32 +391,25 @@ test "lockExclusive waits out the timeout while signals arrive" {
     var prev: linux.Sigaction = undefined;
     _ = linux.sigaction(.USR1, &handler, &prev);
     defer _ = linux.sigaction(.USR1, &prev, null);
-    const Stop = struct {
-        var go = std.atomic.Value(bool).init(true);
-        fn buzz() void {
-            // This thread must not catch SIGUSR1, or the waiter's sleep is
-            // never the one the signal interrupts.
-            var blocked = linux.sigemptyset();
-            linux.sigaddset(&blocked, .USR1);
-            _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
-            while (go.load(.acquire)) {
-                _ = linux.kill(linux.getpid(), .USR1);
-                var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = linux.nanosleep(&ts, null);
-            }
+    const Ping = struct {
+        var go = std.atomic.Value(bool).init(false);
+        fn once() void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            _ = linux.kill(linux.getpid(), .USR1);
         }
     };
-    Stop.go.store(true, .release);
-    const buzz = try std.Thread.spawn(.{}, Stop.buzz, .{});
+    Ping.go.store(false, .release);
+    const ping = try std.Thread.spawn(.{}, Ping.once, .{});
+    defer ping.join();
+    const timeout_ms: u64 = 30;
     var t0: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t0);
-    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, 400));
+    Ping.go.store(true, .release);
+    try std.testing.expectError(error.TimedOut, lockExclusive(waiter, timeout_ms));
     var t1: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &t1);
-    Stop.go.store(false, .release);
-    buzz.join();
     const ms = (t1.sec - t0.sec) * 1000 + @divTrunc(t1.nsec - t0.nsec, 1_000_000);
-    try std.testing.expect(ms >= 300 and ms < 5000);
+    try std.testing.expect(ms + 1 >= timeout_ms);
 }
 
 test "a lock that fails reports its errno, with or without a timeout" {
@@ -398,7 +447,7 @@ test "lockExclusive takes the timeout flock -w seconds give" {
     const Holder = struct {
         var fd: fsx.fd_t = -1;
         fn letGo() void {
-            var ts: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
             _ = linux.nanosleep(&ts, null);
             _ = linux.flock(fd, std.posix.LOCK.UN);
         }
@@ -591,16 +640,34 @@ pub const RootLock = struct {
 
     /// Unlock the record lock, close its descriptor, then unlock and close
     /// the gate. Both descriptors are closed whatever an unlock returns; a
-    /// forked child only closes them.
-    pub fn release(l: RootLock) void {
+    /// forked child only closes them. The first unlock error is returned
+    /// after both closes, as Python's release lets the OSError out, and
+    /// `sys.last_errno` holds that error's errno, not a later one's.
+    pub fn release(l: RootLock) sys.Error!void {
+        var first: ?sys.Error = null;
+        var first_errno: linux.E = .SUCCESS;
         if (linux.getpid() == l.owner) {
             var fl: linux.Flock = std.mem.zeroes(linux.Flock);
             fl.type = linux.F.UNLCK;
-            _ = lock_ops.fcntl(l.posix, linux.F.SETLK, @intFromPtr(&fl));
+            _ = lockCall(lock_ops.fcntl, .{ l.posix, linux.F.SETLK, @intFromPtr(&fl) }) catch |err| {
+                first = err;
+                first_errno = sys.last_errno;
+            };
         }
         sys.close(l.posix);
-        if (linux.getpid() == l.owner) _ = lock_ops.flock(l.gate, std.posix.LOCK.UN);
+        if (linux.getpid() == l.owner) {
+            _ = lockCall(lock_ops.flock, .{ l.gate, std.posix.LOCK.UN }) catch |err| {
+                if (first == null) {
+                    first = err;
+                    first_errno = sys.last_errno;
+                }
+            };
+        }
         sys.close(l.gate);
+        if (first) |err| {
+            sys.last_errno = first_errno;
+            return err;
+        }
     }
 };
 
@@ -637,7 +704,7 @@ fn realOpenLock(dir: fsx.fd_t, name: [*:0]const u8) usize {
     return linux.openat(dir, name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0o600);
 }
 
-/// One of `lock_ops`, retrying on EINTR.
+/// One of `lock_ops` or `write_ops`, retrying on EINTR.
 fn lockCall(f: anytype, args: anytype) Error!usize {
     while (true) {
         if (try sys.result(@call(.auto, f, args))) |rc| return rc;
@@ -781,9 +848,9 @@ test "RootLock refuses a second holder and is free after release" {
     defer fsx.deleteTree(gpa, fsx.cwd, base) catch {};
     const first = try RootLock.acquire(gpa, base, 0);
     try std.testing.expectError(error.Busy, RootLock.acquire(gpa, base, 0));
-    first.release();
+    first.release() catch unreachable;
     const again = try RootLock.acquire(gpa, base, 0);
-    again.release();
+    again.release() catch unreachable;
 }
 
 test "lockExclusiveCancel returns Canceled when cancel is set" {
@@ -859,7 +926,7 @@ test "creating the gate in a read-only directory names .lock" {
     const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
     const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-ro-{d}", .{ cwd, linux.getpid() });
     const held = try RootLock.acquire(gpa, base, 0);
-    held.release();
+    held.release() catch unreachable;
     var zb: [sys.path_max:0]u8 = undefined;
     const gate = try std.mem.print(zb[0..zb.len], "{s}/.lock", .{base});
     try sys.unlinkat(fsx.cwd, gate, 0);

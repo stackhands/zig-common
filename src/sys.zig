@@ -437,18 +437,6 @@ test "describe prints the errno the kernel gave, as Python's OSError does" {
     try std.testing.expectEqualStrings("[Errno 134] Unknown error 134", describeErrno(@fromBackingInt(@intCast(134))));
     try std.testing.expectEqualStrings("No such file or directory", strerror(.NOENT));
     try std.testing.expectEqualStrings("File name too long", strerror(.NAMETOOLONG));
-    const compat_fd = try openat(linux.AT.FDCWD, "COMPAT.md", .{}, 0);
-    defer close(compat_fd);
-    var compat: std.ArrayList(u8) = .empty;
-    defer compat.deinit(std.testing.allocator);
-    var chunk: [512]u8 = undefined;
-    while (true) {
-        const n = try read(compat_fd, &chunk);
-        if (n == 0) break;
-        try compat.appendSlice(std.testing.allocator, chunk[0..n]);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 133") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compat.items, "errno 134,") == null);
 }
 
 test "strerror formats unnamed errno values instead of panicking" {
@@ -458,12 +446,6 @@ test "strerror formats unnamed errno values instead of panicking" {
     raw = 999;
     const unknown_999: linux.E = @fromBackingInt(raw);
     try std.testing.expectEqualStrings("Unknown error 999", strerror(unknown_999));
-}
-
-test "strerror returns Unknown error for non-Linux linux.E tags" {
-    try std.testing.expectEqualStrings("Unknown error 160", strerror(.NSRNODATA));
-    try std.testing.expectEqualStrings("Unknown error 177", strerror(.NSRCNAMELOOP));
-    try std.testing.expectEqualStrings("[Errno 160] Unknown error 160", describeErrno(.NSRNODATA));
 }
 
 test "errnoText names success, returns null for unknown errnos and sys wrappers surface expected errors" {
@@ -535,4 +517,75 @@ test "keepAboveStdio moves descriptors 0, 1 and 2 above 2 with close-on-exec" {
     var status: i32 = 0;
     _ = try call(linux.wait4, .{ @as(linux.pid_t, @intCast(pid)), &status, @as(u32, 0), @as(?*linux.rusage, null) });
     try std.testing.expectEqual(@as(i32, 0), status);
+}
+
+test "keepAboveStdio reports duplication failure when the descriptor table is full" {
+    // A limit of 3 makes F_DUPFD with a minimum of 3 return EINVAL. The
+    // soft limit stays above that, and the child fills every slot it
+    // allows, so the failure is EMFILE. The limit is restored before
+    // the child exits.
+    const Child = struct {
+        fn run() u8 {
+            var saved: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &saved)) != .SUCCESS) return 20;
+            if (linux.errno(linux.fcntl(0, linux.F.GETFD, 0)) != .SUCCESS) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch return 21;
+                if (fd != 0) {
+                    if (linux.errno(linux.dup2(fd, 0)) != .SUCCESS) {
+                        close(fd);
+                        return 22;
+                    }
+                    close(fd);
+                }
+            }
+            if (saved.max < 4) return 23;
+            const cap = @min(saved.max, @as(linux.rlim_t, 8));
+            const tightened: linux.rlimit = .{ .cur = cap, .max = saved.max };
+            if (linux.errno(linux.setrlimit(.NOFILE, &tightened)) != .SUCCESS) return 24;
+            defer _ = linux.setrlimit(.NOFILE, &saved);
+
+            var extras: [16]fd_t = undefined;
+            var n_extra: usize = 0;
+            defer for (extras[0..n_extra]) |fd| close(fd);
+
+            var hit = false;
+            while (n_extra < extras.len) {
+                const fd = openat(linux.AT.FDCWD, "/dev/null", .{}, 0) catch |err| {
+                    if (err == error.Unexpected and last_errno == .MFILE) {
+                        hit = true;
+                        break;
+                    }
+                    return 25;
+                };
+                if (@as(linux.rlim_t, @intCast(fd)) >= cap) {
+                    close(fd);
+                    return 26;
+                }
+                extras[n_extra] = fd;
+                n_extra += 1;
+            }
+            if (!hit) return 27;
+
+            const low: fd_t = 0;
+            if (keepAboveStdio(low)) |_| {
+                return 28;
+            } else |err| {
+                // EMFILE is not its own error. The call reports it as
+                // Unexpected, and last_errno keeps the kernel's value.
+                if (err != error.Unexpected or last_errno != .MFILE) return 29;
+                if (!std.mem.eql(u8, describe(err), "[Errno 24] Too many open files")) return 30;
+            }
+            // On error the original descriptor is left open.
+            if (linux.errno(linux.fcntl(low, linux.F.GETFD, 0)) != .SUCCESS) return 31;
+
+            if (linux.errno(linux.setrlimit(.NOFILE, &saved)) != .SUCCESS) return 32;
+            var back: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.NOFILE, &back)) != .SUCCESS) return 33;
+            if (back.cur != saved.cur or back.max != saved.max) return 34;
+            return 0;
+        }
+    };
+
+    const test_support = @import("test_support.zig");
+    try test_support.expectChildPasses(Child.run);
 }

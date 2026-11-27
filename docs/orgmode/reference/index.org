@@ -15,4 +15,5 @@ Each page states facts in the order the thing itself has them.
    compatibility
    api
    environment-diff
+   env-scrub
 #+end_export

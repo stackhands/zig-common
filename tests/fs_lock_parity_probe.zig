@@ -295,8 +295,11 @@ fn osFailMode() void {
 
 fn lockCase(name: []const u8, root: []const u8) void {
     if (state.RootLock.acquire(A, root, 0)) |held| {
-        held.release();
-        emit(&.{ "rootlock", name, "OK", "", "" });
+        const status = if (held.release()) |_|
+            "OK"
+        else |e|
+            std.fmt.allocPrint(A, "ERR:release:{s}", .{@errorName(e)}) catch unreachable;
+        emit(&.{ "rootlock", name, status, "", "" });
     } else |e| {
         const status = std.fmt.allocPrint(A, "ERR:{s}", .{@errorName(e)}) catch unreachable;
         if (state.osFailure()) |failure| {
@@ -997,7 +1000,7 @@ fn openLockFile(path: []const u8) sys.fd_t {
 fn tryLockMode(path: []const u8) void {
     const fd = openLockFile(path);
     defer sys.close(fd);
-    const result = state.lockExclusive(fd, 400);
+    const result = state.lockExclusive(fd, 30);
     if (result) |_| {
         put("lockExclusive\tOK\n");
     } else |e| {
