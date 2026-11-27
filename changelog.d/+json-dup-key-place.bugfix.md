@@ -1,0 +1,1 @@
+`json.toPy` now matches `json.loads` on duplicate object keys. It keeps the first index of a repeated key and stores the last value there. Keys match after escape decoding, so `\u0062` and `b` are one key. A dropped value stays undecoded, so a lone surrogate in it does not fail the document. Before this change the kept member moved to the later index.
