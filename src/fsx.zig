@@ -169,16 +169,27 @@ pub fn normPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Join `head` and a relative `tail` as `posixpath.join` does. An empty
+/// `head`, or one that already ends in `/`, gains no extra slash, so a
+/// working directory of `/` stays a single slash.
+fn joinRelative(gpa: Allocator, head: []const u8, tail: []const u8) Allocator.Error![]u8 {
+    if (head.len == 0 or head[head.len - 1] == '/') {
+        return std.mem.concat(gpa, u8, &.{ head, tail });
+    }
+    return std.mem.concat(gpa, u8, &.{ head, "/", tail });
+}
+
 /// Return a normalized absolute path like Python's `os.path.abspath`,
 /// joining relative paths to the current working directory without
-/// following symbolic links. The caller owns the returned slice. A
+/// following symbolic links. The join adds `/` only when that directory
+/// does not already end in one. The caller owns the returned slice. A
 /// relative path is `error.NotFound` when that directory has been
 /// removed, as `os.getcwd` reports.
 pub fn absPath(gpa: Allocator, path: []const u8) (Error || Allocator.Error)![]u8 {
     if (std.mem.startsWith(u8, path, "/")) return normPath(gpa, path);
     var buf: [sys.path_max]u8 = undefined;
     const cwd_path = try getcwd(&buf);
-    const joined = try std.mem.concat(gpa, u8, &.{ cwd_path, "/", path });
+    const joined = try joinRelative(gpa, cwd_path, path);
     defer gpa.free(joined);
     return normPath(gpa, joined);
 }
@@ -237,6 +248,41 @@ test "absPath reports a removed working directory" {
     const abs = try absPath(gpa, "/tmp/./x/../y");
     defer gpa.free(abs);
     try std.testing.expectEqualStrings("/tmp/y", abs);
+}
+
+test "absPath joins a root working directory with one slash" {
+    const gpa = std.testing.allocator;
+    var here_buf: [sys.path_max]u8 = undefined;
+    const here = try realpath(cwd, ".", &here_buf);
+    var hz: [sys.path_max:0]u8 = undefined;
+    const here_z = try sys.z(&hz, here);
+    try std.testing.expectEqual(@as(usize, 0), linux.chdir("/"));
+    defer _ = linux.chdir(here_z.ptr);
+
+    // os.path.abspath("/") is "/". os.path.join("/", rel) does not insert
+    // a second slash, and normpath keeps a leading pair, so a join of
+    // "/" + "/" + rel would be "//...".
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "", .want = "/" },
+        .{ .in = ".", .want = "/" },
+        .{ .in = "..", .want = "/" },
+        .{ .in = "a/./b/../c", .want = "/a/c" },
+        .{ .in = "a/../../b", .want = "/b" },
+        .{ .in = "/tmp/./x/../y", .want = "/tmp/y" },
+    };
+    for (cases) |tc| {
+        const got = try absPath(gpa, tc.in);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(tc.want, got);
+    }
+
+    // A relative temporary-directory candidate is normalized the same way.
+    var env: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer env.deinit(gpa);
+    try env.put(gpa, "TMPDIR", "tmp");
+    var td: TempDir = .{};
+    defer td.deinit(gpa);
+    try std.testing.expectEqualStrings("/tmp", try td.get(gpa, env));
 }
 
 /// Open an existing regular file for reading. `follow` decides whether a
@@ -1213,7 +1259,7 @@ fn tempDirPath(gpa: Allocator, candidate: []const u8) (Error || Allocator.Error)
     if (candidate[0] == '/') return normPath(gpa, candidate);
     var buf: [sys.path_max]u8 = undefined;
     const here = try getcwd(&buf);
-    const joined = try std.mem.concat(gpa, u8, &.{ here, "/", candidate });
+    const joined = try joinRelative(gpa, here, candidate);
     defer gpa.free(joined);
     return normPath(gpa, joined);
 }
