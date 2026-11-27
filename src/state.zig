@@ -216,8 +216,10 @@ pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode:
     _ = try sys.result(write_ops.close(fd));
 }
 
-/// Replace `dir/name` with `bytes`: written to `.NAME.PID.RANDOM.tmp` with
-/// mode 0600, flushed with fsync and closed, then renamed over the name.
+/// Replace `dir/name` with `bytes`: written beside `name` with mode 0600,
+/// flushed with fsync and closed, then renamed over the name. The
+/// temporary name is `.NAME.PID.RANDOM.tmp` when that fits in one path
+/// component, and `.PID.RANDOM.tmp` when the name would make it longer.
 /// A failed write, fchmod, fsync or close is returned with `sys.last_errno`
 /// set to its errno; the name is left as it was and the temporary file is
 /// removed. A write lost on NFS may be reported only by the close. The
@@ -228,9 +230,9 @@ pub fn createPrivateAt(dir: fsx.fd_t, name: []const u8, bytes: []const u8, mode:
 pub fn writePrivate(gpa: Allocator, dir: fsx.fd_t, name: []const u8, bytes: []const u8) (Error || Allocator.Error)!void {
     var rnd: [6]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const parent = std.fs.path.dirname(name) orelse ".";
-    const base = std.fs.path.basename(name);
-    const tmp = try gpa.print("{s}/.{s}.{d}.{x}.tmp", .{ parent, base, linux.getpid(), rnd });
+    const tag = try gpa.print("{d}.{x}", .{ linux.getpid(), rnd });
+    defer gpa.free(tag);
+    const tmp = try fsx.tempBeside(gpa, name, tag);
     defer gpa.free(tmp);
     const fd = try sys.openat(dir, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, 0o600);
     var open = true;
@@ -363,6 +365,53 @@ test "writePrivate handles nested names under the opened directory" {
     const got = (try readPrivate(gpa, d, "sub/c.json", 1024)).?;
     defer gpa.free(got);
     try std.testing.expectEqualStrings("{\"v\":2}\n", got);
+}
+
+test "writePrivate stores a name its own temporary file alone would overflow" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-state-long-{d}", .{ cwd, linux.getpid() });
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const d = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(d);
+    }
+
+    // 240 bytes fits in one path component. Adding a pid and a random
+    // suffix on top overflows that component for any pid width.
+    var name_buf: [240]u8 = undefined;
+    @memset(&name_buf, 's');
+    const name = &name_buf;
+    try writePrivate(gpa, d, name, "state\n");
+    const got = (try readPrivate(gpa, d, name, 64)).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("state\n", got);
+    try std.testing.expectEqual(@as(u32, 0o600), (try fsx.statAt(d, name, false)).perm());
+
+    var long_buf: [255]u8 = undefined;
+    @memset(&long_buf, 'u');
+    try writePrivate(gpa, d, &long_buf, "edge\n");
+    const edge = (try readPrivate(gpa, d, &long_buf, 64)).?;
+    defer gpa.free(edge);
+    try std.testing.expectEqualStrings("edge\n", edge);
+
+    var too_buf: [256]u8 = undefined;
+    @memset(&too_buf, 't');
+    try std.testing.expectError(error.NameTooLong, writePrivate(gpa, d, &too_buf, "nope\n"));
+    try std.testing.expectError(error.NameTooLong, readPrivate(gpa, d, &too_buf, 64));
+
+    var it = try fsx.DirIter.init(gpa, d);
+    defer it.deinit(gpa);
+    var seen: usize = 0;
+    while (try it.next()) |e| {
+        seen += 1;
+        try std.testing.expect(e.name[0] != '.');
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
 }
 
 fn onUsr1(_: linux.SIG) callconv(.c) void {}

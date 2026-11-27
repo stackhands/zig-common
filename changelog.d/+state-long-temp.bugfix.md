@@ -1,0 +1,1 @@
+A private state file can fill most of one path component with its name. `writePrivate` built its temporary name from that name, a process id and a random suffix. A name under 255 bytes could then fail with `error.NameTooLong`. Now the temporary name keeps the suffix. It drops the original name when the combined temporary name would pass 255 bytes.

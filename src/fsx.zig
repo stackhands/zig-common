@@ -597,6 +597,27 @@ fn sameNameParent(a_dir: fd_t, a_name: []const u8, b_dir: fd_t, b_name: []const 
     return a_dir == b_dir and std.mem.eql(u8, a, b);
 }
 
+/// The longest one path component may be on the filesystems these tools
+/// use. ext4, xfs, btrfs and tmpfs all share this limit.
+const name_component_max = 255;
+
+/// A temporary path in the same directory as `name`. `tag` is a pid and
+/// a random suffix, already formatted. The result is
+/// `{parent}/.{base}.{tag}.tmp` when that component fits in
+/// `name_component_max` bytes, and `{parent}/.{tag}.tmp` when the base
+/// would push it over. The suffix alone keeps two temporary files in one
+/// directory from colliding, so a final name that fits is not failed by
+/// the temporary one. The caller frees the result.
+pub fn tempBeside(gpa: Allocator, name: []const u8, tag: []const u8) Allocator.Error![]u8 {
+    const parent = std.fs.path.dirname(name) orelse ".";
+    const base = std.fs.path.basename(name);
+    const component = std.fmt.count(".{s}.{s}.tmp", .{ base, tag });
+    if (component <= name_component_max) {
+        return gpa.print("{s}/.{s}.{s}.tmp", .{ parent, base, tag });
+    }
+    return gpa.print("{s}/.{s}.tmp", .{ parent, tag });
+}
+
 fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });

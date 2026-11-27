@@ -14,10 +14,6 @@ const flate = std.compress.flate;
 /// path per line. `renameInList` gives its text after files are renamed.
 pub const licensed_list = ".licensed-logs";
 
-/// The longest a single path component may be on a Linux filesystem
-/// holding log files: ext4, xfs, btrfs and tmpfs all share this limit.
-const name_component_max = 255;
-
 /// The errors of `gzipInPlace`: the `sys.Error` of a failed call,
 /// `error.OutOfMemory`, or `error.WriteFailed` from writing the
 /// compressed stream.
@@ -84,22 +80,13 @@ pub fn gzipInPlaceAtStep(gpa: Allocator, io: Io, dir: fsx.fd_t, name: []const u8
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
     const gz_parent = std.fs.path.dirname(gz_name) orelse ".";
-    const gz_base = std.fs.path.basename(gz_name);
     const pid = linux.getpid();
     const suffix = std.mem.readInt(u32, &rnd, .little);
-    // A name this program's own `name.gz` already fits in one path
-    // component can still leave the temporary file holding both that name
-    // and the pid and random suffix guarding it from a concurrent or a
-    // retried run over that component's own limit. The suffix alone is
-    // already enough to keep two temporary files from colliding in `dir`,
-    // so a name that would overflow is left out of the temporary one
-    // rather than failing a compression this program's own final name
-    // would otherwise have gone on to complete.
-    const tagged_len = std.fmt.count(".{s}.{d}.{x:0>8}.tmp", .{ gz_base, pid, suffix });
-    const tmp_name = if (tagged_len <= name_component_max)
-        try gpa.print("{s}/.{s}.{d}.{x:0>8}.tmp", .{ gz_parent, gz_base, pid, suffix })
-    else
-        try gpa.print("{s}/.{d}.{x:0>8}.tmp", .{ gz_parent, pid, suffix });
+    const tag = try gpa.print("{d}.{x:0>8}", .{ pid, suffix });
+    defer gpa.free(tag);
+    // The archive name can already sit near the component limit. The
+    // temporary file then keeps only the pid and the random suffix.
+    const tmp_name = try fsx.tempBeside(gpa, gz_name, tag);
     defer gpa.free(tmp_name);
     const dst = try sys.openat(dir, tmp_name, .{
         .ACCMODE = .WRONLY,
