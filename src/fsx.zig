@@ -597,7 +597,11 @@ fn sameNameParent(a_dir: fd_t, a_name: []const u8, b_dir: fd_t, b_name: []const 
     return a_dir == b_dir and std.mem.eql(u8, a, b);
 }
 
-fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
+/// A temporary name beside `base`: `parent/.basename.pid.random.tmp`.
+/// `parent` is the directory of `base`, or `.` when `base` has none.
+/// The slice points into `out`. A name that does not fit is
+/// `error.NameTooLong`.
+pub fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
     var rnd: [4]u8 = undefined;
     _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
     const parent = std.fs.path.dirname(base) orelse ".";
@@ -611,7 +615,7 @@ fn tmpName(base: []const u8, out: *[sys.path_max]u8) Error![]const u8 {
 
 /// Sync the directory that receives `name`, which is the parent of `name`
 /// when it is nested and `dir` itself otherwise.
-fn fsyncNameParent(dir: fd_t, name: []const u8) Error!void {
+pub fn fsyncNameParent(dir: fd_t, name: []const u8) Error!void {
     const parent = std.fs.path.dirname(name) orelse ".";
     const parent_dir = try openDir(dir, parent, true);
     var open = true;

@@ -1,0 +1,1 @@
+A nested `atomicWriteAt` name sent the temporary file to the wrong directory. A call with `sub/metrics` failed when `.sub` was absent. The temporary file now sits beside the destination, the published file keeps the requested mode, and the call syncs and closes that parent after the rename. atomicWriteAt now refuses an absolute name or a ".." component.

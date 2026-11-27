@@ -462,6 +462,14 @@ pub fn fileMode(path: []const u8) u32 {
 /// and that errno is kept.
 pub fn fsyncDir(path: []const u8) sys.Error!void {
     const fd = try sys.openat(fsx.cwd, path, .{}, 0);
+    try syncAndClose(fd);
+}
+
+/// fsync `fd` and close it once through `ops.close`. A failed close is
+/// returned with `sys.last_errno` set. A close that EINTR interrupts is
+/// not retried and is not an error. On an earlier error the cleanup
+/// close is ignored and that errno is kept.
+fn syncAndClose(fd: sys.fd_t) sys.Error!void {
     var open = true;
     errdefer if (open) closeDiscarded(fd);
     try sys.fsync(fd);
@@ -691,33 +699,51 @@ pub fn atomicWrite(a: Allocator, path: []const u8, data: []const u8, opts: Write
     renamed = true;
     // Opening the directory names it. Flushing the descriptor names no file.
     const directory = sys.openat(fsx.cwd, parent, .{}, 0) catch |err| return failOs(a, why, err, parent, null);
-    var dir_open = true;
-    defer if (dir_open) closeDiscarded(directory);
-    sys.fsync(directory) catch |err| return failOs(a, why, err, null, null);
-    dir_open = false;
-    closeTemp(directory) catch |err| return failOs(a, why, err, null, null);
+    syncAndClose(directory) catch |err| return failOs(a, why, err, null, null);
+}
+
+/// True when `name` is absolute or has a ".." path component.
+/// `a..b` and `..x` are ordinary file names.
+fn nameEscapesDir(name: []const u8) bool {
+    if (std.fs.path.isAbsolute(name)) return true;
+    var it = std.mem.splitScalar(u8, name, '/');
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return true;
+    }
+    return false;
 }
 
 /// atomic_write pinned to an open directory: replace `dir/name` with
 /// `bytes` at exactly `mode`, whatever the process umask leaves, as
 /// the tools' metrics writer does with the descriptor it holds. The
-/// bytes go to a temporary file in the same directory, synced and
-/// closed, and only then renamed over the destination. A failed write,
+/// bytes go to a temporary file in the same directory as `name`, synced
+/// and closed, and only then renamed over the destination. A nested
+/// name puts that file in the parent of the final component.
+/// `sub/metrics` uses `sub/.metrics.` plus the process id, a random
+/// suffix and `.tmp`. An absolute name, or a name with a ".."
+/// component, is `error.InvalidArgument` and creates nothing. A name
+/// such as `a..b` or `..x` is an ordinary file name. A failed write,
 /// fchmod, fsync or close is returned with `sys.last_errno` set to its
 /// errno; the destination is left as it was and the temporary file is
 /// removed. A write lost on NFS may be reported only by the close. The
-/// descriptor is closed once on every path. A close that EINTR
+/// temporary descriptor is closed once on every path. A close that EINTR
 /// interrupts is not retried, as Linux has freed the descriptor, and is
 /// not an error, as `sys.result` treats EINTR; the fsync before it has
-/// already flushed the bytes. Shares atomicWrite's write, sync, close
-/// and rename steps, through the same ops a replaceable build may fail.
-/// Everything it allocates from `a` is freed before it returns.
+/// already flushed the bytes. After the rename, `fsx.fsyncNameParent`
+/// syncs and closes the directory that received the new name. A nested
+/// name opens that parent. A name in the caller's directory opens `.`
+/// and leaves the caller's descriptor open. That close goes through
+/// `fsx.publish_ops`. A failed close is returned and the destination
+/// keeps the bytes the rename published. Shares atomicWrite's write,
+/// sync, close and rename steps, through the same ops a replaceable
+/// build may fail. The temporary name comes from `fsx.tmpName`. This
+/// call allocates nothing; `a` stays for source compatibility.
 pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []const u8, mode: u32) (Allocator.Error || sys.Error)!void {
+    _ = a;
     sys.last_errno = .SUCCESS;
-    var rnd: [4]u8 = undefined;
-    _ = try sys.call(linux.getrandom, .{ &rnd, rnd.len, 0 });
-    const tmp = try a.print(".{s}.{d}.{x:0>8}.tmp", .{ name, linux.getpid(), std.mem.readInt(u32, &rnd, .little) });
-    defer a.free(tmp);
+    if (nameEscapesDir(name)) return error.InvalidArgument;
+    var tmp_buf: [sys.path_max]u8 = undefined;
+    const tmp = try fsx.tmpName(name, &tmp_buf);
     var zb: [sys.path_max:0]u8 = undefined;
     const ztmp = try sys.z(&zb, tmp);
     const flags: sys.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
@@ -745,7 +771,7 @@ pub fn atomicWriteAt(a: Allocator, dir: sys.fd_t, name: []const u8, data: []cons
     var zn: [sys.path_max:0]u8 = undefined;
     _ = try op(ops.renameat, .{ dir, ztmp.ptr, dir, (try sys.z(&zn, name)).ptr });
     done = true;
-    try sys.fsync(dir);
+    try fsx.fsyncNameParent(dir, name);
 }
 
 fn discard(tmp: []const u8, created: fsx.Stat) void {
@@ -1035,6 +1061,195 @@ test "atomicWriteAt publishes the exact mode under any umask" {
     while (try it.next()) |e| {
         try std.testing.expect(std.mem.indexOf(u8, e.name, ".tmp") == null);
     }
+}
+
+test "atomicWriteAt publishes a nested file in its own directory" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-atomic-nested-{d}", .{ cwd, linux.getpid() });
+    fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const dir = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.close(dir);
+    }
+    _ = linux.mkdirat(dir, (try sys.z(&zb, "sub")).ptr, 0o700);
+    const Check = struct {
+        fn temps(alloc: Allocator, parent: sys.fd_t) !void {
+            const sub = try fsx.openDir(parent, "sub", false);
+            defer sys.close(sub);
+            var it = try fsx.DirIter.init(alloc, sub);
+            defer it.deinit(alloc);
+            while (try it.next()) |e| {
+                try std.testing.expect(std.mem.indexOf(u8, e.name, ".tmp") == null);
+                try std.testing.expect(!std.mem.startsWith(u8, e.name, ".metrics."));
+                try std.testing.expect(!std.mem.startsWith(u8, e.name, ".other."));
+            }
+        }
+    };
+    const created = try sys.openat(dir, "sub/metrics", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try sys.writeAll(created, "old\n");
+    sys.close(created);
+
+    // 0o077 would leave a created file at 0o600. The published mode is the
+    // one named here, and the temporary file has to live in `sub`.
+    const old_umask: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old_umask);
+    try atomicWriteAt(gpa, dir, "sub/metrics", "new\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(dir, "sub/metrics", false)).perm());
+    {
+        const f = try fsx.openRegular(dir, "sub/metrics", false);
+        defer sys.close(f.fd);
+        const text = try fsx.readAll(gpa, f.fd, 32);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("new\n", text);
+    }
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, ".sub", false));
+    try Check.temps(gpa, dir);
+
+    const saved_write = ops.*;
+    defer ops.* = saved_write;
+    const FailWrite = struct {
+        fn write(_: sys.fd_t, _: []const u8) usize {
+            return @bitCast(-@as(isize, @backingInt(linux.E.NOSPC)));
+        }
+    };
+    ops.write = FailWrite.write;
+    try std.testing.expectError(error.NoSpace, atomicWriteAt(gpa, dir, "sub/other", "x\n", 0o644));
+    try std.testing.expectEqual(linux.E.NOSPC, sys.last_errno);
+    try std.testing.expectError(error.NotFound, fsx.statAt(dir, "sub/other", false));
+    try Check.temps(gpa, dir);
+    ops.* = saved_write;
+
+    const sub_id = try fsx.statAt(dir, "sub", false);
+    const DirClose = struct {
+        var dev: u64 = 0;
+        var ino: u64 = 0;
+        var saw: bool = false;
+        var n: usize = 0;
+        fn close(fd: sys.fd_t) usize {
+            const match = if (fsx.fstat(fd)) |st|
+                st.isDir() and st.dev == dev and st.ino == ino
+            else |_|
+                false;
+            const rc = linux.close(fd);
+            if (!match) return rc;
+            n += 1;
+            saw = true;
+            return @bitCast(-@as(isize, @backingInt(linux.E.IO)));
+        }
+    };
+    DirClose.dev = sub_id.dev;
+    DirClose.ino = sub_id.ino;
+    DirClose.saw = false;
+    DirClose.n = 0;
+    const saved_publish = fsx.publish_ops.*;
+    defer fsx.publish_ops.* = saved_publish;
+    fsx.publish_ops.close = DirClose.close;
+    try std.testing.expectError(error.Unexpected, atomicWriteAt(gpa, dir, "sub/metrics", "third\n", 0o640));
+    try std.testing.expect(DirClose.saw);
+    try std.testing.expectEqual(@as(usize, 1), DirClose.n);
+    try std.testing.expectEqual(linux.E.IO, sys.last_errno);
+    try std.testing.expectEqual(@as(u32, 0o640), (try fsx.statAt(dir, "sub/metrics", false)).perm());
+    {
+        const f = try fsx.openRegular(dir, "sub/metrics", false);
+        defer sys.close(f.fd);
+        const text = try fsx.readAll(gpa, f.fd, 32);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("third\n", text);
+    }
+    try Check.temps(gpa, dir);
+}
+
+test "atomicWriteAt refuses an absolute name or a .. component" {
+    const gpa = std.testing.allocator;
+    var pb: [sys.path_max]u8 = undefined;
+    var abs_buf: [sys.path_max]u8 = undefined;
+    var cwd_buf: [sys.path_max]u8 = undefined;
+    const cwd = try fsx.realpath(fsx.cwd, ".", &cwd_buf);
+    const base = try std.mem.print(&pb, "{s}/.zig-cache/zig-common-atomic-escape-{d}", .{ cwd, linux.getpid() });
+    const abs = try std.mem.print(&abs_buf, "{s}/.zig-cache/zig-common-atomic-abs-{d}", .{ cwd, linux.getpid() });
+    fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+    sys.unlinkat(fsx.cwd, abs, 0) catch {};
+    var zb: [sys.path_max:0]u8 = undefined;
+    _ = linux.mkdirat(fsx.cwd, (try sys.z(&zb, base)).ptr, 0o700);
+    const root = try fsx.openDir(fsx.cwd, base, false);
+    defer {
+        fsx.deleteTree(gpa, fsx.cwd, base) catch {};
+        sys.unlinkat(fsx.cwd, abs, 0) catch {};
+        sys.close(root);
+    }
+    _ = linux.mkdirat(root, (try sys.z(&zb, "jail")).ptr, 0o700);
+    _ = linux.mkdirat(root, (try sys.z(&zb, "jail/sub")).ptr, 0o700);
+    _ = linux.mkdirat(root, (try sys.z(&zb, "outside")).ptr, 0o700);
+    const jail = try fsx.openDir(root, "jail", false);
+    defer sys.close(jail);
+
+    // `sub/../../outside/pwned` and `../x` leave `jail`. The absolute path
+    // names a file outside this scratch directory. Each is refused, and
+    // none of those files is created.
+    try std.testing.expect(!std.mem.startsWith(u8, abs, base));
+    try std.testing.expectError(error.InvalidArgument, atomicWriteAt(gpa, jail, "sub/../../outside/pwned", "no\n", 0o644));
+    try std.testing.expectError(error.NotFound, fsx.statAt(root, "outside/pwned", false));
+    try std.testing.expectError(error.InvalidArgument, atomicWriteAt(gpa, jail, "../x", "no\n", 0o644));
+    try std.testing.expectError(error.NotFound, fsx.statAt(root, "x", false));
+    try std.testing.expectError(error.InvalidArgument, atomicWriteAt(gpa, jail, abs, "no\n", 0o644));
+    try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, abs, false));
+
+    // `a..b` and `..x` are file names. `sub/metrics` is published in `sub`.
+    const old_umask: u32 = @intCast(linux.syscall1(.umask, 0o077));
+    defer _ = linux.syscall1(.umask, old_umask);
+    try atomicWriteAt(gpa, jail, "a..b", "dots\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(jail, "a..b", false)).perm());
+    {
+        const f = try fsx.openRegular(jail, "a..b", false);
+        defer sys.close(f.fd);
+        const text = try fsx.readAll(gpa, f.fd, 32);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("dots\n", text);
+    }
+    try atomicWriteAt(gpa, jail, "..x", "lead\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(jail, "..x", false)).perm());
+    {
+        const f = try fsx.openRegular(jail, "..x", false);
+        defer sys.close(f.fd);
+        const text = try fsx.readAll(gpa, f.fd, 32);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("lead\n", text);
+    }
+    try atomicWriteAt(gpa, jail, "sub/metrics", "ok\n", 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try fsx.statAt(jail, "sub/metrics", false)).perm());
+    {
+        const f = try fsx.openRegular(jail, "sub/metrics", false);
+        defer sys.close(f.fd);
+        const text = try fsx.readAll(gpa, f.fd, 32);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("ok\n", text);
+    }
+    try std.testing.expectError(error.NotFound, fsx.statAt(jail, ".sub", false));
+    const Check = struct {
+        fn temps(alloc: Allocator, parent: sys.fd_t) !void {
+            var it = try fsx.DirIter.init(alloc, parent);
+            defer it.deinit(alloc);
+            while (try it.next()) |entry| {
+                try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp") == null);
+            }
+        }
+    };
+    try Check.temps(gpa, jail);
+    const sub = try fsx.openDir(jail, "sub", false);
+    defer sys.close(sub);
+    try Check.temps(gpa, sub);
+    const outside = try fsx.openDir(root, "outside", false);
+    defer sys.close(outside);
+    try Check.temps(gpa, outside);
+    try std.testing.expectError(error.NotFound, fsx.statAt(outside, "pwned", false));
+    try std.testing.expectError(error.NotFound, fsx.statAt(root, "x", false));
+    try std.testing.expectError(error.NotFound, fsx.statAt(fsx.cwd, abs, false));
 }
 
 test "the umask is read without changing it" {
