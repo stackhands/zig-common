@@ -64,6 +64,7 @@ fn textCases(in: []const u8) void {
         emitText("split", in, joined.items);
     }
     emit("replace", in, pytext.decodeReplace(A, in) catch unreachable);
+    emit("repr", in, pytext.reprStrAlloc(A, in) catch unreachable);
 }
 
 fn floatCaseBits(bits: u64) void {
@@ -434,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..100) |_| strerrorCase(rand.uintLessThan(u16, 4096));
 
     const oserror_codes = [_]u16{ 0, 1, 2, 3, 4, 10, 11, 13, 17, 20, 21, 32, 103, 104, 108, 110, 111, 114, 115, 134, 160, 177, 999 };
-    const oserror_paths = [_][]const u8{ "/no/such", "a'b", "a'b\"c", "a\nb\xff", "" };
+    const oserror_paths = [_][]const u8{ "/no/such", "a'b", "a'b\"c", "a\nb\xff", "", "\xe2\x80\xa8" };
     for (oserror_codes) |code| {
         for (oserror_paths) |path| osErrorCase(code, path);
     }

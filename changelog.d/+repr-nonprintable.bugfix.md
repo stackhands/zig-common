@@ -1,0 +1,1 @@
+Error text now escapes a nonprintable character the way Python's `repr` does. A line separator in a path used to pass through raw and break the line. The printable ranges are Unicode 16.0.0, the same data as Python 3.14.

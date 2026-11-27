@@ -29,7 +29,7 @@ DIGIT_TOOL = os.path.join(REPO, "tools", "gen_pytext_nd.py")
 
 # The kinds the probe must cover. A kind with no cases means the parity
 # is silently unchecked, so the counts are asserted, not just the lines.
-KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "digits", "float", "dumps", "strerror", "oserror", "dumpscompact")
+KINDS = ("cache", "wire", "quote", "strip", "split", "replace", "repr", "digits", "float", "dumps", "strerror", "oserror", "dumpscompact")
 MIN_CASES = {
     "cache": 1500,
     "wire": 1500,
@@ -37,6 +37,7 @@ MIN_CASES = {
     "strip": 1500,
     "split": 1500,
     "replace": 1500,
+    "repr": 1500,
     "digits": 1000,
     "float": 2000,
     "dumps": 90,
@@ -86,6 +87,11 @@ def split_expected(data):
 
 def replace_expected(data):
     return data.decode("utf-8", "replace").encode("utf-8")
+
+
+def repr_expected(data):
+    text = data.decode("utf-8", "surrogateescape")
+    return repr(text).encode("utf-8")
 
 
 def digits_expected(data):
@@ -212,6 +218,9 @@ class JsonPytextParity(unittest.TestCase):
 
     def test_decode_replace(self):
         self.assert_parity("replace", replace_expected)
+
+    def test_repr(self):
+        self.assert_parity("repr", repr_expected)
 
     def test_decimal_digits(self):
         skip_unless_pinned_unicode(self)
