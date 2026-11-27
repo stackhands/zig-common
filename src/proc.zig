@@ -53,8 +53,9 @@ pub const Options = struct {
     /// child stays in this process's group, so a kill of this group reaches
     /// it.
     new_session: bool = true,
-    /// Checked whenever the wait is interrupted (a signal handler sets it):
-    /// when true, the child's group is killed and `error.Canceled` returned.
+    /// When true, the child's group is killed and `error.Canceled` is
+    /// returned. The poll loop checks it, and so does the wait after the
+    /// child closes its pipes.
     cancel: ?*const std.atomic.Value(bool) = null,
     /// Set to the child's process group id while it runs, 0 otherwise, so a
     /// signal handler can kill it with `killGroup` or `stopGroup`. It is set
@@ -364,8 +365,9 @@ fn decode(status: u32) Term {
 
 /// Wait up to `ms` (null: no limit) for the child to exit, leaving it
 /// unreaped (a zombie still holds its process group id, so the group cannot
-/// be reused while it is signalled). True once it has exited.
-fn exitedWithin(pid: linux.pid_t, ms: ?i64) bool {
+/// be reused while it is signalled). True once it has exited. False when
+/// `ms` elapses, or when `cancel` is set and the child is still running.
+fn exitedWithin(pid: linux.pid_t, ms: ?i64, cancel: ?*const std.atomic.Value(bool)) bool {
     const until: ?i64 = if (ms) |m| nowMs() + m else null;
     while (true) {
         var info = std.mem.zeroes(linux.siginfo_t);
@@ -375,6 +377,7 @@ fn exitedWithin(pid: linux.pid_t, ms: ?i64) bool {
             .INTR => continue,
             else => return true,
         }
+        if (cancel) |c| if (c.load(.seq_cst)) return false;
         if (until) |u| if (nowMs() >= u) return false;
         var ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         _ = linux.nanosleep(&ts, null);
@@ -622,7 +625,7 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
             failure = error.Canceled;
             break;
         };
-        if (opts.end_with_leader and opts.new_session and exitedWithin(pid, 0)) {
+        if (opts.end_with_leader and opts.new_session and exitedWithin(pid, 0, null)) {
             // The child is gone: stop its group, keep what is already in
             // the pipes, and close them under any writer that left it.
             killGroup(pid, .KILL);
@@ -709,14 +712,17 @@ pub fn run(gpa: Allocator, exe: []const u8, argv: []const []const u8, envp: Envp
 
     if (failure == null) {
         const left: ?i64 = if (deadline) |d| @max(d - nowMs(), 0) else null;
-        if (!exitedWithin(pid, left)) failure = error.TimedOut;
+        if (!exitedWithin(pid, left, opts.cancel)) {
+            const canceled = if (opts.cancel) |c| c.load(.seq_cst) else false;
+            failure = if (canceled) error.Canceled else error.TimedOut;
+        }
     }
     if (failure) |err| {
         if (err == error.Canceled) {
             kill(pid, opts.new_session, .KILL);
         } else {
             kill(pid, opts.new_session, .TERM);
-            if (!exitedWithin(pid, opts.grace_ms)) kill(pid, opts.new_session, .KILL);
+            if (!exitedWithin(pid, opts.grace_ms, null)) kill(pid, opts.new_session, .KILL);
         }
         if (opts.new_session) killGroup(pid, .KILL);
         if (opts.new_session and opts.wait_for_group) waitGroupGone(pid);
@@ -770,6 +776,28 @@ test "a set cancel flag kills the child" {
     const gpa = std.testing.allocator;
     var flag = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, run(gpa, "/bin/sh", &.{ "sh", "-c", "sleep 30" }, no_env, .{ .cancel = &flag }));
+}
+
+test "cancel is honored after the child closes its pipes" {
+    const gpa = std.testing.allocator;
+    var flag = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn go(flag_p: *std.atomic.Value(bool)) void {
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            flag_p.store(true, .seq_cst);
+        }
+    }.go, .{&flag});
+    const start = nowMs();
+    const result = run(gpa, "/bin/sh", &.{ "sh", "-c", "exec >/dev/null; sleep 30" }, no_env, .{
+        .timeout_ms = 4000,
+        .grace_ms = 200,
+        .cancel = &flag,
+    });
+    const elapsed = nowMs() - start;
+    thread.join();
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expect(elapsed < 2000);
 }
 
 const GroupScan = struct {
